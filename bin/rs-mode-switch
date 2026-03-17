@@ -1,0 +1,304 @@
+#!/bin/bash
+# =============================================================================
+# rs-mode-switch — Switch right-sizing between MCO (Policy) and MCOA (ManifestWork) modes
+# =============================================================================
+#
+# Usage:
+#   rs-mode-switch mcoa           # Switch to MCOA mode (ManifestWork-based)
+#   rs-mode-switch mco            # Switch to MCO mode (Policy-based)
+#   rs-mode-switch status         # Show current mode and state
+#   rs-mode-switch enable         # Enable right-sizing in MCO CR
+#   rs-mode-switch disable        # Disable right-sizing in MCO CR
+#
+# Handles all the workarounds automatically:
+#   - ADC state sync wait
+#   - ConfigMap trigger for MCO mode
+#   - MCOA addon manager restart after mode switch
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+    echo "Usage: $(basename "$0") <command>"
+    echo ""
+    echo "Commands:"
+    echo "  mcoa      Switch to MCOA mode (ManifestWork-based)"
+    echo "  mco       Switch to MCO mode (Policy-based)"
+    echo "  status    Show current right-sizing mode and state"
+    echo "  enable    Enable right-sizing in MCO CR (both namespace + virtualization)"
+    echo "  disable   Disable right-sizing in MCO CR"
+    echo ""
+    echo "Options:"
+    echo "  --no-wait     Skip waiting for reconciliation"
+    echo "  --ns-only     Enable/disable namespace right-sizing only"
+    echo "  --virt-only   Enable/disable virtualization right-sizing only"
+}
+
+get_current_mode() {
+    local annotation
+    annotation=$(get_resource_field clustermanagementaddon "$MCOA_NAME" "" \
+        "{.metadata.annotations.${RS_ANNOTATION//./\\.}}" || echo "")
+    if [[ "$annotation" == "v1" ]]; then
+        echo "mcoa"
+    else
+        echo "mco"
+    fi
+}
+
+get_rs_state() {
+    local ns_enabled virt_enabled
+    ns_enabled=$(get_resource_field mco "$MCO_NAME" "" \
+        '{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' || echo "")
+    virt_enabled=$(get_resource_field mco "$MCO_NAME" "" \
+        '{.spec.capabilities.platform.analytics.virtualizationRightSizingRecommendation.enabled}' || echo "")
+    echo "${ns_enabled:-unset}:${virt_enabled:-unset}"
+}
+
+do_switch_mcoa() {
+    local no_wait=false
+    [[ "${1:-}" == "--no-wait" ]] && no_wait=true
+
+    log_step "Switching to MCOA mode (ManifestWork-based)"
+
+    # Set the annotation
+    log_substep "Setting CMA annotation: right-sizing-capable=v1"
+    $KUBE_CLI annotate clustermanagementaddon "$MCOA_NAME" \
+        "$RS_ANNOTATION=v1" --overwrite
+
+    # Trigger MCO reconcile so AnalyticsReconciler detects the CMA change
+    log_substep "Triggering MCO reconcile"
+    $KUBE_CLI annotate mco "$MCO_NAME" \
+        "rs-trigger=$(date +%s)" --overwrite 2>/dev/null
+
+    if [[ "$no_wait" == "false" ]]; then
+        # Wait for MCO to detect annotation, sync ADC, and clean up Policies
+        wait_with_message 30 "Waiting for MCO to sync ADC and clean up Policies"
+
+        # Restart addon manager to pick up new ADC state
+        log_substep "Restarting MCOA addon manager"
+        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" 2>/dev/null
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" --timeout=120s 2>/dev/null
+
+        wait_with_message 30 "Waiting for ManifestWork reconciliation"
+    fi
+
+    echo ""
+    log_success "Switched to MCOA mode"
+    do_status
+}
+
+do_switch_mco() {
+    local no_wait=false
+    [[ "${1:-}" == "--no-wait" ]] && no_wait=true
+
+    log_step "Switching to MCO mode (Policy-based)"
+
+    # Remove the annotation
+    log_substep "Removing CMA annotation"
+    $KUBE_CLI annotate clustermanagementaddon "$MCOA_NAME" \
+        "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
+
+    # Trigger MCO reconcile so AnalyticsReconciler detects the CMA change
+    log_substep "Triggering MCO reconcile"
+    $KUBE_CLI annotate mco "$MCO_NAME" \
+        "rs-trigger=$(date +%s)" --overwrite 2>/dev/null
+
+    if [[ "$no_wait" == "false" ]]; then
+        # Trigger ConfigMap change to force Policy creation
+        log_substep "Triggering ConfigMap change to force Policy creation"
+        $KUBE_CLI patch configmap rs-namespace-config \
+            -n "$OBS_NAMESPACE" \
+            --type=merge \
+            -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+        $KUBE_CLI patch configmap rs-virt-config \
+            -n "$OBS_NAMESPACE" \
+            --type=merge \
+            -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+
+        wait_with_message 45 "Waiting for Policy creation and propagation"
+    fi
+
+    echo ""
+    log_success "Switched to MCO mode"
+    do_status
+}
+
+do_enable() {
+    local ns_flag=true virt_flag=true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ns-only)   virt_flag=false; shift ;;
+            --virt-only) ns_flag=false; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    log_step "Enabling right-sizing (namespace=$ns_flag, virtualization=$virt_flag)"
+
+    $KUBE_CLI patch mco "$MCO_NAME" --type=merge -p "{
+        \"spec\": {
+            \"capabilities\": {
+                \"platform\": {
+                    \"analytics\": {
+                        \"namespaceRightSizingRecommendation\": {\"enabled\": $ns_flag},
+                        \"virtualizationRightSizingRecommendation\": {\"enabled\": $virt_flag}
+                    }
+                }
+            }
+        }
+    }"
+
+    log_success "Right-sizing enabled in MCO CR"
+}
+
+do_disable() {
+    log_step "Disabling right-sizing"
+
+    $KUBE_CLI patch mco "$MCO_NAME" --type=merge -p '{
+        "spec": {
+            "capabilities": {
+                "platform": {
+                    "analytics": {
+                        "namespaceRightSizingRecommendation": {"enabled": false},
+                        "virtualizationRightSizingRecommendation": {"enabled": false}
+                    }
+                }
+            }
+        }
+    }'
+
+    log_success "Right-sizing disabled in MCO CR"
+}
+
+do_status() {
+    log_step "Right-Sizing Status"
+    echo ""
+
+    # Current mode
+    local mode
+    mode=$(get_current_mode)
+    local annotation
+    annotation=$(get_resource_field clustermanagementaddon "$MCOA_NAME" "" \
+        "{.metadata.annotations.${RS_ANNOTATION//./\\.}}" || echo "")
+
+    if [[ "$mode" == "mcoa" ]]; then
+        log_success "Mode: MCOA (ManifestWork-based)  [annotation=$annotation]"
+    else
+        log_info "Mode: MCO (Policy-based)  [annotation=${annotation:-not set}]"
+    fi
+
+    # MCO CR state
+    local state
+    state=$(get_rs_state)
+    local ns_state="${state%%:*}"
+    local virt_state="${state##*:}"
+    echo ""
+    log_info "MCO CR Right-Sizing:"
+    if [[ "$ns_state" == "true" ]]; then
+        log_success "  Namespace:      enabled"
+    else
+        log_warn "  Namespace:      ${ns_state}"
+    fi
+    if [[ "$virt_state" == "true" ]]; then
+        log_success "  Virtualization: enabled"
+    else
+        log_warn "  Virtualization: ${virt_state}"
+    fi
+
+    # ADC state (only relevant in MCOA mode)
+    if [[ "$mode" == "mcoa" ]]; then
+        echo ""
+        log_info "AddOnDeploymentConfig:"
+        local adc_json
+        adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" \
+            -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "{}")
+        local ns_adc virt_adc
+        ns_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformNamespaceRightSizing") | .value' 2>/dev/null)
+        virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null)
+        log_info "  platformNamespaceRightSizing:      ${ns_adc:-not set (auto-enables)}"
+        log_info "  platformVirtualizationRightSizing:  ${virt_adc:-not set (auto-enables)}"
+    fi
+
+    # Hub resources
+    echo ""
+    log_info "Hub Resources:"
+    if [[ "$mode" == "mco" ]]; then
+        # Policies
+        if resource_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE"; then
+            log_success "  Policy (namespace): exists"
+        else
+            log_warn "  Policy (namespace): not found"
+        fi
+        if resource_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE"; then
+            log_success "  Policy (virtualization): exists"
+        else
+            log_warn "  Policy (virtualization): not found"
+        fi
+    else
+        # MCOA placements
+        if resource_exists placement rs-namespace-placement "$OBS_NAMESPACE"; then
+            log_success "  Placement (namespace): exists"
+        else
+            log_warn "  Placement (namespace): not found"
+        fi
+        if resource_exists placement rs-virt-placement "$OBS_NAMESPACE"; then
+            log_success "  Placement (virtualization): exists"
+        else
+            log_warn "  Placement (virtualization): not found"
+        fi
+
+        # ManifestWork check (iterate all managed clusters)
+        local total_pr=0
+        local spoke_list
+        spoke_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        for spoke_name in $spoke_list; do
+            [[ "$spoke_name" == "local-cluster" ]] && continue
+            for mw in $($KUBE_CLI get manifestwork -n "$spoke_name" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+                local pr_count
+                pr_count=$($KUBE_CLI get "$mw" -n "$spoke_name" -o json 2>/dev/null | \
+                    jq '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs"))] | length' 2>/dev/null || echo 0)
+                total_pr=$((total_pr + pr_count))
+            done
+        done
+        if [[ "$total_pr" -gt 0 ]]; then
+            log_success "  ManifestWork PrometheusRules: $total_pr"
+        else
+            log_warn "  ManifestWork PrometheusRules: 0"
+        fi
+    fi
+
+    # ConfigMaps
+    echo ""
+    log_info "ConfigMaps:"
+    if resource_exists configmap rs-namespace-config "$OBS_NAMESPACE"; then
+        log_success "  rs-namespace-config: exists"
+    else
+        log_warn "  rs-namespace-config: not found"
+    fi
+    if resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
+        log_success "  rs-virt-config: exists"
+    else
+        log_warn "  rs-virt-config: not found"
+    fi
+}
+
+# --- Main ---
+case "${1:-}" in
+    -h|--help|"") usage; exit 0 ;;
+esac
+
+init_acm_tools
+
+case "$1" in
+    mcoa)    shift; do_switch_mcoa "$@" ;;
+    mco)     shift; do_switch_mco "$@" ;;
+    enable)  shift; do_enable "$@" ;;
+    disable) do_disable ;;
+    status)  do_status ;;
+    *) log_error "Unknown command: $1"; usage; exit 1 ;;
+esac

@@ -1,0 +1,23 @@
+# Generated manifests
+manifests/*.yaml
+
+# Must-gather output
+must-gather-*/
+
+# Secrets (keep .example, ignore actual secrets)
+install-custom-acm/pull-secret.json
+
+# Temp files
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.code-workspace

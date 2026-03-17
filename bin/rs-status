@@ -1,0 +1,279 @@
+#!/bin/bash
+# =============================================================================
+# rs-status — Quick right-sizing diagnostic dashboard
+# =============================================================================
+#
+# Usage:
+#   rs-status                 # Show full status
+#   rs-status --hub-only      # Skip spoke checks
+#   rs-status --spoke NAME    # Check specific spoke
+#   rs-status --watch         # Refresh every 10s
+#
+# Shows a one-screen color-coded overview of right-sizing state across
+# hub and spoke clusters.
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+    echo "Usage: $(basename "$0") [options]"
+    echo ""
+    echo "Options:"
+    echo "  --hub-only     Skip spoke cluster checks"
+    echo "  --spoke NAME   Spoke context to check (default: $NAMESPACE_SPOKE_CONTEXT)"
+    echo "  --watch        Refresh every 10 seconds (Ctrl+C to stop)"
+    echo "  --json         Output as JSON (for scripting)"
+}
+
+HUB_ONLY=false
+SPOKE="$NAMESPACE_SPOKE_CONTEXT"
+WATCH_MODE=false
+JSON_MODE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --hub-only) HUB_ONLY=true; shift ;;
+        --spoke)    SPOKE="$2"; shift 2 ;;
+        --watch)    WATCH_MODE=true; shift ;;
+        --json)     JSON_MODE=true; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        *) log_error "Unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+show_status() {
+    if [[ "$JSON_MODE" == "true" ]]; then
+        show_status_json
+        return
+    fi
+
+    print_separator
+    echo -e "${BOLD}Right-Sizing Status Dashboard${NC}"
+    print_separator
+    echo ""
+
+    # ── Mode ──
+    local annotation
+    annotation=$($KUBE_CLI get clustermanagementaddon "$MCOA_NAME" \
+        -o jsonpath="{.metadata.annotations.${RS_ANNOTATION//./\\.}}" 2>/dev/null || echo "")
+
+    local mode="MCO (Policy-based)"
+    local mode_color="$BLUE"
+    if [[ "$annotation" == "v1" ]]; then
+        mode="MCOA (ManifestWork-based)"
+        mode_color="$GREEN"
+    fi
+    echo -e "  Mode:  ${mode_color}${BOLD}$mode${NC}"
+    echo -e "  CMA:   annotation=${annotation:-<not set>}"
+
+    # ── MCO CR ──
+    echo ""
+    echo -e "${BOLD}  MCO CR (spec.capabilities.platform.analytics):${NC}"
+    local ns_enabled virt_enabled
+    ns_enabled=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath='{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' 2>/dev/null || echo "?")
+    virt_enabled=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath='{.spec.capabilities.platform.analytics.virtualizationRightSizingRecommendation.enabled}' 2>/dev/null || echo "?")
+
+    local ns_icon="$RED" virt_icon="$RED"
+    [[ "$ns_enabled" == "true" ]] && ns_icon="$GREEN"
+    [[ "$virt_enabled" == "true" ]] && virt_icon="$GREEN"
+    echo -e "    ${ns_icon}Namespace:       $ns_enabled${NC}"
+    echo -e "    ${virt_icon}Virtualization:  $virt_enabled${NC}"
+
+    # ── ADC ──
+    echo ""
+    echo -e "${BOLD}  AddOnDeploymentConfig:${NC}"
+    local adc_json
+    adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" \
+        -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "{}")
+
+    local ns_adc virt_adc
+    ns_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformNamespaceRightSizing") | .value' 2>/dev/null)
+    virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null)
+
+    local ns_adc_icon="$YELLOW" virt_adc_icon="$YELLOW"
+    [[ "$ns_adc" == "enabled" ]] && ns_adc_icon="$GREEN"
+    [[ "$ns_adc" == "disabled" ]] && ns_adc_icon="$RED"
+    [[ "$virt_adc" == "enabled" ]] && virt_adc_icon="$GREEN"
+    [[ "$virt_adc" == "disabled" ]] && virt_adc_icon="$RED"
+    echo -e "    ${ns_adc_icon}platformNamespaceRightSizing:      ${ns_adc:-not set (auto-enables)}${NC}"
+    echo -e "    ${virt_adc_icon}platformVirtualizationRightSizing: ${virt_adc:-not set (auto-enables)}${NC}"
+
+    # ── ConfigMaps ──
+    echo ""
+    echo -e "${BOLD}  ConfigMaps (${OBS_NAMESPACE}):${NC}"
+    for cm in rs-namespace-config rs-virt-config; do
+        if resource_exists configmap "$cm" "$OBS_NAMESPACE"; then
+            echo -e "    ${GREEN}$cm: exists${NC}"
+        else
+            echo -e "    ${RED}$cm: not found${NC}"
+        fi
+    done
+
+    # ── Mode-specific resources ──
+    echo ""
+    if [[ "$annotation" == "v1" ]]; then
+        # MCOA mode
+        echo -e "${BOLD}  MCOA Resources:${NC}"
+
+        # Placements
+        for p in rs-namespace-placement rs-virt-placement; do
+            if resource_exists placement "$p" "$OBS_NAMESPACE"; then
+                local decision_count
+                decision_count=$($KUBE_CLI get placementdecision -n "$OBS_NAMESPACE" \
+                    -l "cluster.open-cluster-management.io/placement=$p" \
+                    -o json 2>/dev/null | jq '[.items[]?.status.decisions[]?] | length' 2>/dev/null || echo 0)
+                echo -e "    ${GREEN}$p: exists ($decision_count clusters)${NC}"
+            else
+                echo -e "    ${RED}$p: not found${NC}"
+            fi
+        done
+
+        # ManifestWorks
+        echo ""
+        echo -e "${BOLD}  ManifestWork PrometheusRules:${NC}"
+        local spoke_list
+        spoke_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+        for spoke_name in $spoke_list; do
+            [[ "$spoke_name" == "local-cluster" ]] && continue
+            local pr_total=0
+            for mw in $($KUBE_CLI get manifestwork -n "$spoke_name" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN"); do
+                local pr_count
+                pr_count=$($KUBE_CLI get "$mw" -n "$spoke_name" -o json 2>/dev/null | \
+                    jq '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs"))] | length' 2>/dev/null || echo 0)
+                pr_total=$((pr_total + pr_count))
+            done
+            if [[ $pr_total -gt 0 ]]; then
+                echo -e "    ${GREEN}$spoke_name: $pr_total PrometheusRule(s)${NC}"
+            else
+                echo -e "    ${YELLOW}$spoke_name: 0 PrometheusRules${NC}"
+            fi
+        done
+    else
+        # MCO mode
+        echo -e "${BOLD}  MCO Policy Resources (${GLOBAL_SET_NAMESPACE}):${NC}"
+        for res_type_name in "policy:rs-prom-rules-policy" "policy:rs-virt-prom-rules-policy" "placement:rs-placement" "placement:rs-virt-placement" "placementbinding:rs-policyset-binding" "placementbinding:rs-virt-policyset-binding"; do
+            local rtype="${res_type_name%%:*}"
+            local rname="${res_type_name##*:}"
+            if resource_exists "$rtype" "$rname" "$GLOBAL_SET_NAMESPACE"; then
+                echo -e "    ${GREEN}$rtype/$rname: exists${NC}"
+            else
+                echo -e "    ${RED}$rtype/$rname: not found${NC}"
+            fi
+        done
+    fi
+
+    # ── Spoke PrometheusRules ──
+    if [[ "$HUB_ONLY" == "false" ]]; then
+        echo ""
+        echo -e "${BOLD}  Spoke PrometheusRules ($SPOKE):${NC}"
+        if switch_context "$SPOKE" 2>/dev/null; then
+            local rules
+            rules=$($KUBE_CLI get prometheusrule -n openshift-monitoring --no-headers 2>/dev/null | grep -i "rs-\|acm-rs" || true)
+            if [[ -n "$rules" ]]; then
+                echo "$rules" | while read -r line; do
+                    local name
+                    name=$(echo "$line" | awk '{print $1}')
+                    echo -e "    ${GREEN}$name${NC}"
+                done
+            else
+                echo -e "    ${YELLOW}No right-sizing PrometheusRules found${NC}"
+            fi
+            switch_context "$HUB_CONTEXT" &>/dev/null || true
+        else
+            echo -e "    ${RED}Could not connect to spoke: $SPOKE${NC}"
+        fi
+    fi
+
+    # ── Operator Pods ──
+    echo ""
+    echo -e "${BOLD}  Operator Pods:${NC}"
+    local mco_pod_status
+    mco_pod_status=$($KUBE_CLI get pods -n "$ACM_NAMESPACE" -l name=multicluster-observability-operator --no-headers 2>/dev/null | awk '{printf "%s (%s)", $1, $3}' | head -1)
+    echo -e "    MCO:  ${mco_pod_status:-not found}"
+
+    local mcoa_pod_status
+    mcoa_pod_status=$($KUBE_CLI get pods -n "$OBS_NAMESPACE" -l app=$MCOA_DEPLOY --no-headers 2>/dev/null | awk '{printf "%s (%s)", $1, $3}' | head -1)
+    echo -e "    MCOA: ${mcoa_pod_status:-not found}"
+
+    # ── Images ──
+    echo ""
+    echo -e "${BOLD}  Images:${NC}"
+    local mco_img mcoa_img
+    mco_img=$(get_resource_field deployment multicluster-observability-operator "$ACM_NAMESPACE" '{.spec.template.spec.containers[0].image}')
+    mcoa_img=$(get_resource_field deployment $MCOA_DEPLOY "$OBS_NAMESPACE" '{.spec.template.spec.containers[0].image}')
+    echo "    MCO:  ${mco_img:-?}"
+    echo "    MCOA: ${mcoa_img:-?}"
+
+    echo ""
+    print_separator
+}
+
+show_status_json() {
+    local annotation ns_enabled virt_enabled ns_adc virt_adc
+
+    annotation=$($KUBE_CLI get clustermanagementaddon "$MCOA_NAME" \
+        -o jsonpath="{.metadata.annotations.${RS_ANNOTATION//./\\.}}" 2>/dev/null || echo "")
+    ns_enabled=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath='{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' 2>/dev/null || echo "null")
+    virt_enabled=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath='{.spec.capabilities.platform.analytics.virtualizationRightSizingRecommendation.enabled}' 2>/dev/null || echo "null")
+
+    local adc_json
+    adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "{}")
+    ns_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformNamespaceRightSizing") | .value' 2>/dev/null || echo "null")
+    virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null || echo "null")
+
+    local mode="mco"
+    [[ "$annotation" == "v1" ]] && mode="mcoa"
+
+    jq -n \
+        --arg mode "$mode" \
+        --arg annotation "$annotation" \
+        --arg ns_enabled "$ns_enabled" \
+        --arg virt_enabled "$virt_enabled" \
+        --arg ns_adc "${ns_adc:-null}" \
+        --arg virt_adc "${virt_adc:-null}" \
+        '{
+            mode: $mode,
+            annotation: $annotation,
+            mco_cr: {
+                namespace_enabled: ($ns_enabled == "true"),
+                virtualization_enabled: ($virt_enabled == "true")
+            },
+            adc: {
+                namespace: (if $ns_adc == "null" then null else $ns_adc end),
+                virtualization: (if $virt_adc == "null" then null else $virt_adc end)
+            }
+        }'
+}
+
+# --- Main ---
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+init_acm_tools
+
+# Save current context and restore on exit (in case script is interrupted
+# while connected to a spoke cluster)
+ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
+if [[ -n "$ORIGINAL_CONTEXT" ]]; then
+    trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null' EXIT
+fi
+
+if [[ "$WATCH_MODE" == "true" ]]; then
+    while true; do
+        clear
+        show_status
+        echo ""
+        echo -e "${BLUE}Refreshing every 10s... (Ctrl+C to stop)${NC}"
+        sleep 10
+    done
+else
+    show_status
+fi

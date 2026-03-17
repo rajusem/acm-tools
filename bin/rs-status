@@ -197,16 +197,52 @@ show_status() {
 
     local mcoa_pod_status
     mcoa_pod_status=$($KUBE_CLI get pods -n "$OBS_NAMESPACE" -l app=$MCOA_DEPLOY --no-headers 2>/dev/null | awk '{printf "%s (%s)", $1, $3}' | head -1)
-    echo -e "    MCOA: ${mcoa_pod_status:-not found}"
+
+    # Check if MCOA pod state is correct for the current mode
+    local mcoa_has_other_caps=false
+    local mco_caps
+    mco_caps=$($KUBE_CLI get mco "$MCO_NAME" -o json 2>/dev/null || echo "{}")
+    # Check if any non-RS MCOA capability is enabled
+    for cap_path in \
+        '.spec.capabilities.platform.logs.collection.enabled' \
+        '.spec.capabilities.platform.metrics.default.enabled' \
+        '.spec.capabilities.platform.analytics.incidentDetection.enabled' \
+        '.spec.capabilities.userWorkloads.logs.collection.clusterLogForwarder.enabled' \
+        '.spec.capabilities.userWorkloads.traces.collection.collector.enabled' \
+        '.spec.capabilities.userWorkloads.traces.collection.instrumentation.enabled' \
+        '.spec.capabilities.userWorkloads.metrics.default.enabled'; do
+        local val
+        val=$(echo "$mco_caps" | jq -r "$cap_path // false" 2>/dev/null)
+        if [[ "$val" == "true" ]]; then
+            mcoa_has_other_caps=true
+            break
+        fi
+    done
+
+    if [[ "$annotation" == "v1" ]] || [[ "$mcoa_has_other_caps" == "true" ]]; then
+        # MCOA should be running
+        if [[ -n "$mcoa_pod_status" ]]; then
+            echo -e "    ${GREEN}MCOA: $mcoa_pod_status${NC}"
+        else
+            echo -e "    ${RED}MCOA: not found (EXPECTED to be running)${NC}"
+        fi
+    else
+        # MCOA should NOT be running (MCO-only mode for right-sizing)
+        if [[ -n "$mcoa_pod_status" ]]; then
+            echo -e "    ${YELLOW}MCOA: $mcoa_pod_status (unexpected — no MCOA capabilities or delegation active)${NC}"
+        else
+            echo -e "    ${GREEN}MCOA: not running (correct — MCO mode, no MCOA capabilities)${NC}"
+        fi
+    fi
 
     # ── Images ──
     echo ""
     echo -e "${BOLD}  Images:${NC}"
     local mco_img mcoa_img
-    mco_img=$(get_resource_field deployment multicluster-observability-operator "$ACM_NAMESPACE" '{.spec.template.spec.containers[0].image}')
-    mcoa_img=$(get_resource_field deployment $MCOA_DEPLOY "$OBS_NAMESPACE" '{.spec.template.spec.containers[0].image}')
-    echo "    MCO:  ${mco_img:-?}"
-    echo "    MCOA: ${mcoa_img:-?}"
+    mco_img=$(get_resource_field deployment multicluster-observability-operator "$ACM_NAMESPACE" '{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+    mcoa_img=$(get_resource_field deployment $MCOA_DEPLOY "$OBS_NAMESPACE" '{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "")
+    echo "    MCO:  ${mco_img:-not deployed}"
+    echo "    MCOA: ${mcoa_img:-not deployed}"
 
     echo ""
     print_separator

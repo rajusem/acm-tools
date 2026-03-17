@@ -1,0 +1,355 @@
+#!/bin/bash
+# =============================================================================
+# setup-observability — Bootstrap MCO on a hub cluster with Minio storage
+# =============================================================================
+#
+# Usage:
+#   setup-observability [options]
+#   setup-observability --skip-minio          # Use existing object storage
+#   setup-observability --enable-rightsizing   # Also enable right-sizing
+#   setup-observability --status              # Show observability status
+#
+# Sets up:
+#   1. Observability namespace
+#   2. Pull secret
+#   3. Minio (optional in-cluster object storage)
+#   4. Thanos object storage secret
+#   5. MultiClusterObservability CR
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+MANIFESTS_DIR="$SCRIPT_DIR/../manifests"
+
+usage() {
+    echo "Usage: $(basename "$0") [command] [options]"
+    echo ""
+    echo "Commands:"
+    echo "  install     Install observability (default)"
+    echo "  uninstall   Remove MCO CR (keeps namespace and storage)"
+    echo "  status      Show observability installation status"
+    echo ""
+    echo "Options (for install):"
+    echo "  --skip-minio            Don't install Minio (use existing object storage)"
+    echo "  --enable-rightsizing    Enable right-sizing after setup"
+    echo "  --mcoa-mode             Also set MCOA right-sizing annotation"
+    echo "  --wait-timeout N        Wait timeout in seconds (default: 300)"
+    echo ""
+    echo "Note: Minio uses dev-only credentials (minio/minio123). Do not use on shared clusters."
+}
+
+create_manifests_if_missing() {
+    mkdir -p "$MANIFESTS_DIR"
+
+    # Namespace
+    if [[ ! -f "$MANIFESTS_DIR/namespace.yaml" ]]; then
+        cat > "$MANIFESTS_DIR/namespace.yaml" <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: open-cluster-management-observability
+EOF
+    fi
+
+    # Minio Deployment (dev-only credentials: minio/minio123 — do not use on shared clusters)
+    if [[ ! -f "$MANIFESTS_DIR/minio-deployment.yaml" ]]; then
+        cat > "$MANIFESTS_DIR/minio-deployment.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: open-cluster-management-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              mkdir -p /data/thanos
+              minio server /data --console-address ":9001"
+          env:
+            - name: MINIO_ROOT_USER
+              value: minio
+            - name: MINIO_ROOT_PASSWORD
+              value: minio123
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+EOF
+    fi
+
+    # Minio Service
+    if [[ ! -f "$MANIFESTS_DIR/minio-service.yaml" ]]; then
+        cat > "$MANIFESTS_DIR/minio-service.yaml" <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: open-cluster-management-observability
+spec:
+  ports:
+    - port: 9000
+      targetPort: 9000
+      protocol: TCP
+      name: api
+    - port: 9001
+      targetPort: 9001
+      protocol: TCP
+      name: console
+  selector:
+    app: minio
+EOF
+    fi
+
+    # Thanos object storage secret
+    if [[ ! -f "$MANIFESTS_DIR/thanos-object-storage-secret.yaml" ]]; then
+        cat > "$MANIFESTS_DIR/thanos-object-storage-secret.yaml" <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: thanos-object-storage
+  namespace: open-cluster-management-observability
+type: Opaque
+stringData:
+  thanos.yaml: |
+    type: s3
+    config:
+      bucket: thanos
+      endpoint: minio.open-cluster-management-observability.svc:9000
+      insecure: true
+      access_key: minio
+      secret_key: minio123
+EOF
+    fi
+
+    # MCO CR
+    if [[ ! -f "$MANIFESTS_DIR/mco-cr.yaml" ]]; then
+        cat > "$MANIFESTS_DIR/mco-cr.yaml" <<'EOF'
+apiVersion: observability.open-cluster-management.io/v1beta2
+kind: MultiClusterObservability
+metadata:
+  name: observability
+spec:
+  observabilityAddonSpec: {}
+  storageConfig:
+    metricObjectStorage:
+      key: thanos.yaml
+      name: thanos-object-storage
+EOF
+    fi
+}
+
+do_install() {
+    local skip_minio=false
+    local enable_rs=false
+    local mcoa_mode=false
+    local wait_timeout=300
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --skip-minio)         skip_minio=true; shift ;;
+            --enable-rightsizing)  enable_rs=true; shift ;;
+            --mcoa-mode)          mcoa_mode=true; enable_rs=true; shift ;;
+            --wait-timeout)       wait_timeout="$2"; shift 2 ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    create_manifests_if_missing
+
+    log_step "Setting up MCO Observability"
+    echo ""
+
+    # 1. Namespace
+    log_substep "Creating observability namespace"
+    $KUBE_CLI apply -f "$MANIFESTS_DIR/namespace.yaml"
+
+    # 2. Pull secret
+    log_substep "Copying pull secret"
+    local pull_secret
+    pull_secret=$($KUBE_CLI get secret/pull-secret -n openshift-config \
+        -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null || echo "")
+
+    if [[ -n "$pull_secret" ]]; then
+        cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: multiclusterhub-operator-pull-secret
+  namespace: $OBS_NAMESPACE
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: $pull_secret
+EOF
+        log_success "Pull secret created"
+    else
+        log_warn "Could not extract pull secret from openshift-config"
+        log_info "You may need to create it manually"
+    fi
+
+    # 3. Minio
+    if [[ "$skip_minio" == "false" ]]; then
+        log_substep "Deploying Minio"
+        $KUBE_CLI apply -f "$MANIFESTS_DIR/minio-deployment.yaml"
+        $KUBE_CLI apply -f "$MANIFESTS_DIR/minio-service.yaml"
+
+        log_substep "Waiting for Minio to be ready"
+        $KUBE_CLI rollout status deployment/minio -n "$OBS_NAMESPACE" --timeout=120s
+        log_success "Minio is running"
+    fi
+
+    # 4. Thanos object storage secret
+    log_substep "Creating Thanos object storage secret"
+    $KUBE_CLI apply -f "$MANIFESTS_DIR/thanos-object-storage-secret.yaml"
+
+    # 5. MCO CR
+    log_substep "Creating MultiClusterObservability CR"
+    $KUBE_CLI apply -f "$MANIFESTS_DIR/mco-cr.yaml"
+
+    # Wait for MCO to be ready
+    log_substep "Waiting for MCO to reconcile (timeout: ${wait_timeout}s)"
+    local elapsed=0
+    while [[ $elapsed -lt $wait_timeout ]]; do
+        local status
+        status=$($KUBE_CLI get mco "$MCO_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+        if [[ "$status" == "True" ]]; then
+            log_success "MCO is Ready"
+            break
+        fi
+        printf "\r  Waiting for MCO... (%ds/%ds)" "$elapsed" "$wait_timeout"
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
+    echo ""
+
+    if [[ $elapsed -ge $wait_timeout ]]; then
+        log_warn "MCO not ready within timeout. Check with: $KUBE_CLI get mco $MCO_NAME -o yaml"
+    fi
+
+    # 6. Enable right-sizing
+    if [[ "$enable_rs" == "true" ]]; then
+        echo ""
+        "$SCRIPT_DIR/rs-mode-switch" enable
+        if [[ "$mcoa_mode" == "true" ]]; then
+            "$SCRIPT_DIR/rs-mode-switch" mcoa
+        fi
+    fi
+
+    echo ""
+    print_separator
+    log_success "Observability setup complete"
+    print_separator
+}
+
+do_uninstall() {
+    log_step "Removing MCO CR"
+
+    if resource_exists mco "$MCO_NAME"; then
+        if confirm "Delete MCO CR '$MCO_NAME'?"; then
+            $KUBE_CLI delete mco "$MCO_NAME" --wait=true --timeout=120s
+            log_success "MCO CR deleted"
+        else
+            log_info "Cancelled"
+        fi
+    else
+        log_info "MCO CR not found, nothing to delete"
+    fi
+}
+
+do_status() {
+    log_step "Observability Status"
+    echo ""
+
+    # MCO CR
+    if resource_exists mco "$MCO_NAME"; then
+        local ready
+        ready=$(get_resource_field mco "$MCO_NAME" "" '{.status.conditions[?(@.type=="Ready")].status}')
+        if [[ "$ready" == "True" ]]; then
+            log_success "MCO CR: Ready"
+        else
+            local reason
+            reason=$(get_resource_field mco "$MCO_NAME" "" '{.status.conditions[?(@.type=="Ready")].message}')
+            log_warn "MCO CR: Not Ready ($reason)"
+        fi
+    else
+        log_warn "MCO CR: not found"
+    fi
+
+    # Key pods
+    echo ""
+    log_info "Key Pods:"
+    for dep in observability-observatorium-api observability-thanos-query observability-thanos-compact observability-thanos-receive-default observability-thanos-rule; do
+        if resource_exists deployment "$dep" "$OBS_NAMESPACE"; then
+            local ready_replicas
+            ready_replicas=$(get_resource_field deployment "$dep" "$OBS_NAMESPACE" '{.status.readyReplicas}')
+            log_success "  $dep: ${ready_replicas:-0} ready"
+        fi
+    done
+
+    # Minio
+    echo ""
+    if resource_exists deployment minio "$OBS_NAMESPACE"; then
+        local minio_ready
+        minio_ready=$(get_resource_field deployment minio "$OBS_NAMESPACE" '{.status.readyReplicas}')
+        log_success "Minio: ${minio_ready:-0} ready"
+    else
+        log_info "Minio: not deployed (using external storage)"
+    fi
+
+    # Object storage secret
+    if resource_exists secret thanos-object-storage "$OBS_NAMESPACE"; then
+        log_success "Thanos object storage secret: exists"
+    else
+        log_warn "Thanos object storage secret: not found"
+    fi
+
+    # ManagedClusters
+    echo ""
+    log_info "ManagedClusters:"
+    $KUBE_CLI get managedcluster --no-headers 2>/dev/null | while read -r line; do
+        local name status
+        name=$(echo "$line" | awk '{print $1}')
+        status=$(echo "$line" | awk '{print $4}')
+        if [[ "$status" == "True" ]]; then
+            log_success "  $name: Available"
+        else
+            log_warn "  $name: $status"
+        fi
+    done
+
+    echo ""
+    "$SCRIPT_DIR/rs-mode-switch" status 2>/dev/null || true
+}
+
+# --- Main ---
+case "${1:-install}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+init_acm_tools
+
+case "${1:-install}" in
+    install)    shift 2>/dev/null || true; do_install "$@" ;;
+    uninstall)  do_uninstall ;;
+    status)     do_status ;;
+    *) log_error "Unknown command: $1"; usage; exit 1 ;;
+esac

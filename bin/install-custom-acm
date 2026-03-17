@@ -1,0 +1,481 @@
+#!/bin/bash
+# =============================================================================
+# install-custom-acm — Install a specific ACM version on a hub cluster via OLM
+# =============================================================================
+#
+# Usage:
+#   install-custom-acm [options]
+#   install-custom-acm --version 2.16          # Install ACM 2.16
+#   install-custom-acm --channel release-2.12  # Use specific channel
+#   install-custom-acm --pull-secret           # Merge quay.io pull secret first
+#   install-custom-acm status                  # Show ACM installation status
+#   install-custom-acm uninstall               # Remove ACM
+#
+# Prerequisites:
+#   The cluster's global pull secret must include quay.io:443 credentials.
+#   Place your pull secret JSON at install-custom-acm/pull-secret.json
+#   (see install-custom-acm/pull-secret.json.example for format).
+#   Use --pull-secret to merge it into the cluster's global pull secret.
+#
+# Sets up:
+#   1. Pull secret merge (optional, --pull-secret)
+#   2. ACM namespace
+#   3. OperatorGroup
+#   4. Subscription (with specified channel)
+#   5. MultiClusterHub CR
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Defaults
+ACM_VERSION="${ACM_VERSION:-2.16}"
+ACM_CHANNEL="${ACM_CHANNEL:-release-$ACM_VERSION}"
+MCE_CHANNEL="${MCE_CHANNEL:-}"
+ACM_SOURCE="${ACM_SOURCE:-redhat-operators}"
+ACM_SOURCE_NS="${ACM_SOURCE_NS:-openshift-marketplace}"
+CATALOG_REGISTRY="${CATALOG_REGISTRY:-quay.io:443/acm-d}"
+CATALOG_IMAGE="${CATALOG_IMAGE:-acm-dev-catalog}"
+CATALOG_TAG=""
+MCH_WAIT_TIMEOUT=600
+PULL_SECRET_DIR="$SCRIPT_DIR/../install-custom-acm"
+PULL_SECRET_FILE="$PULL_SECRET_DIR/pull-secret.json"
+
+usage() {
+    echo "Usage: $(basename "$0") [command] [options]"
+    echo ""
+    echo "Commands:"
+    echo "  install     Install ACM (default)"
+    echo "  uninstall   Remove ACM (MCH + Subscription)"
+    echo "  status      Show ACM installation status"
+    echo ""
+    echo "Options (for install):"
+    echo "  --version VER          ACM version, e.g., 2.16, 2.15 (sets channel to release-VER)"
+    echo "  --mce-channel CHANNEL  MCE OLM channel (default: auto-derived from ACM version)"
+    echo "  --channel CHANNEL      ACM OLM channel (default: $ACM_CHANNEL)"
+    echo "  --source SOURCE        CatalogSource name (default: $ACM_SOURCE)"
+    echo "  --source-ns NS         CatalogSource namespace (default: $ACM_SOURCE_NS)"
+    echo "  --wait-timeout N       Seconds to wait for MCH (default: $MCH_WAIT_TIMEOUT)"
+    echo "  --skip-mch             Install operator only, don't create MCH"
+    echo "  --pull-secret          Merge quay.io pull secret into cluster's global pull secret"
+    echo "  --catalog-source       Apply custom CatalogSource for pre-release builds"
+    echo "  --catalog-tag TAG      Catalog image tag (default: latest-VER, e.g., latest-2.16)"
+    echo "  --catalog-image NAME   Catalog image name (default: $CATALOG_IMAGE)"
+    echo "  --catalog-registry REG Catalog image registry (default: $CATALOG_REGISTRY)"
+    echo ""
+    echo "Pull Secret:"
+    echo "  Place your quay.io pull secret JSON at:"
+    echo "    install-custom-acm/pull-secret.json"
+    echo "  See install-custom-acm/pull-secret.json.example for the expected format."
+    echo "  The cluster needs quay.io:443 credentials to pull ACM operator images."
+    echo ""
+    echo "Examples:"
+    echo "  install-custom-acm --version 2.16"
+    echo "  install-custom-acm --version 2.16 --mce-channel stable-2.11"
+    echo "  install-custom-acm --pull-secret --catalog-source --version 2.16"
+    echo "  install-custom-acm --catalog-source --catalog-tag 2.16-SNAPSHOT-2026-03-15"
+    echo "  install-custom-acm --source acm-custom-registry --source-ns openshift-marketplace"
+    echo "  install-custom-acm status"
+}
+
+merge_pull_secret() {
+    if [[ ! -f "$PULL_SECRET_FILE" ]]; then
+        log_error "Pull secret not found: $PULL_SECRET_FILE"
+        log_info "Place your quay.io pull secret JSON at:"
+        log_info "  $PULL_SECRET_FILE"
+        log_info "See install-custom-acm/pull-secret.json.example for format."
+        return 1
+    fi
+
+    log_substep "Merging quay.io pull secret into cluster global pull secret"
+
+    # Extract current global pull secret
+    local current_secret
+    current_secret=$($KUBE_CLI get secret/pull-secret -n openshift-config \
+        -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null | base64 -d)
+
+    if [[ -z "$current_secret" ]]; then
+        log_error "Could not read cluster global pull secret"
+        return 1
+    fi
+
+    # Merge the new pull secret into the existing one
+    local merged
+    merged=$(echo "$current_secret" | jq --argjson new "$(cat "$PULL_SECRET_FILE")" \
+        '.auths += $new.auths')
+
+    # Apply the merged pull secret
+    local tmpfile
+    tmpfile=$(mktemp /tmp/pull-secret-XXXXXX)
+    trap 'rm -f "$tmpfile"' RETURN
+    echo "$merged" > "$tmpfile"
+
+    $KUBE_CLI set data secret/pull-secret -n openshift-config \
+        --from-file=.dockerconfigjson="$tmpfile"
+
+    rm -f "$tmpfile"
+    trap - RETURN
+
+    log_success "Pull secret updated with quay.io:443 credentials"
+    log_info "Cluster nodes will restart to pick up the new pull secret"
+}
+
+copy_pull_secret_to_namespace() {
+    local target_ns="$1"
+    log_substep "Copying pull secret to namespace: $target_ns"
+
+    $KUBE_CLI get secret -n openshift-config pull-secret -o json 2>/dev/null | \
+        jq 'del(.metadata["name","namespace","creationTimestamp","resourceVersion","selfLink","uid","annotations"])' | \
+        jq '.metadata += {"name":"multiclusterhub-operator-pull-secret"}' | \
+        $KUBE_CLI apply -n "$target_ns" -f -
+
+    log_success "Pull secret copied as multiclusterhub-operator-pull-secret"
+}
+
+wait_for_catalog_source() {
+    local cs_name="$1"
+    local timeout="${2:-300}"
+    log_substep "Waiting for CatalogSource $cs_name to be READY..."
+    local elapsed=0
+    while [[ $elapsed -lt $timeout ]]; do
+        local state
+        state=$($KUBE_CLI get catalogsource "$cs_name" -n openshift-marketplace \
+            -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "")
+        if [[ "$state" == "READY" ]]; then
+            log_success "CatalogSource $cs_name is READY"
+            return 0
+        fi
+        printf "\r  CatalogSource %s: %-20s (%ds/%ds)" "$cs_name" "${state:-Pending}" "$elapsed" "$timeout"
+        sleep 15
+        elapsed=$((elapsed + 15))
+    done
+    echo ""
+    log_warn "CatalogSource $cs_name not READY within ${timeout}s (may still be initializing)"
+}
+
+do_install() {
+    local skip_mch=false
+    local merge_pull=false
+    local apply_catalog=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version)          ACM_VERSION="$2"; ACM_CHANNEL="release-$2"; shift 2 ;;
+            --channel)          ACM_CHANNEL="$2"; shift 2 ;;
+            --mce-channel)      MCE_CHANNEL="$2"; shift 2 ;;
+            --source)           ACM_SOURCE="$2"; shift 2 ;;
+            --source-ns)        ACM_SOURCE_NS="$2"; shift 2 ;;
+            --wait-timeout)     MCH_WAIT_TIMEOUT="$2"; shift 2 ;;
+            --skip-mch)         skip_mch=true; shift ;;
+            --pull-secret)      merge_pull=true; shift ;;
+            --catalog-source)   apply_catalog=true; shift ;;
+            --catalog-tag)      CATALOG_TAG="$2"; shift 2 ;;
+            --catalog-image)    CATALOG_IMAGE="$2"; shift 2 ;;
+            --catalog-registry) CATALOG_REGISTRY="$2"; shift 2 ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    # Default catalog tag derived from version
+    if [[ -z "$CATALOG_TAG" ]]; then
+        CATALOG_TAG="latest-${ACM_VERSION}"
+    fi
+
+    # Auto-derive MCE channel from ACM version if not provided
+    # ACM 2.x maps to MCE 2.(x-5), e.g. ACM 2.16 -> MCE 2.11
+    if [[ -z "$MCE_CHANNEL" ]]; then
+        local acm_minor mce_minor
+        acm_minor=$(echo "$ACM_VERSION" | cut -d. -f2)
+        mce_minor=$((acm_minor - 5))
+        MCE_CHANNEL="stable-2.${mce_minor}"
+    fi
+
+    log_step "Installing ACM"
+    log_info "ACM Version:  $ACM_VERSION"
+    log_info "ACM Channel:  $ACM_CHANNEL"
+    log_info "MCE Channel:  $MCE_CHANNEL (auto-derived from ACM $ACM_VERSION)"
+    log_info "Source:        $ACM_SOURCE ($ACM_SOURCE_NS)"
+    if [[ "$apply_catalog" == "true" ]]; then
+        log_info "Catalog Tag:   $CATALOG_TAG"
+    fi
+    echo ""
+
+    # 0a. Merge pull secret if requested
+    if [[ "$merge_pull" == "true" ]]; then
+        merge_pull_secret
+        echo ""
+    fi
+
+    # 0b. Apply custom CatalogSource if requested
+    if [[ "$apply_catalog" == "true" ]]; then
+        local catalog_full_image="${CATALOG_REGISTRY}/${CATALOG_IMAGE}:${CATALOG_TAG}"
+        log_substep "Applying custom CatalogSource"
+        log_info "Catalog image: $catalog_full_image"
+        cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: $CATALOG_IMAGE
+  namespace: openshift-marketplace
+spec:
+  displayName: ACM Custom Registry
+  image: $catalog_full_image
+  publisher: Red Hat
+  sourceType: grpc
+  updateStrategy:
+    registryPoll:
+      interval: 10m
+EOF
+        ACM_SOURCE="$CATALOG_IMAGE"
+        log_success "CatalogSource applied (source: $ACM_SOURCE)"
+        wait_for_catalog_source "$ACM_SOURCE"
+        echo ""
+    fi
+
+    # 1. Create namespace
+    log_substep "Creating namespace: $ACM_NAMESPACE"
+    cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $ACM_NAMESPACE
+EOF
+
+    # 2. Create OperatorGroup
+    log_substep "Creating OperatorGroup"
+    cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: open-cluster-management
+  namespace: $ACM_NAMESPACE
+spec:
+  targetNamespaces:
+    - $ACM_NAMESPACE
+EOF
+
+    # 3. Copy pull secret into ACM namespace (needed by MCH for image pulls)
+    copy_pull_secret_to_namespace "$ACM_NAMESPACE"
+
+    # 4. Create ACM Subscription
+    log_substep "Creating ACM Subscription (channel: $ACM_CHANNEL)"
+    cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: acm-operator-subscription
+  namespace: $ACM_NAMESPACE
+spec:
+  sourceNamespace: $ACM_SOURCE_NS
+  source: $ACM_SOURCE
+  channel: $ACM_CHANNEL
+  installPlanApproval: Automatic
+  name: advanced-cluster-management
+EOF
+
+    # Wait for CSV to install
+    log_substep "Waiting for ACM operator to install..."
+    local elapsed=0
+    local csv_ready=false
+    while [[ $elapsed -lt 300 ]]; do
+        local csv_name csv_phase
+        csv_name=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.currentCSV}')
+        if [[ -n "$csv_name" ]]; then
+            csv_phase=$(get_resource_field csv "$csv_name" "$ACM_NAMESPACE" '{.status.phase}')
+            if [[ "$csv_phase" == "Succeeded" ]]; then
+                csv_ready=true
+                log_success "ACM operator installed: $csv_name"
+                break
+            fi
+        else
+            csv_phase="Pending"
+        fi
+        printf "\r  Waiting for CSV... (%ds, phase: %s)" "$elapsed" "${csv_phase:-Pending}"
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
+    echo ""
+
+    if [[ "$csv_ready" == "false" ]]; then
+        log_error "ACM operator failed to install within 300s"
+        log_info "Check: $KUBE_CLI get csv -n $ACM_NAMESPACE"
+        log_info "Check: $KUBE_CLI get installplan -n $ACM_NAMESPACE"
+        return 1
+    fi
+
+    # 4. Create MCH
+    if [[ "$skip_mch" == "true" ]]; then
+        log_info "Skipping MCH creation (--skip-mch)"
+        return 0
+    fi
+
+    if resource_exists multiclusterhub multiclusterhub "$ACM_NAMESPACE"; then
+        log_info "MultiClusterHub already exists, skipping creation"
+    else
+        log_substep "Creating MultiClusterHub"
+        local mce_sub_spec
+        mce_sub_spec="{\"channel\":\"$MCE_CHANNEL\",\"source\":\"$ACM_SOURCE\",\"sourceNamespace\":\"$ACM_SOURCE_NS\"}"
+        cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: operator.open-cluster-management.io/v1
+kind: MultiClusterHub
+metadata:
+  name: multiclusterhub
+  namespace: $ACM_NAMESPACE
+  annotations:
+    installer.open-cluster-management.io/mce-subscription-spec: '$mce_sub_spec'
+spec:
+  imagePullSecret: multiclusterhub-operator-pull-secret
+EOF
+        log_info "MCH configured with MCE source: $ACM_SOURCE (channel: $MCE_CHANNEL)"
+    fi
+
+    # Wait for MCH to be Running
+    log_substep "Waiting for MCH to reach Running state (timeout: ${MCH_WAIT_TIMEOUT}s)..."
+    elapsed=0
+    while [[ $elapsed -lt $MCH_WAIT_TIMEOUT ]]; do
+        local mch_status
+        mch_status=$($KUBE_CLI get mch multiclusterhub -n "$ACM_NAMESPACE" \
+            -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+        if [[ "$mch_status" == "Running" ]]; then
+            log_success "MCH is Running"
+            break
+        fi
+        printf "\r  MCH status: %-20s (%ds/%ds)" "${mch_status:-Pending}" "$elapsed" "$MCH_WAIT_TIMEOUT"
+        sleep 15
+        elapsed=$((elapsed + 15))
+    done
+    echo ""
+
+    if [[ $elapsed -ge $MCH_WAIT_TIMEOUT ]]; then
+        log_warn "MCH not Running within timeout. It may still be initializing."
+        log_info "Check: $KUBE_CLI get mch multiclusterhub -n $ACM_NAMESPACE"
+    fi
+
+    echo ""
+    print_separator
+    log_success "ACM installation complete"
+    do_status
+    print_separator
+}
+
+do_uninstall() {
+    log_step "Uninstalling ACM"
+
+    # Delete MCH
+    if resource_exists multiclusterhub multiclusterhub "$ACM_NAMESPACE"; then
+        if confirm "Delete MultiClusterHub?"; then
+            log_substep "Deleting MultiClusterHub (this may take several minutes)"
+            $KUBE_CLI delete mch multiclusterhub -n "$ACM_NAMESPACE" --timeout=600s
+            log_success "MCH deleted"
+        fi
+    else
+        log_info "MCH not found"
+    fi
+
+    # Delete Subscription
+    if resource_exists subscription acm-operator-subscription "$ACM_NAMESPACE"; then
+        if confirm "Delete ACM Subscription?"; then
+            log_substep "Deleting Subscription"
+            $KUBE_CLI delete subscription acm-operator-subscription -n "$ACM_NAMESPACE"
+
+            # Delete all ACM CSVs (may be multiple after upgrades)
+            local csv_list
+            csv_list=$($KUBE_CLI get csv -n "$ACM_NAMESPACE" -o name 2>/dev/null | grep "advanced-cluster-management" || true)
+            for csv in $csv_list; do
+                $KUBE_CLI delete "$csv" -n "$ACM_NAMESPACE"
+            done
+            log_success "ACM operator removed"
+        fi
+    fi
+
+    echo ""
+    log_success "ACM uninstall complete"
+    log_info "Namespace $ACM_NAMESPACE was preserved. Delete manually if needed:"
+    log_info "  $KUBE_CLI delete namespace $ACM_NAMESPACE"
+}
+
+do_status() {
+    log_step "ACM Installation Status"
+    echo ""
+
+    # Subscription
+    local sub_state
+    sub_state=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.state}')
+    if [[ -n "$sub_state" ]]; then
+        local sub_channel
+        sub_channel=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.spec.channel}')
+        log_success "Subscription: $sub_state (channel: $sub_channel)"
+    else
+        log_warn "Subscription: not found"
+    fi
+
+    # CSV (use subscription's currentCSV to handle multiple CSVs after upgrades)
+    local csv_name csv_phase
+    csv_name=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.currentCSV}')
+    if [[ -n "$csv_name" ]]; then
+        csv_phase=$(get_resource_field csv "$csv_name" "$ACM_NAMESPACE" '{.status.phase}')
+    fi
+    if [[ -n "$csv_name" ]]; then
+        if [[ "$csv_phase" == "Succeeded" ]]; then
+            log_success "CSV: $csv_name ($csv_phase)"
+        else
+            log_warn "CSV: $csv_name ($csv_phase)"
+        fi
+    else
+        log_warn "CSV: not found"
+    fi
+
+    # MCH
+    local mch_phase
+    mch_phase=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.phase}')
+    if [[ -n "$mch_phase" ]]; then
+        local mch_version
+        mch_version=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.currentVersion}')
+        if [[ "$mch_phase" == "Running" ]]; then
+            log_success "MCH: $mch_phase (version: ${mch_version:-unknown})"
+        else
+            log_warn "MCH: $mch_phase (version: ${mch_version:-unknown})"
+        fi
+    else
+        log_warn "MCH: not found"
+    fi
+
+    # Image override
+    local override_cm
+    override_cm=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.metadata.annotations.installer\.open-cluster-management\.io/image-overrides-configmap}')
+    if [[ -n "$override_cm" ]]; then
+        log_info "Image Override: $override_cm"
+    fi
+
+    # ManagedClusters
+    echo ""
+    local mc_count
+    mc_count=$($KUBE_CLI get managedcluster --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    log_info "ManagedClusters: $mc_count"
+    $KUBE_CLI get managedcluster --no-headers 2>/dev/null | while read -r line; do
+        local name hub avail
+        name=$(echo "$line" | awk '{print $1}')
+        hub=$(echo "$line" | awk '{print $2}')
+        avail=$(echo "$line" | awk '{print $4}')
+        if [[ "$avail" == "True" ]]; then
+            log_success "  $name (hub=$hub, available=$avail)"
+        else
+            log_warn "  $name (hub=$hub, available=${avail:-Unknown})"
+        fi
+    done
+}
+
+# --- Main ---
+case "${1:-install}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+init_acm_tools
+
+case "${1:-install}" in
+    install)    shift 2>/dev/null || true; do_install "$@" ;;
+    uninstall)  do_uninstall ;;
+    status)     do_status ;;
+    *) log_error "Unknown command: $1"; usage; exit 1 ;;
+esac

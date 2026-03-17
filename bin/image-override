@@ -1,0 +1,200 @@
+#!/bin/bash
+# =============================================================================
+# image-override — Apply or revert MCO/MCOA image overrides on an ACM hub
+# =============================================================================
+#
+# Usage:
+#   image-override apply [--tag TAG] [--registry REGISTRY]
+#   image-override revert
+#   image-override status
+#
+# Applies image override ConfigMap to BOTH required namespaces and annotates MCH.
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+OVERRIDE_JSON="$SCRIPT_DIR/../image-override.json"
+
+usage() {
+    echo "Usage: $(basename "$0") <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  apply    Apply image overrides to the hub cluster"
+    echo "  revert   Remove image overrides and restore upstream images"
+    echo "  status   Show current image override state"
+    echo ""
+    echo "Options (for apply):"
+    echo "  --tag TAG          Override all image tags in the JSON"
+    echo "  --registry REG     Override all image registries in the JSON"
+    echo "  --force-reconcile  Toggle MCH annotation to force pod restart"
+    echo ""
+    echo "Configuration:"
+    echo "  Edit image-override.json to control which images are overridden."
+    echo "  Remove an entry to skip that image. Add entries for other images."
+    echo ""
+    echo "Examples:"
+    echo "  image-override apply                # Apply from image-override.json"
+    echo "  image-override apply --tag v44      # Apply with tag override"
+    echo "  image-override revert"
+    echo "  image-override status"
+}
+
+do_apply() {
+    local tag_override=""
+    local registry_override=""
+    local force_reconcile=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tag) tag_override="$2"; shift 2 ;;
+            --registry) registry_override="$2"; shift 2 ;;
+            --force-reconcile) force_reconcile=true; shift ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    if [[ ! -f "$OVERRIDE_JSON" ]]; then
+        log_error "image-override.json not found: $OVERRIDE_JSON"
+        log_info "Create it with your image overrides. Example:"
+        log_info '  [{"image-name":"multicluster-observability-operator","image-tag":"v43","image-remote":"quay.io/rzalavad","image-key":"multicluster_observability_operator"}]'
+        return 1
+    fi
+
+    # Read JSON and apply CLI overrides
+    local json
+    json=$(cat "$OVERRIDE_JSON")
+
+    if [[ -n "$tag_override" ]]; then
+        json=$(echo "$json" | jq --arg tag "$tag_override" '[.[] | . + {"image-tag": $tag}]')
+    fi
+    if [[ -n "$registry_override" ]]; then
+        json=$(echo "$json" | jq --arg reg "$registry_override" '[.[] | . + {"image-remote": $reg}]')
+    fi
+
+    local image_count
+    image_count=$(echo "$json" | jq 'length')
+
+    log_step "Applying image overrides ($image_count images from image-override.json)"
+    echo "$json" | jq -r '.[] | "  \(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"'
+    echo ""
+
+    # Create temp file for ConfigMap
+    local tmpfile
+    tmpfile=$(mktemp /tmp/image-override-XXXXXX)
+    trap 'rm -f "$tmpfile"' EXIT
+    echo "$json" > "$tmpfile"
+
+    # Apply to both namespaces
+    for ns in "$ACM_NAMESPACE" "$OBS_NAMESPACE"; do
+        log_substep "Creating ConfigMap in $ns"
+        $KUBE_CLI create configmap image-override \
+            -n "$ns" \
+            --from-file=image-override.json="$tmpfile" \
+            --dry-run=client -o yaml | $KUBE_CLI apply -f -
+    done
+
+    rm -f "$tmpfile"
+    trap - EXIT
+
+    # Remove deprecated annotation if present
+    $KUBE_CLI annotate mch multiclusterhub -n "$ACM_NAMESPACE" \
+        mch-imageOverridesCM- --overwrite 2>/dev/null || true
+
+    # Annotate MCH
+    log_substep "Annotating MCH with image override ConfigMap"
+    $KUBE_CLI annotate mch multiclusterhub \
+        -n "$ACM_NAMESPACE" \
+        --overwrite \
+        installer.open-cluster-management.io/image-overrides-configmap=image-override
+
+    if [[ "$force_reconcile" == "true" ]]; then
+        log_substep "Force-reconciling: toggling MCH annotation"
+        $KUBE_CLI annotate mch multiclusterhub -n "$ACM_NAMESPACE" installer.open-cluster-management.io/image-overrides-configmap- --overwrite
+        sleep 3
+        $KUBE_CLI annotate mch multiclusterhub -n "$ACM_NAMESPACE" --overwrite installer.open-cluster-management.io/image-overrides-configmap=image-override
+    fi
+
+    echo ""
+    log_success "Image overrides applied"
+    log_info "MCO operator pod will restart automatically. Check with:"
+    log_info "  $KUBE_CLI get pods -n $ACM_NAMESPACE -l name=multicluster-observability-operator"
+}
+
+do_revert() {
+    log_step "Reverting image overrides"
+
+    log_substep "Removing MCH annotation"
+    $KUBE_CLI annotate mch multiclusterhub -n "$ACM_NAMESPACE" \
+        installer.open-cluster-management.io/image-overrides-configmap- \
+        mch-imageOverridesCM- \
+        --overwrite 2>/dev/null || true
+
+    for ns in "$ACM_NAMESPACE" "$OBS_NAMESPACE"; do
+        log_substep "Deleting ConfigMap from $ns"
+        $KUBE_CLI delete configmap image-override -n "$ns" --ignore-not-found
+    done
+
+    echo ""
+    log_success "Image overrides reverted. MCH will restore upstream images."
+}
+
+do_status() {
+    log_step "Image Override Status"
+    echo ""
+
+    # MCH annotation
+    local mch_annotation
+    mch_annotation=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.metadata.annotations.installer\.open-cluster-management\.io/image-overrides-configmap}')
+    if [[ -n "$mch_annotation" ]]; then
+        log_success "MCH annotation: installer.open-cluster-management.io/image-overrides-configmap=$mch_annotation"
+    else
+        log_info "MCH annotation: not set (using upstream images)"
+    fi
+
+    # ConfigMaps
+    for ns in "$ACM_NAMESPACE" "$OBS_NAMESPACE"; do
+        if resource_exists configmap image-override "$ns"; then
+            local cm_json
+            cm_json=$($KUBE_CLI get configmap image-override -n "$ns" \
+                -o jsonpath='{.data.image-override\.json}' 2>/dev/null || echo "[]")
+            local count
+            count=$(echo "$cm_json" | jq 'length' 2>/dev/null || echo "0")
+            log_success "ConfigMap in $ns: $count image(s)"
+            echo "$cm_json" | jq -r '.[] | "    \(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' 2>/dev/null || true
+        else
+            log_info "ConfigMap in $ns: not found"
+        fi
+    done
+
+    # Current operator image
+    echo ""
+    local mco_image
+    mco_image=$(get_resource_field deployment multicluster-observability-operator "$ACM_NAMESPACE" \
+        '{.spec.template.spec.containers[0].image}')
+    if [[ -n "$mco_image" ]]; then
+        log_info "MCO operator image: $mco_image"
+    fi
+
+    local mcoa_image
+    mcoa_image=$(get_resource_field deployment $MCOA_DEPLOY "$OBS_NAMESPACE" \
+        '{.spec.template.spec.containers[0].image}')
+    if [[ -n "$mcoa_image" ]]; then
+        log_info "MCOA addon image:   $mcoa_image"
+    fi
+}
+
+# --- Main ---
+case "${1:-}" in
+    -h|--help|"") usage; exit 0 ;;
+esac
+
+init_acm_tools
+
+case "$1" in
+    apply)  shift; do_apply "$@" ;;
+    revert) do_revert ;;
+    status) do_status ;;
+    *) log_error "Unknown command: $1"; usage; exit 1 ;;
+esac

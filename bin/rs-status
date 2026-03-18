@@ -120,7 +120,7 @@ show_status() {
         echo -e "${BOLD}  MCOA Resources:${NC}"
 
         # Placements
-        for p in rs-namespace-placement rs-virt-placement; do
+        for p in rs-placement rs-virt-placement; do
             if resource_exists placement "$p" "$GLOBAL_SET_NAMESPACE"; then
                 local decision_count
                 decision_count=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \

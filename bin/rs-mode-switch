@@ -301,7 +301,7 @@ do_status() {
         fi
     else
         # MCOA placements
-        if resource_exists placement rs-namespace-placement "$GLOBAL_SET_NAMESPACE"; then
+        if resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE"; then
             log_success "  Placement (namespace): exists"
         else
             $not_found_log "  Placement (namespace): not found"

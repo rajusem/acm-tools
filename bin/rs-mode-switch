@@ -38,7 +38,7 @@ usage() {
 
 get_current_mode() {
     local annotation
-    annotation=$(get_resource_field clustermanagementaddon "$MCOA_NAME" "" \
+    annotation=$(get_resource_field mco "$MCO_NAME" "" \
         "{.metadata.annotations.${RS_ANNOTATION//./\\.}}" || echo "")
     if [[ "$annotation" == "v1" ]]; then
         echo "mcoa"
@@ -71,24 +71,10 @@ do_switch_mcoa() {
 
     log_step "Switching to MCOA mode (ManifestWork-based)"
 
-    # Check COO is installed (provides Perses dashboards)
-    if ! check_coo_installed; then
-        log_warn "Cluster Observability Operator (COO) is not installed"
-        log_info "COO provides Perses dashboards for right-sizing. Install it from OperatorHub."
-        if ! confirm "Continue without COO?"; then
-            return 1
-        fi
-    fi
-
-    # Set the annotation
-    log_substep "Setting CMA annotation: right-sizing-capable=v1"
-    $KUBE_CLI annotate clustermanagementaddon "$MCOA_NAME" \
-        "$RS_ANNOTATION=v1" --overwrite
-
-    # Trigger MCO reconcile so AnalyticsReconciler detects the CMA change
-    log_substep "Triggering MCO reconcile"
+    # Set the annotation on MCO CR
+    log_substep "Setting MCO CR annotation: right-sizing-capable=v1"
     $KUBE_CLI annotate mco "$MCO_NAME" \
-        "rs-trigger=$(date +%s)" --overwrite 2>/dev/null
+        "$RS_ANNOTATION=v1" --overwrite
 
     if [[ "$no_wait" == "false" ]]; then
         # Wait for MCO to detect annotation, sync ADC, and clean up Policies
@@ -102,6 +88,49 @@ do_switch_mcoa() {
             -n "$OBS_NAMESPACE" --timeout=120s 2>/dev/null
 
         wait_with_message 30 "Waiting for ManifestWork reconciliation"
+
+        # Wait for COO to be auto-installed by MCOA
+        log_substep "Waiting for COO auto-installation by MCOA"
+        local coo_timeout=120
+        local coo_installed=false
+        for ((i=0; i<coo_timeout; i+=10)); do
+            if check_coo_installed; then
+                coo_installed=true
+                break
+            fi
+            printf "\r  ${BLUE}Waiting for COO to be installed (%ds/%ds)...${NC}  " "$i" "$coo_timeout"
+            sleep 10
+        done
+        printf "\r%-60s\r" " "
+
+        if [[ "$coo_installed" == "true" ]]; then
+            log_success "COO auto-installed by MCOA"
+
+            # Wait for Perses pod to be ready
+            log_substep "Waiting for Perses pod"
+            local perses_timeout=90
+            local perses_ready=false
+            local coo_ns="openshift-cluster-observability-operator"
+            for ((i=0; i<perses_timeout; i+=10)); do
+                local perses_phase
+                perses_phase=$($KUBE_CLI get pods -n "$coo_ns" --no-headers 2>/dev/null | grep "^perses-" | awk '{print $3}' | head -1)
+                if [[ "$perses_phase" == "Running" ]]; then
+                    perses_ready=true
+                    break
+                fi
+                printf "\r  ${BLUE}Waiting for Perses pod (%ds/%ds)...${NC}  " "$i" "$perses_timeout"
+                sleep 10
+            done
+            printf "\r%-60s\r" " "
+
+            if [[ "$perses_ready" == "true" ]]; then
+                log_success "Perses pod running"
+            else
+                log_warn "Perses pod not ready yet — check rs-status later"
+            fi
+        else
+            log_warn "COO not installed after ${coo_timeout}s — MCOA may still be reconciling. Check rs-status later"
+        fi
     fi
 
     echo ""
@@ -115,15 +144,10 @@ do_switch_mco() {
 
     log_step "Switching to MCO mode (Policy-based)"
 
-    # Remove the annotation
-    log_substep "Removing CMA annotation"
-    $KUBE_CLI annotate clustermanagementaddon "$MCOA_NAME" \
-        "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
-
-    # Trigger MCO reconcile so AnalyticsReconciler detects the CMA change
-    log_substep "Triggering MCO reconcile"
+    # Remove the annotation from MCO CR
+    log_substep "Removing MCO CR annotation"
     $KUBE_CLI annotate mco "$MCO_NAME" \
-        "rs-trigger=$(date +%s)" --overwrite 2>/dev/null
+        "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
 
     if [[ "$no_wait" == "false" ]]; then
         # Trigger ConfigMap change to force Policy creation
@@ -209,7 +233,7 @@ do_status() {
     local mode
     mode=$(get_current_mode)
     local annotation
-    annotation=$(get_resource_field clustermanagementaddon "$MCOA_NAME" "" \
+    annotation=$(get_resource_field mco "$MCO_NAME" "" \
         "{.metadata.annotations.${RS_ANNOTATION//./\\.}}" || echo "")
 
     if [[ "$mode" == "mcoa" ]]; then

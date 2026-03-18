@@ -56,7 +56,7 @@ show_status() {
 
     # ── Mode ──
     local annotation
-    annotation=$($KUBE_CLI get clustermanagementaddon "$MCOA_NAME" \
+    annotation=$($KUBE_CLI get mco "$MCO_NAME" \
         -o jsonpath="{.metadata.annotations.${RS_ANNOTATION//./\\.}}" 2>/dev/null || echo "")
 
     local mode="MCO (Policy-based)"
@@ -66,7 +66,7 @@ show_status() {
         mode_color="$GREEN"
     fi
     echo -e "  Mode:  ${mode_color}${BOLD}$mode${NC}"
-    echo -e "  CMA:   annotation=${annotation:-<not set>}"
+    echo -e "  MCO CR: annotation=${annotation:-<not set>}"
 
     # ── MCO CR ──
     echo ""
@@ -332,7 +332,7 @@ show_status() {
 show_status_json() {
     local annotation ns_enabled virt_enabled ns_adc virt_adc
 
-    annotation=$($KUBE_CLI get clustermanagementaddon "$MCOA_NAME" \
+    annotation=$($KUBE_CLI get mco "$MCO_NAME" \
         -o jsonpath="{.metadata.annotations.${RS_ANNOTATION//./\\.}}" 2>/dev/null || echo "")
     ns_enabled=$($KUBE_CLI get mco "$MCO_NAME" \
         -o jsonpath='{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' 2>/dev/null || echo "null")

@@ -134,6 +134,24 @@ bin/rs-mode-switch mco                       # Switch to MCO mode
 
 Handles all workarounds automatically: ADC state sync wait, ConfigMap trigger for MCO mode, addon manager restart after mode switch.
 
+**How mode switching works:**
+
+The mode is controlled by a single annotation on the MCO CR (`MultiClusterObservability`):
+
+```bash
+# Switch to MCOA mode (ManifestWork-based)
+kubectl annotate mco observability \
+    observability.open-cluster-management.io/right-sizing-capable=v1 --overwrite
+
+# Switch to MCO mode (Policy-based) — remove the annotation
+kubectl annotate mco observability \
+    observability.open-cluster-management.io/right-sizing-capable-
+```
+
+The `rs-mode-switch` script wraps these with additional steps (restarting the addon manager, patching ConfigMaps, waiting for COO/Perses) to speed up reconciliation.
+
+**COO auto-installation:** When switching to MCOA mode with right-sizing enabled, MCOA automatically installs the Cluster Observability Operator (COO) and Perses dashboards. The script waits for COO installation and Perses pod readiness.
+
 ### rs-status
 
 One-screen color-coded dashboard of right-sizing state across hub and spoke clusters.

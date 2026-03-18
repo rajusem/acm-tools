@@ -143,11 +143,11 @@ collect hub/resources/placements-mco.yaml \
 
 log_substep "Placements (MCOA)"
 collect hub/resources/placements-mcoa.yaml \
-    $KUBE_CLI get placement -n "$OBS_NAMESPACE" -o yaml
+    $KUBE_CLI get placement -n "$GLOBAL_SET_NAMESPACE" -o yaml
 
 log_substep "PlacementDecisions (MCOA)"
 collect hub/resources/placementdecisions-mcoa.yaml \
-    $KUBE_CLI get placementdecision -n "$OBS_NAMESPACE" -o yaml
+    $KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" -o yaml
 
 log_substep "PlacementBindings"
 collect hub/resources/placementbindings.yaml \

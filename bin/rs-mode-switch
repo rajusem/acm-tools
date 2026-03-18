@@ -56,11 +56,29 @@ get_rs_state() {
     echo "${ns_enabled:-unset}:${virt_enabled:-unset}"
 }
 
+check_coo_installed() {
+    local coo_csv
+    coo_csv=$($KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | grep -i cluster-observability-operator || true)
+    if [[ -n "$coo_csv" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 do_switch_mcoa() {
     local no_wait=false
     [[ "${1:-}" == "--no-wait" ]] && no_wait=true
 
     log_step "Switching to MCOA mode (ManifestWork-based)"
+
+    # Check COO is installed (provides Perses dashboards)
+    if ! check_coo_installed; then
+        log_warn "Cluster Observability Operator (COO) is not installed"
+        log_info "COO provides Perses dashboards for right-sizing. Install it from OperatorHub."
+        if ! confirm "Continue without COO?"; then
+            return 1
+        fi
+    fi
 
     # Set the annotation
     log_substep "Setting CMA annotation: right-sizing-capable=v1"
@@ -176,6 +194,14 @@ do_disable() {
 }
 
 do_status() {
+    if ! resource_exists mco "$MCO_NAME"; then
+        log_step "Right-Sizing Status"
+        echo ""
+        log_warn "MCO CR not found. Set up observability first:"
+        log_info "  bin/setup-observability"
+        return 0
+    fi
+
     log_step "Right-Sizing Status"
     echo ""
 
@@ -197,15 +223,22 @@ do_status() {
     state=$(get_rs_state)
     local ns_state="${state%%:*}"
     local virt_state="${state##*:}"
+    local rs_active=false
+    [[ "$ns_state" == "true" || "$virt_state" == "true" ]] && rs_active=true
+
     echo ""
     log_info "MCO CR Right-Sizing:"
     if [[ "$ns_state" == "true" ]]; then
         log_success "  Namespace:      enabled"
+    elif [[ "$ns_state" == "false" ]]; then
+        log_info "  Namespace:      disabled"
     else
         log_warn "  Namespace:      ${ns_state}"
     fi
     if [[ "$virt_state" == "true" ]]; then
         log_success "  Virtualization: enabled"
+    elif [[ "$virt_state" == "false" ]]; then
+        log_info "  Virtualization: disabled"
     else
         log_warn "  Virtualization: ${virt_state}"
     fi
@@ -224,7 +257,10 @@ do_status() {
         log_info "  platformVirtualizationRightSizing:  ${virt_adc:-not set (auto-enables)}"
     fi
 
-    # Hub resources
+    # Hub resources (not-found is expected when right-sizing is disabled)
+    local not_found_log="log_error"
+    [[ "$rs_active" == "false" ]] && not_found_log="log_info"
+
     echo ""
     log_info "Hub Resources:"
     if [[ "$mode" == "mco" ]]; then
@@ -232,43 +268,59 @@ do_status() {
         if resource_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE"; then
             log_success "  Policy (namespace): exists"
         else
-            log_warn "  Policy (namespace): not found"
+            $not_found_log "  Policy (namespace): not found"
         fi
         if resource_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE"; then
             log_success "  Policy (virtualization): exists"
         else
-            log_warn "  Policy (virtualization): not found"
+            $not_found_log "  Policy (virtualization): not found"
         fi
     else
         # MCOA placements
-        if resource_exists placement rs-namespace-placement "$OBS_NAMESPACE"; then
+        if resource_exists placement rs-namespace-placement "$GLOBAL_SET_NAMESPACE"; then
             log_success "  Placement (namespace): exists"
         else
-            log_warn "  Placement (namespace): not found"
+            $not_found_log "  Placement (namespace): not found"
         fi
-        if resource_exists placement rs-virt-placement "$OBS_NAMESPACE"; then
+        if resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE"; then
             log_success "  Placement (virtualization): exists"
         else
-            log_warn "  Placement (virtualization): not found"
+            $not_found_log "  Placement (virtualization): not found"
         fi
 
-        # ManifestWork check (iterate all managed clusters)
+        # ManifestWork PrometheusRules per spoke
         local total_pr=0
         local spoke_list
         spoke_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        log_info "  ManifestWork PrometheusRules:"
         for spoke_name in $spoke_list; do
-            [[ "$spoke_name" == "local-cluster" ]] && continue
+            local pr_names=""
             for mw in $($KUBE_CLI get manifestwork -n "$spoke_name" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
-                local pr_count
-                pr_count=$($KUBE_CLI get "$mw" -n "$spoke_name" -o json 2>/dev/null | \
-                    jq '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs"))] | length' 2>/dev/null || echo 0)
-                total_pr=$((total_pr + pr_count))
+                local names
+                names=$($KUBE_CLI get "$mw" -n "$spoke_name" -o json 2>/dev/null | \
+                    jq -r '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs")) | .metadata.name] | .[]' 2>/dev/null || true)
+                if [[ -n "$names" ]]; then
+                    pr_names="${pr_names:+$pr_names$'\n'}$names"
+                fi
             done
+            local pr_count=0
+            if [[ -n "$pr_names" ]]; then
+                pr_count=$(echo "$pr_names" | wc -l | tr -d ' ')
+                total_pr=$((total_pr + pr_count))
+                log_success "    $spoke_name: $pr_count PrometheusRule(s)"
+                echo "$pr_names" | while read -r name; do
+                    log_info "      - $name"
+                done
+            else
+                if [[ "$rs_active" == "true" ]]; then
+                    log_error "    $spoke_name: 0 PrometheusRules"
+                else
+                    $not_found_log "    $spoke_name: 0 PrometheusRules"
+                fi
+            fi
         done
-        if [[ "$total_pr" -gt 0 ]]; then
-            log_success "  ManifestWork PrometheusRules: $total_pr"
-        else
-            log_warn "  ManifestWork PrometheusRules: 0"
+        if [[ "$total_pr" -eq 0 && "$rs_active" == "true" ]]; then
+            log_error "  Total: 0 PrometheusRules across all spokes"
         fi
     fi
 
@@ -278,12 +330,54 @@ do_status() {
     if resource_exists configmap rs-namespace-config "$OBS_NAMESPACE"; then
         log_success "  rs-namespace-config: exists"
     else
-        log_warn "  rs-namespace-config: not found"
+        $not_found_log "  rs-namespace-config: not found"
     fi
     if resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
         log_success "  rs-virt-config: exists"
     else
-        log_warn "  rs-virt-config: not found"
+        $not_found_log "  rs-virt-config: not found"
+    fi
+
+    # COO + Perses (only relevant in MCOA mode with RS active)
+    if [[ "$mode" == "mcoa" && "$rs_active" == "true" ]]; then
+        echo ""
+        log_info "Cluster Observability Operator (COO):"
+        local coo_ns="openshift-cluster-observability-operator"
+        if check_coo_installed; then
+            local coo_phase
+            coo_phase=$($KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | grep -i cluster-observability-operator | awk '{print $NF}' || true)
+            log_success "  COO: installed (${coo_phase:-unknown})"
+        else
+            log_error "  COO: not installed (required for Perses dashboards)"
+        fi
+
+        # Perses pod
+        local perses_phase
+        perses_phase=$($KUBE_CLI get pods -n "$coo_ns" --no-headers 2>/dev/null | grep "^perses-" | awk '{print $3}' | head -1)
+        if [[ "$perses_phase" == "Running" ]]; then
+            log_success "  Perses pod: Running"
+        elif [[ -n "$perses_phase" ]]; then
+            log_warn "  Perses pod: $perses_phase"
+        else
+            log_warn "  Perses pod: not found"
+        fi
+
+        # Perses dashboards
+        local dashboard_count
+        dashboard_count=$($KUBE_CLI get persesdashboard -n "$OBS_NAMESPACE" --no-headers 2>/dev/null | grep -c "acm-rs" || echo 0)
+        if [[ "$dashboard_count" -gt 0 ]]; then
+            log_success "  Perses dashboards: $dashboard_count"
+            $KUBE_CLI get persesdashboard -n "$OBS_NAMESPACE" --no-headers 2>/dev/null | grep "acm-rs" | awk '{print "    - " $1}'
+        else
+            log_warn "  Perses dashboards: 0"
+        fi
+
+        # UIPlugin
+        if $KUBE_CLI get uiplugin monitoring &>/dev/null; then
+            log_success "  UIPlugin: monitoring"
+        else
+            log_warn "  UIPlugin: not found"
+        fi
     fi
 }
 

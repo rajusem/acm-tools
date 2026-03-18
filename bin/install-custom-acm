@@ -477,5 +477,6 @@ case "${1:-install}" in
     install)    shift 2>/dev/null || true; do_install "$@" ;;
     uninstall)  do_uninstall ;;
     status)     do_status ;;
+    --*)        do_install "$@" ;;
     *) log_error "Unknown command: $1"; usage; exit 1 ;;
 esac

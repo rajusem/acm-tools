@@ -168,20 +168,36 @@ do_status() {
         fi
     done
 
-    # Current operator image
+    # Current operator images — compare with override ConfigMap
     echo ""
+    local cm_json
+    cm_json=$($KUBE_CLI get configmap image-override -n "$ACM_NAMESPACE" \
+        -o jsonpath='{.data.image-override\.json}' 2>/dev/null || echo "[]")
+
     local mco_image
     mco_image=$(get_resource_field deployment multicluster-observability-operator "$ACM_NAMESPACE" \
         '{.spec.template.spec.containers[0].image}')
     if [[ -n "$mco_image" ]]; then
-        log_info "MCO operator image: $mco_image"
+        local expected_mco
+        expected_mco=$(echo "$cm_json" | jq -r '.[] | select(.["image-key"]=="multicluster_observability_operator") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' 2>/dev/null)
+        if [[ -n "$expected_mco" && "$mco_image" != "$expected_mco" ]]; then
+            log_warn "MCO operator image: $mco_image (expected: $expected_mco — pod may need restart)"
+        else
+            log_info "MCO operator image: $mco_image"
+        fi
     fi
 
     local mcoa_image
     mcoa_image=$(get_resource_field deployment $MCOA_DEPLOY "$OBS_NAMESPACE" \
         '{.spec.template.spec.containers[0].image}')
     if [[ -n "$mcoa_image" ]]; then
-        log_info "MCOA addon image:   $mcoa_image"
+        local expected_mcoa
+        expected_mcoa=$(echo "$cm_json" | jq -r '.[] | select(.["image-key"]=="multicluster_observability_addon") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' 2>/dev/null)
+        if [[ -n "$expected_mcoa" && "$mcoa_image" != "$expected_mcoa" ]]; then
+            log_warn "MCOA addon image:   $mcoa_image (expected: $expected_mcoa — pod may need restart)"
+        else
+            log_info "MCOA addon image:   $mcoa_image"
+        fi
     fi
 }
 

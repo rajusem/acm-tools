@@ -337,7 +337,11 @@ do_status() {
     done
 
     echo ""
-    "$SCRIPT_DIR/rs-mode-switch" status 2>/dev/null || true
+    if resource_exists mco "$MCO_NAME"; then
+        "$SCRIPT_DIR/rs-mode-switch" status 2>/dev/null || true
+    else
+        log_info "Right-sizing status skipped (MCO CR not found)"
+    fi
 }
 
 # --- Main ---
@@ -351,5 +355,6 @@ case "${1:-install}" in
     install)    shift 2>/dev/null || true; do_install "$@" ;;
     uninstall)  do_uninstall ;;
     status)     do_status ;;
+    --*)        do_install "$@" ;;
     *) log_error "Unknown command: $1"; usage; exit 1 ;;
 esac

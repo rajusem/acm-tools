@@ -121,9 +121,9 @@ show_status() {
 
         # Placements
         for p in rs-namespace-placement rs-virt-placement; do
-            if resource_exists placement "$p" "$OBS_NAMESPACE"; then
+            if resource_exists placement "$p" "$GLOBAL_SET_NAMESPACE"; then
                 local decision_count
-                decision_count=$($KUBE_CLI get placementdecision -n "$OBS_NAMESPACE" \
+                decision_count=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
                     -l "cluster.open-cluster-management.io/placement=$p" \
                     -o json 2>/dev/null | jq '[.items[]?.status.decisions[]?] | length' 2>/dev/null || echo 0)
                 echo -e "    ${GREEN}$p: exists ($decision_count clusters)${NC}"
@@ -138,18 +138,24 @@ show_status() {
         local spoke_list
         spoke_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
         for spoke_name in $spoke_list; do
-            [[ "$spoke_name" == "local-cluster" ]] && continue
-            local pr_total=0
-            for mw in $($KUBE_CLI get manifestwork -n "$spoke_name" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN"); do
-                local pr_count
-                pr_count=$($KUBE_CLI get "$mw" -n "$spoke_name" -o json 2>/dev/null | \
-                    jq '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs"))] | length' 2>/dev/null || echo 0)
-                pr_total=$((pr_total + pr_count))
+            local pr_names=""
+            for mw in $($KUBE_CLI get manifestwork -n "$spoke_name" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+                local names
+                names=$($KUBE_CLI get "$mw" -n "$spoke_name" -o json 2>/dev/null | \
+                    jq -r '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs")) | .metadata.name] | .[]' 2>/dev/null || true)
+                if [[ -n "$names" ]]; then
+                    pr_names="${pr_names:+$pr_names$'\n'}$names"
+                fi
             done
-            if [[ $pr_total -gt 0 ]]; then
-                echo -e "    ${GREEN}$spoke_name: $pr_total PrometheusRule(s)${NC}"
+            if [[ -n "$pr_names" ]]; then
+                local pr_count
+                pr_count=$(echo "$pr_names" | wc -l | tr -d ' ')
+                echo -e "    ${GREEN}$spoke_name: $pr_count PrometheusRule(s)${NC}"
+                echo "$pr_names" | while read -r name; do
+                    echo -e "      ${GREEN}- $name${NC}"
+                done
             else
-                echo -e "    ${YELLOW}$spoke_name: 0 PrometheusRules${NC}"
+                echo -e "    ${RED}$spoke_name: 0 PrometheusRules${NC}"
             fi
         done
     else
@@ -169,31 +175,62 @@ show_status() {
     # ── Spoke PrometheusRules ──
     if [[ "$HUB_ONLY" == "false" ]]; then
         echo ""
-        echo -e "${BOLD}  Spoke PrometheusRules ($SPOKE):${NC}"
-        if switch_context "$SPOKE" 2>/dev/null; then
-            local rules
-            rules=$($KUBE_CLI get prometheusrule -n openshift-monitoring --no-headers 2>/dev/null | grep -i "rs-\|acm-rs" || true)
-            if [[ -n "$rules" ]]; then
-                echo "$rules" | while read -r line; do
-                    local name
-                    name=$(echo "$line" | awk '{print $1}')
-                    echo -e "    ${GREEN}$name${NC}"
-                done
-            else
-                echo -e "    ${YELLOW}No right-sizing PrometheusRules found${NC}"
+        echo -e "${BOLD}  Spoke PrometheusRules:${NC}"
+
+        # Map managed cluster names to kubeconfig contexts
+        mc_to_context() {
+            case "$1" in
+                local-cluster)   echo "$HUB_CONTEXT" ;;
+                namespace-spoke) echo "$NAMESPACE_SPOKE_CONTEXT" ;;
+                vm-spoke)        echo "$VM_SPOKE_CONTEXT" ;;
+                *)               echo "$1" ;;
+            esac
+        }
+
+        local mc_list checked_contexts=""
+        mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        for mc in $mc_list; do
+            local ctx
+            ctx=$(mc_to_context "$mc")
+            # Skip if we already checked this context (e.g. vm-spoke defaults to hub)
+            if echo "$checked_contexts" | grep -qw "$ctx"; then
+                continue
             fi
-            switch_context "$HUB_CONTEXT" &>/dev/null || true
-        else
-            echo -e "    ${RED}Could not connect to spoke: $SPOKE${NC}"
-        fi
+            checked_contexts="$checked_contexts $ctx"
+
+            if switch_context "$ctx" 2>/dev/null; then
+                local rules
+                rules=$($KUBE_CLI get prometheusrule -n openshift-monitoring --no-headers 2>/dev/null | grep -i "rs-\|acm-rs" || true)
+                if [[ -n "$rules" ]]; then
+                    echo -e "    ${GREEN}$mc ($ctx):${NC}"
+                    echo "$rules" | while read -r line; do
+                        local name
+                        name=$(echo "$line" | awk '{print $1}')
+                        echo -e "      ${GREEN}- $name${NC}"
+                    done
+                else
+                    echo -e "    ${RED}$mc ($ctx): no right-sizing PrometheusRules${NC}"
+                fi
+            else
+                echo -e "    ${RED}$mc ($ctx): could not connect${NC}"
+            fi
+        done
+        switch_context "$HUB_CONTEXT" &>/dev/null || true
     fi
 
     # ── Operator Pods ──
     echo ""
     echo -e "${BOLD}  Operator Pods:${NC}"
-    local mco_pod_status
+    local mco_pod_status mco_pod_phase
     mco_pod_status=$($KUBE_CLI get pods -n "$ACM_NAMESPACE" -l name=multicluster-observability-operator --no-headers 2>/dev/null | awk '{printf "%s (%s)", $1, $3}' | head -1)
-    echo -e "    MCO:  ${mco_pod_status:-not found}"
+    mco_pod_phase=$($KUBE_CLI get pods -n "$ACM_NAMESPACE" -l name=multicluster-observability-operator --no-headers 2>/dev/null | awk '{print $3}' | head -1)
+    if [[ "$mco_pod_phase" == "Running" ]]; then
+        echo -e "    ${GREEN}MCO:  $mco_pod_status${NC}"
+    elif [[ -n "$mco_pod_status" ]]; then
+        echo -e "    ${RED}MCO:  $mco_pod_status${NC}"
+    else
+        echo -e "    ${RED}MCO:  not found${NC}"
+    fi
 
     local mcoa_pod_status
     mcoa_pod_status=$($KUBE_CLI get pods -n "$OBS_NAMESPACE" -l app=$MCOA_DEPLOY --no-headers 2>/dev/null | awk '{printf "%s (%s)", $1, $3}' | head -1)
@@ -232,6 +269,50 @@ show_status() {
             echo -e "    ${YELLOW}MCOA: $mcoa_pod_status (unexpected — no MCOA capabilities or delegation active)${NC}"
         else
             echo -e "    ${GREEN}MCOA: not running (correct — MCO mode, no MCOA capabilities)${NC}"
+        fi
+    fi
+
+    # ── COO + Perses ──
+    if [[ "$annotation" == "v1" ]]; then
+        local coo_ns="openshift-cluster-observability-operator"
+        echo ""
+        echo -e "${BOLD}  Cluster Observability Operator (COO):${NC}"
+        local coo_csv
+        coo_csv=$($KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | grep -i cluster-observability-operator || true)
+        if [[ -n "$coo_csv" ]]; then
+            local coo_phase
+            coo_phase=$(echo "$coo_csv" | awk '{print $NF}')
+            echo -e "    ${GREEN}COO: installed ($coo_phase)${NC}"
+        else
+            echo -e "    ${RED}COO: not installed (required for Perses dashboards)${NC}"
+        fi
+
+        # Perses pod
+        local perses_phase
+        perses_phase=$($KUBE_CLI get pods -n "$coo_ns" --no-headers 2>/dev/null | grep "^perses-" | awk '{print $3}' | head -1)
+        if [[ "$perses_phase" == "Running" ]]; then
+            echo -e "    ${GREEN}Perses pod: Running${NC}"
+        elif [[ -n "$perses_phase" ]]; then
+            echo -e "    ${YELLOW}Perses pod: $perses_phase${NC}"
+        else
+            echo -e "    ${RED}Perses pod: not found${NC}"
+        fi
+
+        # Perses dashboards
+        local dashboard_count
+        dashboard_count=$($KUBE_CLI get persesdashboard -n "$OBS_NAMESPACE" --no-headers 2>/dev/null | grep -c "acm-rs" || echo 0)
+        if [[ "$dashboard_count" -gt 0 ]]; then
+            echo -e "    ${GREEN}Perses dashboards: $dashboard_count${NC}"
+            $KUBE_CLI get persesdashboard -n "$OBS_NAMESPACE" --no-headers 2>/dev/null | grep "acm-rs" | awk -v g="$GREEN" -v nc="$NC" '{print "      - " g $1 nc}'
+        else
+            echo -e "    ${RED}Perses dashboards: 0${NC}"
+        fi
+
+        # UIPlugin
+        if $KUBE_CLI get uiplugin monitoring &>/dev/null; then
+            echo -e "    ${GREEN}UIPlugin: monitoring${NC}"
+        else
+            echo -e "    ${RED}UIPlugin: not found${NC}"
         fi
     fi
 

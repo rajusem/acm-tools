@@ -401,10 +401,10 @@ do_status() {
 
     # Subscription
     local sub_state
-    sub_state=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.state}')
+    sub_state=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.state}' || echo "")
     if [[ -n "$sub_state" ]]; then
         local sub_channel
-        sub_channel=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.spec.channel}')
+        sub_channel=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.spec.channel}' || echo "")
         log_success "Subscription: $sub_state (channel: $sub_channel)"
     else
         log_warn "Subscription: not found"
@@ -412,9 +412,9 @@ do_status() {
 
     # CSV (use subscription's currentCSV to handle multiple CSVs after upgrades)
     local csv_name csv_phase
-    csv_name=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.currentCSV}')
+    csv_name=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.currentCSV}' || echo "")
     if [[ -n "$csv_name" ]]; then
-        csv_phase=$(get_resource_field csv "$csv_name" "$ACM_NAMESPACE" '{.status.phase}')
+        csv_phase=$(get_resource_field csv "$csv_name" "$ACM_NAMESPACE" '{.status.phase}' || echo "")
     fi
     if [[ -n "$csv_name" ]]; then
         if [[ "$csv_phase" == "Succeeded" ]]; then
@@ -428,10 +428,10 @@ do_status() {
 
     # MCH
     local mch_phase
-    mch_phase=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.phase}')
+    mch_phase=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.phase}' || echo "")
     if [[ -n "$mch_phase" ]]; then
         local mch_version
-        mch_version=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.currentVersion}')
+        mch_version=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.currentVersion}' || echo "")
         if [[ "$mch_phase" == "Running" ]]; then
             log_success "MCH: $mch_phase (version: ${mch_version:-unknown})"
         else
@@ -443,7 +443,7 @@ do_status() {
 
     # Image override
     local override_cm
-    override_cm=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.metadata.annotations.installer\.open-cluster-management\.io/image-overrides-configmap}')
+    override_cm=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.metadata.annotations.installer\.open-cluster-management\.io/image-overrides-configmap}' || echo "")
     if [[ -n "$override_cm" ]]; then
         log_info "Image Override: $override_cm"
     fi

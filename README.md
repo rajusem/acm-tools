@@ -166,44 +166,35 @@ bin/rs-status --json                         # JSON output for scripting
 
 Shows: mode (MCO/MCOA), MCO CR state, ADC state, ConfigMaps, mode-specific resources (Policies or Placements/ManifestWorks), spoke PrometheusRules, operator pods, and images.
 
-### collect-must-gather
+### rs-collect-must-gather
 
-Gather a diagnostic bundle for right-sizing troubleshooting.
+Gather and analyze a diagnostic bundle for right-sizing troubleshooting.
 
 ```bash
-bin/collect-must-gather                      # Collect full bundle
-bin/collect-must-gather --output-dir /tmp/diag
-bin/collect-must-gather --spoke vm-spoke     # Collect from specific spoke
-bin/collect-must-gather --skip-spoke         # Hub only
-bin/collect-must-gather --log-lines 1000     # More log lines
+bin/rs-collect-must-gather                          # Collect full bundle
+bin/rs-collect-must-gather --analyze                # Collect then analyze
+bin/rs-collect-must-gather analyze ./must-gather-*  # Analyze existing bundle
+bin/rs-collect-must-gather --spoke vm-spoke         # Collect from specific spoke
+bin/rs-collect-must-gather --skip-spoke             # Hub only
+bin/rs-collect-must-gather --log-lines 1000         # More log lines
 ```
 
 Collects MCO/MCOA operator logs, resource states (MCO CR, CMA, ADC, ConfigMaps, Policies, Placements, ManifestWorks), events, spoke PrometheusRules, and agent logs into a timestamped directory.
 
+The `analyze` subcommand examines collected data offline (no cluster connection needed) and checks for: pod health, ADC state consistency, resource mismatches, ManifestWork generation lag, log errors/panics, and missing ConfigMaps.
+
 ## Deployment Architecture
 
-MCO and MCOA are deployed differently:
+Both MCO and MCOA are deployed via MCH image overrides:
 
-| Component | Deployment Method | Image Source |
-|-----------|------------------|--------------|
-| **MCO** (multicluster-observability-operator) | MCH image override (`image-override.json` + annotation) | `multicluster_observability_operator` key in MCH manifest |
-| **MCOA** (multicluster-observability-addon) | Kustomize direct deploy (`oc apply -k deploy/`) | Image set in Kustomize manifests |
+| Component | Deployment Method | Image Key |
+|-----------|------------------|-----------|
+| **MCO** (multicluster-observability-operator) | MCH image override | `multicluster_observability_operator` |
+| **MCOA** (multicluster-observability-addon) | MCH image override → MCO deploys MCOA | `multicluster_observability_addon` |
 
-The MCH image override for `multicluster_observability_addon` updates the MCH manifest but does **not** affect the Kustomize-deployed MCOA addon manager. The MCO only creates the addon manager deployment when platform capabilities (metrics/logs/incident detection) are enabled — right-sizing alone doesn't trigger it.
+MCO creates the MCOA addon manager deployment when MCOA capabilities are active (metrics, logs, traces, incident detection) or when right-sizing is delegated to MCOA via the MCO CR annotation. The image override ConfigMap must be in **both** `open-cluster-management` (for MCO) and `open-cluster-management-observability` (for MCOA) namespaces — `image-override apply` handles this automatically.
 
-**Important:** `endpoint-observability-operator` is the hub endpoint metrics operator (a separate component), not the MCOA addon manager. Its image key is `endpoint_monitoring_operator`.
-
-### Component names (dev vs production)
-
-The Kustomize deployment (used for development) and the MCO-managed deployment (production) use different resource names:
-
-| Resource | Kustomize (dev) | MCO-managed (production) |
-|----------|----------------|--------------------------|
-| CMA | `multicluster-observability-addon` | `observability-controller` |
-| Deployment | `multicluster-observability-addon-manager` | `observability-multicluster-observability-addon` |
-| ManifestWork | `addon-multicluster-observability-addon-deploy-*` | `addon-observability-controller-deploy-*` |
-
-The tools in this repo use the Kustomize names (matching the dev workflow).
+**Important:** MCH uses `imagePullPolicy: IfNotPresent` — always increment the image tag when rebuilding (e.g., v55 → v56) to ensure the new image is pulled.
 
 ## Directory Structure
 

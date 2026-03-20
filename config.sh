@@ -11,9 +11,6 @@ export ACM_TOOLS_REGISTRY="${ACM_TOOLS_REGISTRY:-quay.io/rzalavad}"
 export MCO_IMAGE_NAME="${MCO_IMAGE_NAME:-multicluster-observability-operator}"
 export MCOA_IMAGE_NAME="${MCOA_IMAGE_NAME:-multicluster-observability-addon}"
 
-# --- Image Tag (keep MCO and MCOA in sync) ---
-export ACM_TOOLS_IMAGE_TAG="${ACM_TOOLS_IMAGE_TAG:-v43}"
-
 # --- Cluster Contexts ---
 export HUB_CONTEXT="${HUB_CONTEXT:-hub}"
 export NAMESPACE_SPOKE_CONTEXT="${NAMESPACE_SPOKE_CONTEXT:-namespace-spoke}"

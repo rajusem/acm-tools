@@ -7,7 +7,7 @@
   },
   {
     "image-name": "multicluster-observability-addon",
-    "image-tag": "v55",
+    "image-tag": "v56",
     "image-remote": "quay.io/rzalavad",
     "image-key": "multicluster_observability_addon"
   }

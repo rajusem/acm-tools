@@ -1,0 +1,792 @@
+#!/bin/bash
+# =============================================================================
+# rs-collect-must-gather — Gather and analyze diagnostic bundle for right-sizing
+# =============================================================================
+#
+# Usage:
+#   rs-collect-must-gather [options]                  # Collect bundle
+#   rs-collect-must-gather analyze <dir>              # Analyze existing bundle
+#   rs-collect-must-gather --analyze                  # Collect then analyze
+#   rs-collect-must-gather --output-dir /tmp/diag
+#   rs-collect-must-gather --spoke namespace-spoke
+#
+# Collects logs, resource states, events, and ManifestWork content
+# into a timestamped directory for offline analysis.
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+usage() {
+    echo "Usage: $(basename "$0") [command] [options]"
+    echo ""
+    echo "Commands:"
+    echo "  collect     Collect diagnostic bundle (default)"
+    echo "  analyze     Analyze a must-gather bundle for common issues"
+    echo ""
+    echo "Options (for collect):"
+    echo "  --output-dir DIR   Output directory (default: ./must-gather-<timestamp>)"
+    echo "  --spoke NAME       Spoke cluster context to collect from (default: $NAMESPACE_SPOKE_CONTEXT)"
+    echo "  --log-lines N      Number of log lines to collect (default: 500)"
+    echo "  --skip-spoke       Skip spoke cluster collection"
+    echo "  --analyze          Run analysis after collection"
+    echo ""
+    echo "Usage (analyze):"
+    echo "  $(basename "$0") analyze <must-gather-dir>"
+    echo ""
+    echo "Collects:"
+    echo "  - MCO operator logs"
+    echo "  - MCOA addon manager logs"
+    echo "  - Right-sizing resources (ConfigMaps, Policies, Placements)"
+    echo "  - ManifestWork content"
+    echo "  - AddOnDeploymentConfig state"
+    echo "  - MCO CR annotations"
+    echo "  - Events from observability namespace"
+    echo "  - Spoke PrometheusRules and agent logs"
+}
+
+# =============================================================================
+# Analyze function — works on collected must-gather directory (no cluster needed)
+# =============================================================================
+do_analyze() {
+    local dir="$1"
+
+    if [[ ! -d "$dir" ]]; then
+        log_error "Directory not found: $dir"
+        return 1
+    fi
+
+    local findings=0
+    local warnings=0
+
+    print_separator
+    echo -e "${BOLD}Right-Sizing Must-Gather Analysis${NC}"
+    echo -e "  Directory: $dir"
+    print_separator
+    echo ""
+
+    # --- Determine mode from MCO CR ---
+    local mco_cr="$dir/hub/resources/mco-cr.yaml"
+    local annotation=""
+    local mode="unknown"
+    if [[ -f "$mco_cr" ]]; then
+        annotation=$(grep -A10 "annotations:" "$mco_cr" 2>/dev/null | \
+            grep "right-sizing-capable" | awk '{print $2}' || true)
+        if [[ "$annotation" == "v1" ]]; then
+            mode="mcoa"
+        elif ! grep -q "command failed" "$mco_cr" 2>/dev/null; then
+            mode="mco"
+        fi
+    else
+        log_error "MCO CR not collected — cannot determine mode"
+        ((findings++))
+    fi
+
+    if [[ "$mode" != "unknown" ]]; then
+        if [[ "$mode" == "mcoa" ]]; then
+            echo -e "  Mode: ${GREEN}${BOLD}MCOA (ManifestWork-based)${NC}  [annotation=$annotation]"
+        else
+            echo -e "  Mode: ${BLUE}${BOLD}MCO (Policy-based)${NC}  [annotation=not set]"
+        fi
+    fi
+
+    # --- RS enabled state ---
+    local ns_enabled="false" virt_enabled="false"
+    if [[ -f "$mco_cr" ]]; then
+        ns_enabled=$(grep -A1 "namespaceRightSizingRecommendation:" "$mco_cr" 2>/dev/null | grep "enabled:" | awk '{print $2}' || echo "unset")
+        virt_enabled=$(grep -A1 "virtualizationRightSizingRecommendation:" "$mco_cr" 2>/dev/null | grep "enabled:" | awk '{print $2}' || echo "unset")
+    fi
+    echo -e "  RS: namespace=${ns_enabled}, virtualization=${virt_enabled}"
+    echo ""
+
+    # =====================================================================
+    # Check 1: MCO operator pod health
+    # =====================================================================
+    log_step "Pod Health"
+
+    local pods_acm="$dir/hub/resources/pods-acm.txt"
+    if [[ -f "$pods_acm" ]]; then
+        local mco_pod_line
+        mco_pod_line=$(grep "multicluster-observability-operator" "$pods_acm" 2>/dev/null | head -1 || true)
+        if [[ -n "$mco_pod_line" ]]; then
+            local mco_status mco_restarts
+            mco_status=$(echo "$mco_pod_line" | awk '{print $3}')
+            mco_restarts=$(echo "$mco_pod_line" | awk '{print $4}')
+            if [[ "$mco_status" != "Running" ]]; then
+                log_error "MCO operator pod: $mco_status (not Running)"
+                ((findings++))
+            elif [[ "$mco_restarts" -gt 0 ]] 2>/dev/null; then
+                log_warn "MCO operator pod: Running but $mco_restarts restart(s)"
+                ((warnings++))
+            else
+                log_success "MCO operator pod: Running"
+            fi
+        else
+            log_error "MCO operator pod: not found in pods-acm.txt"
+            ((findings++))
+        fi
+    fi
+
+    local pods_obs="$dir/hub/resources/pods-obs.txt"
+    if [[ -f "$pods_obs" ]]; then
+        local mcoa_pod_line
+        mcoa_pod_line=$(grep "addon-manager" "$pods_obs" 2>/dev/null | head -1 || true)
+        if [[ -n "$mcoa_pod_line" ]]; then
+            local mcoa_status mcoa_restarts
+            mcoa_status=$(echo "$mcoa_pod_line" | awk '{print $3}')
+            mcoa_restarts=$(echo "$mcoa_pod_line" | awk '{print $4}')
+            if [[ "$mcoa_status" != "Running" ]]; then
+                log_error "MCOA addon manager pod: $mcoa_status (not Running)"
+                ((findings++))
+            elif [[ "$mcoa_restarts" -gt 0 ]] 2>/dev/null; then
+                log_warn "MCOA addon manager pod: Running but $mcoa_restarts restart(s)"
+                ((warnings++))
+            else
+                log_success "MCOA addon manager pod: Running"
+            fi
+        else
+            if [[ "$mode" == "mcoa" ]]; then
+                log_error "MCOA addon manager pod: not found (expected in MCOA mode)"
+                ((findings++))
+            else
+                log_success "MCOA addon manager pod: not running (correct for MCO mode)"
+            fi
+        fi
+    fi
+
+    # =====================================================================
+    # Check 2: ADC state consistency (MCOA mode)
+    # =====================================================================
+    if [[ "$mode" == "mcoa" ]]; then
+        echo ""
+        log_step "ADC State Consistency"
+
+        local adc_file="$dir/hub/resources/addondeploymentconfig.yaml"
+        if [[ -f "$adc_file" ]] && ! grep -q "command failed" "$adc_file" 2>/dev/null; then
+            local ns_adc virt_adc
+            ns_adc=$(grep -A1 "name: platformNamespaceRightSizing" "$adc_file" 2>/dev/null | grep "value:" | awk '{print $2}' || true)
+            virt_adc=$(grep -A1 "name: platformVirtualizationRightSizing" "$adc_file" 2>/dev/null | grep "value:" | awk '{print $2}' || true)
+
+            # NS RS
+            if [[ "$ns_enabled" == "true" && "$ns_adc" != "enabled" ]]; then
+                log_error "ADC mismatch: namespace RS enabled in MCO CR but ADC='${ns_adc:-not set}' (expected: enabled)"
+                ((findings++))
+            elif [[ "$ns_enabled" == "false" && "$ns_adc" == "enabled" ]]; then
+                log_error "ADC mismatch: namespace RS disabled in MCO CR but ADC='enabled' (expected: disabled)"
+                ((findings++))
+            else
+                log_success "ADC namespace RS: ${ns_adc:-not set} (consistent)"
+            fi
+
+            # Virt RS
+            if [[ "$virt_enabled" == "true" && "$virt_adc" != "enabled" ]]; then
+                log_error "ADC mismatch: virtualization RS enabled in MCO CR but ADC='${virt_adc:-not set}' (expected: enabled)"
+                ((findings++))
+            elif [[ "$virt_enabled" == "false" && "$virt_adc" == "enabled" ]]; then
+                log_error "ADC mismatch: virtualization RS disabled in MCO CR but ADC='enabled' (expected: disabled)"
+                ((findings++))
+            else
+                log_success "ADC virtualization RS: ${virt_adc:-not set} (consistent)"
+            fi
+        else
+            log_warn "AddOnDeploymentConfig not collected or not found"
+            ((warnings++))
+        fi
+    fi
+
+    # =====================================================================
+    # Check 3: Mode-specific resources
+    # =====================================================================
+    echo ""
+    log_step "Resource Consistency"
+
+    local rs_active=false
+    [[ "$ns_enabled" == "true" || "$virt_enabled" == "true" ]] && rs_active=true
+
+    if [[ "$mode" == "mco" && "$rs_active" == "true" ]]; then
+        # MCO mode — should have Policies
+        local policies_file="$dir/hub/resources/policies.yaml"
+        if [[ -f "$policies_file" ]]; then
+            local ns_policy virt_policy
+            ns_policy=$(grep "name: rs-prom-rules-policy" "$policies_file" 2>/dev/null || true)
+            virt_policy=$(grep "name: rs-virt-prom-rules-policy" "$policies_file" 2>/dev/null || true)
+            if [[ -n "$ns_policy" ]]; then
+                log_success "Policy rs-prom-rules-policy: exists"
+            elif [[ "$ns_enabled" == "true" ]]; then
+                log_error "Policy rs-prom-rules-policy: missing (namespace RS is enabled)"
+                ((findings++))
+            fi
+            if [[ -n "$virt_policy" ]]; then
+                log_success "Policy rs-virt-prom-rules-policy: exists"
+            elif [[ "$virt_enabled" == "true" ]]; then
+                log_error "Policy rs-virt-prom-rules-policy: missing (virtualization RS is enabled)"
+                ((findings++))
+            fi
+        fi
+
+        # MCO mode should NOT have ManifestWork PrometheusRules
+        local mw_count=0
+        for mw_file in "$dir"/hub/manifests/*.json; do
+            [[ -f "$mw_file" ]] || continue
+            if grep -q "acm-rs" "$mw_file" 2>/dev/null; then
+                ((mw_count++))
+            fi
+        done
+        if [[ "$mw_count" -gt 0 ]]; then
+            log_warn "Found $mw_count ManifestWork(s) with RS PrometheusRules in MCO mode (stale MCOA resources?)"
+            ((warnings++))
+        fi
+    fi
+
+    if [[ "$mode" == "mcoa" && "$rs_active" == "true" ]]; then
+        # MCOA mode — should have Placements and ManifestWorks
+        local placements_file="$dir/hub/resources/placements-mcoa.yaml"
+        if [[ -f "$placements_file" ]]; then
+            local ns_placement virt_placement
+            ns_placement=$(grep "name: rs-placement" "$placements_file" 2>/dev/null | head -1 || true)
+            virt_placement=$(grep "name: rs-virt-placement" "$placements_file" 2>/dev/null || true)
+            if [[ -n "$ns_placement" ]]; then
+                log_success "Placement rs-placement: exists"
+            elif [[ "$ns_enabled" == "true" ]]; then
+                log_error "Placement rs-placement: missing (namespace RS is enabled)"
+                ((findings++))
+            fi
+            if [[ -n "$virt_placement" ]]; then
+                log_success "Placement rs-virt-placement: exists"
+            elif [[ "$virt_enabled" == "true" ]]; then
+                log_error "Placement rs-virt-placement: missing (virtualization RS is enabled)"
+                ((findings++))
+            fi
+        fi
+
+        # Check PlacementDecision — NoManagedClusterSetBindings
+        local pd_file="$dir/hub/resources/placementdecisions-mcoa.yaml"
+        if [[ -f "$placements_file" ]] && grep -q "NoManagedClusterSetBindings" "$placements_file" 2>/dev/null; then
+            log_error "Placement has NoManagedClusterSetBindings — clusters cannot be selected"
+            log_info "  Placements must be in a namespace with a ManagedClusterSetBinding"
+            ((findings++))
+        fi
+
+        # Check ManifestWork PrometheusRules
+        local mw_with_rs=0
+        local mw_total=0
+        for mw_file in "$dir"/hub/manifests/*.json; do
+            [[ -f "$mw_file" ]] || continue
+            ((mw_total++))
+            if grep -q "acm-rs" "$mw_file" 2>/dev/null; then
+                ((mw_with_rs++))
+            fi
+        done
+        if [[ "$mw_total" -gt 0 ]]; then
+            if [[ "$mw_with_rs" -gt 0 ]]; then
+                log_success "ManifestWorks with RS PrometheusRules: $mw_with_rs/$mw_total"
+            else
+                log_error "No ManifestWorks contain RS PrometheusRules (RS enabled but not deployed)"
+                ((findings++))
+            fi
+        else
+            log_error "No ManifestWorks collected (MCOA may not be reconciling)"
+            ((findings++))
+        fi
+
+        # Check for observedGeneration lag
+        for mw_file in "$dir"/hub/manifests/*.json; do
+            [[ -f "$mw_file" ]] || continue
+            local gen obs_gen spoke_name
+            gen=$(jq -r '.metadata.generation // 0' "$mw_file" 2>/dev/null || echo "0")
+            obs_gen=$(jq -r '.status.conditions[0].observedGeneration // 0' "$mw_file" 2>/dev/null || echo "0")
+            spoke_name=$(basename "$mw_file" | cut -d_ -f1)
+            if [[ "$gen" != "$obs_gen" && "$gen" != "0" ]]; then
+                log_warn "$spoke_name ManifestWork: generation=$gen != observedGeneration=$obs_gen (work agent may be stale)"
+                ((warnings++))
+            fi
+        done
+
+        # MCOA mode should NOT have Policies
+        local policies_file="$dir/hub/resources/policies.yaml"
+        if [[ -f "$policies_file" ]]; then
+            if grep -q "name: rs-prom-rules-policy\|name: rs-virt-prom-rules-policy" "$policies_file" 2>/dev/null; then
+                log_warn "RS Policies still exist in MCOA mode (should have been cleaned up by MCO)"
+                ((warnings++))
+            fi
+        fi
+    fi
+
+    # =====================================================================
+    # Check 4: Spoke PrometheusRules
+    # =====================================================================
+    local spoke_pr_file="$dir/spoke/prometheusrules-list.txt"
+    if [[ -f "$spoke_pr_file" ]] && ! grep -q "command failed" "$spoke_pr_file" 2>/dev/null; then
+        echo ""
+        log_step "Spoke PrometheusRules"
+
+        local ns_pr virt_pr
+        ns_pr=$(grep "acm-rs-namespace" "$spoke_pr_file" 2>/dev/null || true)
+        virt_pr=$(grep "acm-rs-virt" "$spoke_pr_file" 2>/dev/null || true)
+
+        if [[ "$ns_enabled" == "true" ]]; then
+            if [[ -n "$ns_pr" ]]; then
+                log_success "Namespace PrometheusRule on spoke: exists"
+            else
+                log_error "Namespace PrometheusRule on spoke: missing (namespace RS is enabled)"
+                ((findings++))
+            fi
+        fi
+        if [[ "$virt_enabled" == "true" ]]; then
+            if [[ -n "$virt_pr" ]]; then
+                log_success "Virtualization PrometheusRule on spoke: exists"
+            else
+                log_error "Virtualization PrometheusRule on spoke: missing (virtualization RS is enabled)"
+                ((findings++))
+            fi
+        fi
+    fi
+
+    # =====================================================================
+    # Check 5: Log errors
+    # =====================================================================
+    echo ""
+    log_step "Log Analysis"
+
+    # MCO operator errors
+    local mco_log="$dir/hub/logs/mco-operator.log"
+    if [[ -f "$mco_log" ]]; then
+        local rs_errors
+        rs_errors=$(grep -i "error" "$mco_log" 2>/dev/null | grep -i "right.siz\|analytics\|rs-\|rightsizing" || true)
+        if [[ -n "$rs_errors" ]]; then
+            local error_count
+            error_count=$(echo "$rs_errors" | wc -l | tr -d ' ')
+            log_warn "MCO operator: $error_count right-sizing related error(s)"
+            echo "$rs_errors" | tail -5 | while read -r line; do
+                echo -e "    ${RED}$(echo "$line" | cut -c1-120)${NC}"
+            done
+            ((warnings++))
+        else
+            log_success "MCO operator: no right-sizing errors"
+        fi
+
+        # Check for panic/fatal
+        local panics
+        panics=$(grep -i "panic\|fatal" "$mco_log" 2>/dev/null | tail -3 || true)
+        if [[ -n "$panics" ]]; then
+            log_error "MCO operator: PANIC/FATAL in logs"
+            echo "$panics" | while read -r line; do
+                echo -e "    ${RED}$(echo "$line" | cut -c1-120)${NC}"
+            done
+            ((findings++))
+        fi
+    fi
+
+    # MCOA addon manager errors
+    local mcoa_log="$dir/hub/logs/mcoa-addon-manager.log"
+    if [[ -f "$mcoa_log" ]] && ! grep -q "command failed" "$mcoa_log" 2>/dev/null; then
+        local mcoa_rs_errors
+        mcoa_rs_errors=$(grep -i "error" "$mcoa_log" 2>/dev/null | grep -i "right.siz\|analytics\|rs-\|rightsizing\|placement\|prometheusrule" || true)
+        if [[ -n "$mcoa_rs_errors" ]]; then
+            local mcoa_error_count
+            mcoa_error_count=$(echo "$mcoa_rs_errors" | wc -l | tr -d ' ')
+            log_warn "MCOA addon manager: $mcoa_error_count right-sizing related error(s)"
+            echo "$mcoa_rs_errors" | tail -5 | while read -r line; do
+                echo -e "    ${RED}$(echo "$line" | cut -c1-120)${NC}"
+            done
+            ((warnings++))
+        else
+            log_success "MCOA addon manager: no right-sizing errors"
+        fi
+
+        # Check for panic/fatal
+        local mcoa_panics
+        mcoa_panics=$(grep -i "panic\|fatal" "$mcoa_log" 2>/dev/null | tail -3 || true)
+        if [[ -n "$mcoa_panics" ]]; then
+            log_error "MCOA addon manager: PANIC/FATAL in logs"
+            echo "$mcoa_panics" | while read -r line; do
+                echo -e "    ${RED}$(echo "$line" | cut -c1-120)${NC}"
+            done
+            ((findings++))
+        fi
+    fi
+
+    # Work agent errors (spoke)
+    local work_log="$dir/spoke/work-agent.log"
+    if [[ -f "$work_log" ]] && ! grep -q "command failed" "$work_log" 2>/dev/null; then
+        local work_errors
+        work_errors=$(grep -i "error\|failed" "$work_log" 2>/dev/null | grep -i "manifestwork\|apply\|observ" | tail -5 || true)
+        if [[ -n "$work_errors" ]]; then
+            local work_error_count
+            work_error_count=$(echo "$work_errors" | wc -l | tr -d ' ')
+            log_warn "Spoke work agent: $work_error_count ManifestWork-related error(s)"
+            echo "$work_errors" | while read -r line; do
+                echo -e "    ${YELLOW}$(echo "$line" | cut -c1-120)${NC}"
+            done
+            ((warnings++))
+        else
+            log_success "Spoke work agent: no ManifestWork errors"
+        fi
+    fi
+
+    # =====================================================================
+    # Check 6: ConfigMap presence
+    # =====================================================================
+    if [[ "$rs_active" == "true" ]]; then
+        echo ""
+        log_step "ConfigMaps"
+        local ns_cm="$dir/hub/resources/configmap-rs-namespace-config.yaml"
+        local virt_cm="$dir/hub/resources/configmap-rs-virt-config.yaml"
+
+        if [[ "$ns_enabled" == "true" ]]; then
+            if [[ -f "$ns_cm" ]] && ! grep -q "command failed" "$ns_cm" 2>/dev/null; then
+                log_success "rs-namespace-config: exists"
+            else
+                log_error "rs-namespace-config: missing (namespace RS is enabled)"
+                ((findings++))
+            fi
+        fi
+        if [[ "$virt_enabled" == "true" ]]; then
+            if [[ -f "$virt_cm" ]] && ! grep -q "command failed" "$virt_cm" 2>/dev/null; then
+                log_success "rs-virt-config: exists"
+            else
+                log_error "rs-virt-config: missing (virtualization RS is enabled)"
+                ((findings++))
+            fi
+        fi
+    fi
+
+    # =====================================================================
+    # Check 7: ManagedCluster availability
+    # =====================================================================
+    local mc_file="$dir/hub/resources/managedclusteraddons.txt"
+    if [[ -f "$pods_acm" ]]; then
+        echo ""
+        log_step "Events (recent warnings)"
+        local obs_events="$dir/hub/resources/events-obs.txt"
+        if [[ -f "$obs_events" ]]; then
+            local warning_events
+            warning_events=$(grep -i "Warning" "$obs_events" 2>/dev/null | tail -5 || true)
+            if [[ -n "$warning_events" ]]; then
+                local warning_count
+                warning_count=$(grep -ci "Warning" "$obs_events" 2>/dev/null || echo "0")
+                log_warn "$warning_count warning event(s) in observability namespace (showing last 5)"
+                echo "$warning_events" | while read -r line; do
+                    echo -e "    ${YELLOW}$(echo "$line" | cut -c1-120)${NC}"
+                done
+                ((warnings++))
+            else
+                log_success "No warning events in observability namespace"
+            fi
+        fi
+    fi
+
+    # =====================================================================
+    # Summary
+    # =====================================================================
+    echo ""
+    print_separator
+    if [[ $findings -gt 0 ]]; then
+        log_error "Analysis complete: $findings finding(s), $warnings warning(s)"
+    elif [[ $warnings -gt 0 ]]; then
+        log_warn "Analysis complete: $findings finding(s), $warnings warning(s)"
+    else
+        log_success "Analysis complete: no issues found"
+    fi
+    print_separator
+}
+
+# =============================================================================
+# Collect function (original collection logic)
+# =============================================================================
+do_collect() {
+    local output_dir="$1"
+    local spoke_context="$2"
+    local log_lines="$3"
+    local skip_spoke="$4"
+
+    init_acm_tools
+
+    # Save current context and restore on exit
+    ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
+    if [[ -n "$ORIGINAL_CONTEXT" ]]; then
+        trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null' EXIT
+    fi
+
+    mkdir -p "$output_dir"/{hub/{logs,resources,manifests},spoke}
+
+    log_step "Collecting diagnostic bundle"
+    log_info "Output: $output_dir"
+    log_info "Spoke:  $spoke_context"
+    echo ""
+
+    # Helper to run a command and save output
+    collect() {
+        local file="$1"
+        shift
+        echo "# Command: $*" > "$output_dir/$file"
+        echo "# Collected: $(date)" >> "$output_dir/$file"
+        echo "" >> "$output_dir/$file"
+        "$@" >> "$output_dir/$file" 2>&1 || echo "(command failed)" >> "$output_dir/$file"
+    }
+
+    # =============================================================================
+    # Hub Cluster
+    # =============================================================================
+    log_step "Collecting from hub cluster"
+
+    # --- Logs ---
+    log_substep "MCO operator logs"
+    collect hub/logs/mco-operator.log \
+        $KUBE_CLI logs deployment/multicluster-observability-operator \
+        -n "$ACM_NAMESPACE" \
+        -c multicluster-observability-operator \
+        --tail="$log_lines"
+
+    log_substep "MCOA addon manager logs"
+    collect hub/logs/mcoa-addon-manager.log \
+        $KUBE_CLI logs deployment/$MCOA_DEPLOY \
+        -n "$OBS_NAMESPACE" \
+        --tail="$log_lines"
+
+    # Previous pod logs (if crashed)
+    log_substep "MCO operator previous logs"
+    collect hub/logs/mco-operator-previous.log \
+        $KUBE_CLI logs deployment/multicluster-observability-operator \
+        -n "$ACM_NAMESPACE" \
+        -c multicluster-observability-operator \
+        --previous --tail="$log_lines" || true
+
+    log_substep "MCOA addon manager previous logs"
+    collect hub/logs/mcoa-addon-manager-previous.log \
+        $KUBE_CLI logs deployment/$MCOA_DEPLOY \
+        -n "$OBS_NAMESPACE" \
+        --previous --tail="$log_lines" || true
+
+    # --- Resources ---
+    log_substep "MCO CR"
+    collect hub/resources/mco-cr.yaml \
+        $KUBE_CLI get mco "$MCO_NAME" -o yaml
+
+    log_substep "ClusterManagementAddOn"
+    collect hub/resources/cma.yaml \
+        $KUBE_CLI get clustermanagementaddon "$MCOA_NAME" -o yaml
+
+    log_substep "AddOnDeploymentConfig"
+    collect hub/resources/addondeploymentconfig.yaml \
+        $KUBE_CLI get addondeploymentconfig "$MCOA_NAME" -n "$OBS_NAMESPACE" -o yaml
+
+    log_substep "ConfigMaps (right-sizing)"
+    for cm in rs-namespace-config rs-virt-config; do
+        collect "hub/resources/configmap-$cm.yaml" \
+            $KUBE_CLI get configmap "$cm" -n "$OBS_NAMESPACE" -o yaml
+    done
+
+    log_substep "Policies"
+    collect hub/resources/policies.yaml \
+        $KUBE_CLI get policy -n "$GLOBAL_SET_NAMESPACE" -o yaml
+
+    log_substep "Placements (MCO)"
+    collect hub/resources/placements-mco.yaml \
+        $KUBE_CLI get placement -n "$GLOBAL_SET_NAMESPACE" -o yaml
+
+    log_substep "Placements (MCOA)"
+    collect hub/resources/placements-mcoa.yaml \
+        $KUBE_CLI get placement -n "$GLOBAL_SET_NAMESPACE" -o yaml
+
+    log_substep "PlacementDecisions (MCOA)"
+    collect hub/resources/placementdecisions-mcoa.yaml \
+        $KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" -o yaml
+
+    log_substep "PlacementBindings"
+    collect hub/resources/placementbindings.yaml \
+        $KUBE_CLI get placementbinding -n "$GLOBAL_SET_NAMESPACE" -o yaml
+
+    log_substep "ManagedClusterSetBindings"
+    collect hub/resources/managedclustersetbindings.yaml \
+        $KUBE_CLI get managedclustersetbinding -n "$OBS_NAMESPACE" -o yaml
+
+    log_substep "ManagedClusterAddOns"
+    collect hub/resources/managedclusteraddons.txt \
+        $KUBE_CLI get managedclusteraddon -A
+
+    log_substep "Pod status (MCO)"
+    collect hub/resources/pods-acm.txt \
+        $KUBE_CLI get pods -n "$ACM_NAMESPACE" -o wide
+
+    log_substep "Pod status (MCOA)"
+    collect hub/resources/pods-obs.txt \
+        $KUBE_CLI get pods -n "$OBS_NAMESPACE" -o wide
+
+    # --- ManifestWorks ---
+    log_substep "ManifestWorks (all spokes)"
+    for spoke_ns in $($KUBE_CLI get managedcluster -o name 2>/dev/null | sed 's|managedcluster.cluster.open-cluster-management.io/||'); do
+        for mw in $($KUBE_CLI get manifestwork -n "$spoke_ns" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN"); do
+            mw_basename=$(basename "$mw")
+            collect "hub/manifests/${spoke_ns}_${mw_basename}.json" \
+                $KUBE_CLI get "$mw" -n "$spoke_ns" -o json
+        done
+    done
+
+    # --- Events ---
+    log_substep "Events (observability namespace)"
+    collect hub/resources/events-obs.txt \
+        $KUBE_CLI get events -n "$OBS_NAMESPACE" --sort-by=.lastTimestamp
+
+    log_substep "Events (ACM namespace)"
+    collect hub/resources/events-acm.txt \
+        $KUBE_CLI get events -n "$ACM_NAMESPACE" --sort-by=.lastTimestamp
+
+    # --- Image info ---
+    log_substep "Current images"
+    {
+        echo "MCO Operator:"
+        $KUBE_CLI get deployment multicluster-observability-operator \
+            -n "$ACM_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null
+        echo ""
+        echo ""
+        echo "MCOA Addon Manager:"
+        $KUBE_CLI get deployment $MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null
+        echo ""
+        echo ""
+        echo "Image Override ConfigMap (ACM):"
+        $KUBE_CLI get configmap image-override -n "$ACM_NAMESPACE" -o jsonpath='{.data.image-override\.json}' 2>/dev/null || echo "(not found)"
+        echo ""
+    } > "$output_dir/hub/resources/images.txt"
+
+    # =============================================================================
+    # Spoke Cluster
+    # =============================================================================
+    if [[ "$skip_spoke" == "false" ]]; then
+        log_step "Collecting from spoke cluster: $spoke_context"
+
+        if switch_context "$spoke_context"; then
+            log_substep "PrometheusRules"
+            collect spoke/prometheusrules.yaml \
+                $KUBE_CLI get prometheusrule -n openshift-monitoring -o yaml
+
+            log_substep "PrometheusRule list"
+            collect spoke/prometheusrules-list.txt \
+                $KUBE_CLI get prometheusrule -n openshift-monitoring
+
+            log_substep "Governance agent logs"
+            gov_pod=$($KUBE_CLI get pods -n open-cluster-management-agent-addon \
+                --no-headers 2>/dev/null | grep governance | awk '{print $1}' | head -1 || true)
+            if [[ -n "$gov_pod" ]]; then
+                collect spoke/governance-agent.log \
+                    $KUBE_CLI logs "$gov_pod" -n open-cluster-management-agent-addon --tail="$log_lines"
+            fi
+
+            log_substep "Work agent logs"
+            work_pod=$($KUBE_CLI get pods -n open-cluster-management-agent \
+                --no-headers 2>/dev/null | grep -E 'work|klusterlet-agent' | awk '{print $1}' | head -1 || true)
+            if [[ -n "$work_pod" ]]; then
+                collect spoke/work-agent.log \
+                    $KUBE_CLI logs "$work_pod" -n open-cluster-management-agent --tail="$log_lines"
+            fi
+
+            log_substep "Agent pods status"
+            collect spoke/agent-pods.txt \
+                $KUBE_CLI get pods -n open-cluster-management-agent -o wide
+            collect spoke/agent-addon-pods.txt \
+                $KUBE_CLI get pods -n open-cluster-management-agent-addon -o wide
+
+            # Switch back to hub
+            switch_context "$HUB_CONTEXT" || true
+        else
+            log_warn "Could not connect to spoke: $spoke_context"
+        fi
+    fi
+
+    # =============================================================================
+    # Summary
+    # =============================================================================
+    echo ""
+    log_step "Generating summary"
+
+    {
+        echo "=== Right-Sizing Must-Gather Summary ==="
+        echo "Collected: $(date)"
+        echo "Hub context: $HUB_CONTEXT"
+        echo "Spoke context: $spoke_context"
+        echo ""
+
+        # Mode
+        annotation=$(grep -A10 "annotations:" "$output_dir/hub/resources/mco-cr.yaml" 2>/dev/null | \
+            grep "right-sizing-capable" | awk '{print $2}' || echo "not found")
+        echo "Right-sizing mode: $(if [[ "$annotation" == "v1" ]]; then echo "MCOA"; else echo "MCO"; fi) (MCO CR annotation: $annotation)"
+
+        # RS state
+        echo ""
+        echo "MCO CR state:"
+        grep -A2 "namespaceRightSizingRecommendation:" "$output_dir/hub/resources/mco-cr.yaml" 2>/dev/null | head -3 || echo "  (not found)"
+        grep -A2 "virtualizationRightSizingRecommendation:" "$output_dir/hub/resources/mco-cr.yaml" 2>/dev/null | head -3 || echo "  (not found)"
+
+        # File listing
+        echo ""
+        echo "=== Collected Files ==="
+        find "$output_dir" -type f | sort | sed "s|$output_dir/||"
+    } > "$output_dir/SUMMARY.txt"
+
+    # Count files
+    local file_count
+    file_count=$(find "$output_dir" -type f | wc -l | tr -d ' ')
+
+    echo ""
+    print_separator
+    log_success "Must-gather collected: $file_count files"
+    log_info "Location: $output_dir"
+    log_info "Summary:  $output_dir/SUMMARY.txt"
+    print_separator
+
+    echo ""
+    log_info "To create a shareable archive:"
+    log_info "  tar czf $(basename "$output_dir").tar.gz -C $(dirname "$output_dir") $(basename "$output_dir")"
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    analyze)
+        shift
+        if [[ $# -eq 0 ]]; then
+            log_error "Usage: $(basename "$0") analyze <must-gather-dir>"
+            exit 1
+        fi
+        do_analyze "$1"
+        exit 0
+        ;;
+esac
+
+# Parse collect options
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+OUTPUT_DIR=""
+SPOKE_CONTEXT="$NAMESPACE_SPOKE_CONTEXT"
+LOG_LINES=500
+SKIP_SPOKE=false
+RUN_ANALYZE=false
+
+# Skip "collect" subcommand if present
+[[ "${1:-}" == "collect" ]] && shift
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --spoke)      SPOKE_CONTEXT="$2"; shift 2 ;;
+        --log-lines)  LOG_LINES="$2"; shift 2 ;;
+        --skip-spoke) SKIP_SPOKE=true; shift ;;
+        --analyze)    RUN_ANALYZE=true; shift ;;
+        -h|--help)    usage; exit 0 ;;
+        *) log_error "Unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+OUTPUT_DIR="${OUTPUT_DIR:-./must-gather-$TIMESTAMP}"
+
+do_collect "$OUTPUT_DIR" "$SPOKE_CONTEXT" "$LOG_LINES" "$SKIP_SPOKE"
+
+if [[ "$RUN_ANALYZE" == "true" ]]; then
+    echo ""
+    do_analyze "$OUTPUT_DIR"
+fi

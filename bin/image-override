@@ -176,7 +176,7 @@ do_status() {
 
     local mco_image
     mco_image=$(get_resource_field deployment multicluster-observability-operator "$ACM_NAMESPACE" \
-        '{.spec.template.spec.containers[0].image}')
+        '{.spec.template.spec.containers[0].image}' || echo "")
     if [[ -n "$mco_image" ]]; then
         local expected_mco
         expected_mco=$(echo "$cm_json" | jq -r '.[] | select(.["image-key"]=="multicluster_observability_operator") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' 2>/dev/null)
@@ -189,7 +189,7 @@ do_status() {
 
     local mcoa_image
     mcoa_image=$(get_resource_field deployment $MCOA_DEPLOY "$OBS_NAMESPACE" \
-        '{.spec.template.spec.containers[0].image}')
+        '{.spec.template.spec.containers[0].image}' || echo "")
     if [[ -n "$mcoa_image" ]]; then
         local expected_mcoa
         expected_mcoa=$(echo "$cm_json" | jq -r '.[] | select(.["image-key"]=="multicluster_observability_addon") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' 2>/dev/null)

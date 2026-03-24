@@ -124,6 +124,7 @@ OBS_NAMESPACE="open-cluster-management-observability"
 ACM_NAMESPACE="open-cluster-management"
 GLOBAL_SET_NAMESPACE="open-cluster-management-global-set"
 RS_ANNOTATION="observability.open-cluster-management.io/right-sizing-capable"
+ANALYTICS_NAMESPACE="observability-analytics"
 
 # Load config at source time (safe — no CLI dependency).
 # CLI detection is deferred to init_acm_tools so --help works without oc/kubectl.

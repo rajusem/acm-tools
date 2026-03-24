@@ -1,13 +1,13 @@
 [
   {
     "image-name": "multicluster-observability-operator",
-    "image-tag": "v55",
+    "image-tag": "v57",
     "image-remote": "quay.io/rzalavad",
     "image-key": "multicluster_observability_operator"
   },
   {
     "image-name": "multicluster-observability-addon",
-    "image-tag": "v56",
+    "image-tag": "v58",
     "image-remote": "quay.io/rzalavad",
     "image-key": "multicluster_observability_addon"
   }

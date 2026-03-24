@@ -300,10 +300,10 @@ show_status() {
 
         # Perses dashboards
         local dashboard_count
-        dashboard_count=$($KUBE_CLI get persesdashboard -n "$OBS_NAMESPACE" --no-headers 2>/dev/null | grep -c "acm-rs" || echo 0)
+        dashboard_count=$($KUBE_CLI get persesdashboard -n "$ANALYTICS_NAMESPACE" --no-headers 2>/dev/null | grep -c "acm-rs" || echo 0)
         if [[ "$dashboard_count" -gt 0 ]]; then
             echo -e "    ${GREEN}Perses dashboards: $dashboard_count${NC}"
-            $KUBE_CLI get persesdashboard -n "$OBS_NAMESPACE" --no-headers 2>/dev/null | grep "acm-rs" | awk -v g="$GREEN" -v nc="$NC" '{print "      - " g $1 nc}'
+            $KUBE_CLI get persesdashboard -n "$ANALYTICS_NAMESPACE" --no-headers 2>/dev/null | grep "acm-rs" | awk -v g="$GREEN" -v nc="$NC" '{print "      - " g $1 nc}'
         else
             echo -e "    ${RED}Perses dashboards: 0${NC}"
         fi

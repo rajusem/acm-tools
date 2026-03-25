@@ -61,6 +61,7 @@ bin/install-custom-acm --catalog-source --catalog-tag 2.16-SNAPSHOT-2026-03-15  
 bin/install-custom-acm --skip-mch                         # Install operator only, skip MCH
 bin/install-custom-acm status                             # Show installation status
 bin/install-custom-acm uninstall                          # Remove ACM
+bin/install-custom-acm uninstall --force-remove           # Remove managed clusters + ACM
 ```
 
 Installs ACM operator and creates MultiClusterHub (MCH), which manages MCE (multicluster-engine) automatically. MCE channel is auto-derived from ACM version (ACM 2.x → MCE 2.(x-5)), e.g., ACM 2.16 → MCE `stable-2.11`.
@@ -90,6 +91,26 @@ bin/setup-observability --mcoa-mode          # Enable right-sizing in MCOA mode
 bin/setup-observability status               # Show observability status
 bin/setup-observability uninstall            # Remove MCO CR
 ```
+
+### add-managed-cluster
+
+Import or remove OpenShift clusters as ACM managed clusters.
+
+```bash
+bin/add-managed-cluster add namespace-spoke               # Import from kubeconfig context
+bin/add-managed-cluster add vm-spoke --name my-vm-cluster  # Import with custom name
+bin/add-managed-cluster add namespace-spoke --no-wait      # Import without waiting
+bin/add-managed-cluster add vm-spoke --force-import        # Clean existing klusterlet and re-import
+bin/add-managed-cluster status                             # List managed clusters
+bin/add-managed-cluster remove namespace-spoke             # Remove (with confirmation)
+bin/add-managed-cluster remove namespace-spoke --force     # Remove without confirmation
+```
+
+Creates a ManagedCluster CR on the hub, then extracts the klusterlet import manifests and applies them on the spoke via `--context`. This works regardless of hub→spoke network connectivity (only requires spoke→hub). The ManagedCluster is labeled `vendor: OpenShift`. A `KlusterletAddonConfig` is also created to enable policy addons (policy controller, application manager, search collector) — these are required for MCO Policy-based right-sizing to enforce PrometheusRules on spokes. Observability addon auto-deploys via MCO/MCOA after import.
+
+Before importing, the script checks if the spoke already has a klusterlet installed (from a previous hub attachment). If detected, it blocks with an error showing the existing hub URL. Use `--force-import` to clean up the existing klusterlet and re-import.
+
+The `remove` command performs a **detach** — it removes ACM's management but leaves the spoke cluster intact. The klusterlet agent on the spoke may need manual removal if the spoke is unreachable.
 
 ### image-override
 

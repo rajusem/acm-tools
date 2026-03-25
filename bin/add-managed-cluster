@@ -1,0 +1,527 @@
+#!/bin/bash
+# =============================================================================
+# add-managed-cluster -- Import or remove OpenShift clusters as ACM managed clusters
+# =============================================================================
+#
+# Usage:
+#   add-managed-cluster add <context> [--name <name>]    # Import a cluster
+#   add-managed-cluster add <context> --force-import     # Clean existing klusterlet and re-import
+#   add-managed-cluster status                           # List managed clusters
+#   add-managed-cluster remove <cluster-name>            # Remove (detach) a managed cluster
+#   add-managed-cluster remove <cluster-name> --force    # Remove without confirmation
+#
+# Imports an existing OpenShift cluster (accessible via kubeconfig context)
+# as an ACM managed cluster. Creates a ManagedCluster CR on the hub, then
+# applies klusterlet import manifests on the spoke via --context (works
+# regardless of hub→spoke connectivity, only requires spoke→hub).
+#
+# Before importing, checks if the spoke already has a klusterlet installed.
+# If detected, blocks with an error. Use --force-import to clean up the
+# existing klusterlet and re-import.
+#
+# The 'remove' command performs a DETACH operation — it removes ACM's management
+# of the cluster but leaves the spoke cluster intact. The klusterlet agent on
+# the spoke may need manual removal if the spoke is unreachable.
+#
+# Examples:
+#   add-managed-cluster add namespace-spoke
+#   add-managed-cluster add vm-spoke --name my-vm-cluster
+#   add-managed-cluster add namespace-spoke --force-import
+#   add-managed-cluster status
+#   add-managed-cluster remove namespace-spoke
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# --- Usage -------------------------------------------------------------------
+
+usage() {
+    echo "Usage: $(basename "$0") <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  add <context>   Import a cluster from the given kubeconfig context"
+    echo "  status          List managed clusters with availability status"
+    echo "  remove <name>   Remove (detach) a managed cluster"
+    echo ""
+    echo "Options (for add):"
+    echo "  --name NAME     ManagedCluster name (default: context name)"
+    echo "  --force-import  Clean up existing klusterlet on spoke and re-import"
+    echo "  --no-wait       Skip waiting for cluster to become Available"
+    echo "  --timeout N     Wait timeout in seconds (default: 120)"
+    echo ""
+    echo "Options (for remove):"
+    echo "  --force         Skip confirmation prompt"
+    echo ""
+    echo "Examples:"
+    echo "  $(basename "$0") add namespace-spoke"
+    echo "  $(basename "$0") add vm-spoke --name my-vm-cluster"
+    echo "  $(basename "$0") add namespace-spoke --no-wait"
+    echo "  $(basename "$0") status"
+    echo "  $(basename "$0") remove namespace-spoke"
+}
+
+# --- Helpers -----------------------------------------------------------------
+
+check_acm_installed() {
+    if ! $KUBE_CLI api-resources --api-group=cluster.open-cluster-management.io 2>/dev/null | grep managedclusters >/dev/null; then
+        log_error "ACM ManagedCluster CRD not found on hub cluster"
+        log_info "Install ACM first: bin/install-custom-acm"
+        exit 1
+    fi
+}
+
+validate_cluster_name() {
+    local name="$1"
+    if ! echo "$name" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; then
+        log_error "Invalid cluster name: '$name'"
+        log_info "Must be lowercase alphanumeric with dashes, starting and ending with alphanumeric"
+        return 1
+    fi
+}
+
+validate_spoke_context() {
+    local ctx="$1"
+
+    if ! $KUBE_CLI config get-contexts "$ctx" &>/dev/null; then
+        log_error "Context '$ctx' not found in kubeconfig"
+        log_info "Available contexts:"
+        $KUBE_CLI config get-contexts -o name 2>/dev/null | sed 's/^/  /'
+        return 1
+    fi
+
+    log_substep "Validating spoke cluster connectivity"
+    if ! $KUBE_CLI --context="$ctx" cluster-info &>/dev/null; then
+        log_error "Cannot connect to cluster via context '$ctx'"
+        log_error "The cluster may be hibernating, unreachable, or credentials may have expired."
+        log_info "Try: $KUBE_CLI --context=$ctx cluster-info"
+        return 1
+    fi
+
+    log_success "Spoke cluster reachable via context '$ctx'"
+}
+
+detect_hub_as_spoke() {
+    local spoke_ctx="$1"
+    local spoke_api hub_api
+
+    spoke_api=$($KUBE_CLI config view --context="$spoke_ctx" --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
+    hub_api=$($KUBE_CLI config view --context="$HUB_CONTEXT" --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
+
+    if [[ "$spoke_api" == "$hub_api" ]]; then
+        log_error "Context '$spoke_ctx' points to the same API server as the hub ($hub_api)"
+        log_error "The hub cluster is already managed as 'local-cluster'"
+        log_info "Use a different cluster context for spoke import"
+        return 1
+    fi
+}
+
+detect_existing_klusterlet() {
+    local spoke_ctx="$1"
+    local force="$2"
+
+    # Check if klusterlet is already installed on the spoke
+    local klusterlet_ns
+    klusterlet_ns=$($KUBE_CLI --context="$spoke_ctx" get namespace open-cluster-management-agent \
+        -o jsonpath='{.metadata.name}' 2>/dev/null || echo "")
+
+    if [[ -z "$klusterlet_ns" ]]; then
+        return 0  # No klusterlet — safe to import
+    fi
+
+    # Klusterlet namespace exists — identify which hub it's attached to
+    local hub_url
+    hub_url=$($KUBE_CLI --context="$spoke_ctx" get secret bootstrap-hub-kubeconfig \
+        -n open-cluster-management-agent \
+        -o jsonpath='{.data.kubeconfig}' 2>/dev/null | base64 -d 2>/dev/null | \
+        grep "server:" | head -1 | awk '{print $2}' || echo "unknown")
+
+    log_error "Spoke cluster is already attached to a hub"
+    log_error "  Existing hub: $hub_url"
+
+    if [[ "$force" == "true" ]]; then
+        log_warn "Cleaning up existing klusterlet on spoke (--force-import)"
+        # Remove klusterlet CR first (triggers operator cleanup)
+        $KUBE_CLI --context="$spoke_ctx" delete klusterlet klusterlet --ignore-not-found --timeout=30s 2>/dev/null || true
+        # Remove klusterlet namespaces
+        $KUBE_CLI --context="$spoke_ctx" delete namespace open-cluster-management-agent --ignore-not-found --timeout=60s 2>/dev/null || true
+        $KUBE_CLI --context="$spoke_ctx" delete namespace open-cluster-management-agent-addon --ignore-not-found --timeout=60s 2>/dev/null || true
+        # Remove klusterlet CRD and cluster-scoped RBAC
+        $KUBE_CLI --context="$spoke_ctx" delete crd klusterlets.operator.open-cluster-management.io --ignore-not-found 2>/dev/null || true
+        $KUBE_CLI --context="$spoke_ctx" delete clusterrole klusterlet klusterlet-bootstrap-kubeconfig open-cluster-management:klusterlet-admin-aggregate-clusterrole --ignore-not-found 2>/dev/null || true
+        $KUBE_CLI --context="$spoke_ctx" delete clusterrolebinding klusterlet --ignore-not-found 2>/dev/null || true
+        log_success "Existing klusterlet cleaned up"
+        return 0
+    fi
+
+    log_info "Use --force-import to clean up the existing klusterlet and re-import"
+    return 1
+}
+
+extract_spoke_kubeconfig() {
+    local ctx="$1"
+    local kubeconfig
+    kubeconfig=$($KUBE_CLI config view --context="$ctx" --minify --flatten --raw 2>/dev/null)
+
+    if [[ -z "$kubeconfig" ]]; then
+        log_error "Failed to extract kubeconfig for context '$ctx'"
+        return 1
+    fi
+
+    # Warn if using token-based auth (may expire during import)
+    # Send to stderr since stdout is captured by command substitution
+    if echo "$kubeconfig" | grep -q "token:"; then
+        log_warn "Spoke kubeconfig uses token-based auth — token may expire during import" >&2
+        log_info "Consider using a service account token for reliable long-term import" >&2
+    fi
+
+    echo "$kubeconfig"
+}
+
+wait_for_namespace() {
+    local ns="$1"
+    local timeout="${2:-30}"
+    local elapsed=0
+
+    while [[ $elapsed -lt $timeout ]]; do
+        if $KUBE_CLI get namespace "$ns" &>/dev/null; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    log_error "Namespace '$ns' not created after ${timeout}s"
+    log_info "ACM may not be processing the ManagedCluster CR"
+    return 1
+}
+
+# --- Subcommands -------------------------------------------------------------
+
+do_add() {
+    local spoke_context=""
+    local cluster_name=""
+    local no_wait=false
+    local force_import=false
+    local wait_timeout=120
+
+    # Parse: first positional arg is context
+    if [[ $# -eq 0 ]]; then
+        log_error "Missing required argument: <context>"
+        usage
+        exit 1
+    fi
+
+    spoke_context="$1"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)         cluster_name="$2"; shift 2 ;;
+            --no-wait)      no_wait=true; shift ;;
+            --force-import) force_import=true; shift ;;
+            --timeout)      wait_timeout="$2"; shift 2 ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    # Default cluster name to context name
+    cluster_name="${cluster_name:-$spoke_context}"
+
+    validate_cluster_name "$cluster_name"
+
+    log_step "Importing cluster '$cluster_name' from context '$spoke_context'"
+    echo ""
+
+    # Check ACM is installed on hub (already on hub context from main)
+    check_acm_installed
+
+    # Validate spoke context and connectivity (uses --context flag, no context switch)
+    validate_spoke_context "$spoke_context"
+
+    # Ensure spoke is not the hub itself
+    detect_hub_as_spoke "$spoke_context"
+
+    # Check if spoke is already attached to a hub
+    log_substep "Checking for existing klusterlet on spoke"
+    detect_existing_klusterlet "$spoke_context" "$force_import"
+
+    # Check if ManagedCluster already exists
+    if resource_exists managedcluster "$cluster_name"; then
+        local existing_available
+        existing_available=$($KUBE_CLI get managedcluster "$cluster_name" \
+            -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
+            2>/dev/null || echo "")
+        if [[ "$existing_available" == "True" ]]; then
+            log_warn "ManagedCluster '$cluster_name' already exists and is Available"
+            log_info "Use 'remove' first to re-import"
+            return 0
+        else
+            log_warn "ManagedCluster '$cluster_name' exists but is not Available (status: ${existing_available:-Unknown})"
+            if confirm "Re-create auto-import secret to retry import?"; then
+                log_info "Re-creating auto-import secret..."
+            else
+                log_info "Cancelled"
+                return 0
+            fi
+        fi
+    fi
+
+    # Create ManagedCluster CR (if not already existing from retry path)
+    if ! resource_exists managedcluster "$cluster_name"; then
+        log_substep "Creating ManagedCluster CR"
+        cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: cluster.open-cluster-management.io/v1
+kind: ManagedCluster
+metadata:
+  name: $cluster_name
+  labels:
+    vendor: OpenShift
+spec:
+  hubAcceptsClient: true
+EOF
+        log_success "ManagedCluster '$cluster_name' created"
+    fi
+
+    # Wait for ACM to create the cluster namespace
+    log_substep "Waiting for namespace '$cluster_name'"
+    wait_for_namespace "$cluster_name"
+
+    # Create KlusterletAddonConfig to enable policy addons on spoke
+    # (required for MCO Policy-based right-sizing to enforce PrometheusRules)
+    log_substep "Creating KlusterletAddonConfig"
+    cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: agent.open-cluster-management.io/v1
+kind: KlusterletAddonConfig
+metadata:
+  name: $cluster_name
+  namespace: $cluster_name
+spec:
+  clusterName: $cluster_name
+  clusterNamespace: $cluster_name
+  applicationManager:
+    enabled: true
+  certPolicyController:
+    enabled: true
+  policyController:
+    enabled: true
+  searchCollector:
+    enabled: true
+EOF
+    log_success "KlusterletAddonConfig created"
+
+    # Import using manual method: extract import manifests from hub, apply on spoke.
+    # This always works because we have spoke context and spoke→hub connectivity
+    # (unlike auto-import which requires hub→spoke connectivity).
+
+    # Wait for hub to generate import secret
+    log_substep "Waiting for import manifests to be generated"
+    local import_elapsed=0
+    while [[ $import_elapsed -lt 60 ]]; do
+        if resource_exists secret "${cluster_name}-import" "$cluster_name"; then
+            break
+        fi
+        sleep 2
+        import_elapsed=$((import_elapsed + 2))
+    done
+
+    if ! resource_exists secret "${cluster_name}-import" "$cluster_name"; then
+        log_error "Import secret '${cluster_name}-import' not found after 60s"
+        log_info "ACM may not be processing the ManagedCluster. Check:"
+        log_info "  $KUBE_CLI get mch -n $ACM_NAMESPACE"
+        return 1
+    fi
+
+    # Extract and apply CRDs + import manifests on spoke
+    log_substep "Applying klusterlet CRDs on spoke"
+    $KUBE_CLI get secret "${cluster_name}-import" -n "$cluster_name" \
+        -o jsonpath='{.data.crds\.yaml}' | base64 -d | \
+        $KUBE_CLI --context="$spoke_context" apply -f -
+
+    log_substep "Applying import manifests on spoke"
+    $KUBE_CLI get secret "${cluster_name}-import" -n "$cluster_name" \
+        -o jsonpath='{.data.import\.yaml}' | base64 -d | \
+        $KUBE_CLI --context="$spoke_context" apply -f -
+
+    log_success "Klusterlet installed on spoke"
+
+    # Wait for cluster to become Available
+    local available=false
+    if [[ "$no_wait" == "false" ]]; then
+        log_substep "Waiting for cluster to become Available (timeout: ${wait_timeout}s)"
+        local elapsed=0
+        while [[ $elapsed -lt $wait_timeout ]]; do
+            local mc_status
+            mc_status=$($KUBE_CLI get managedcluster "$cluster_name" \
+                -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
+                2>/dev/null || echo "")
+            if [[ "$mc_status" == "True" ]]; then
+                available=true
+                break
+            fi
+            printf "\r  ${BLUE}Waiting for ManagedCluster to become Available (%ds/%ds)...${NC}  " "$elapsed" "$wait_timeout"
+            sleep 5
+            elapsed=$((elapsed + 5))
+        done
+        printf "\r%-70s\r" " "
+
+        if [[ "$available" == "true" ]]; then
+            log_success "Cluster '$cluster_name' is Available"
+        else
+            log_warn "Cluster '$cluster_name' not Available after ${wait_timeout}s"
+            log_info "Import may still be in progress. Check with:"
+            log_info "  $KUBE_CLI get managedcluster $cluster_name"
+        fi
+    else
+        log_info "Skipping wait (--no-wait). Check status with:"
+        log_info "  $(basename "$0") status"
+    fi
+
+    # Summary
+    echo ""
+    print_separator
+    if [[ "$available" == "true" ]]; then
+        log_success "Cluster '$cluster_name' imported successfully"
+    else
+        log_info "Import initiated for cluster '$cluster_name'"
+    fi
+    log_info "Observability addon will auto-deploy via MCO/MCOA"
+    print_separator
+}
+
+do_status() {
+    log_step "Managed Clusters"
+    echo ""
+
+    check_acm_installed
+
+    local mc_output
+    mc_output=$($KUBE_CLI get managedcluster --no-headers 2>/dev/null || echo "")
+
+    if [[ -z "$mc_output" ]]; then
+        log_info "No managed clusters found"
+        return 0
+    fi
+
+    # Header
+    printf "  ${BOLD}%-30s %-12s %-12s %-10s %s${NC}\n" "NAME" "HUB-ACCEPT" "AVAILABLE" "JOINED" "AGE"
+    echo "  $(printf '%.0s-' {1..80})"
+
+    while IFS= read -r line; do
+        local name hub_accepted avail joined age
+        name=$(echo "$line" | awk '{print $1}')
+        hub_accepted=$(echo "$line" | awk '{print $2}')
+        avail=$(echo "$line" | awk '{print $4}')
+        joined=$(echo "$line" | awk '{print $5}')
+        age=$(echo "$line" | awk '{print $6}')
+
+        local color="$RED"
+        [[ "$avail" == "True" ]] && color="$GREEN"
+        [[ "$avail" == "Unknown" ]] && color="$YELLOW"
+
+        printf "  ${color}%-30s %-12s %-12s %-10s %s${NC}\n" \
+            "$name" "$hub_accepted" "$avail" "$joined" "$age"
+    done <<< "$mc_output"
+
+    # Summary
+    local total_count avail_count
+    total_count=$(echo "$mc_output" | wc -l | tr -d ' ')
+    avail_count=$(echo "$mc_output" | awk '$4=="True"' | wc -l | tr -d ' ')
+    echo ""
+    log_info "Total: $total_count cluster(s), $avail_count available"
+
+    # Pending auto-imports
+    local pending
+    pending=$($KUBE_CLI get secret -A --no-headers 2>/dev/null | grep "auto-import-secret" || true)
+    if [[ -n "$pending" ]]; then
+        echo ""
+        log_info "Pending auto-imports:"
+        echo "$pending" | while IFS= read -r line; do
+            local ns
+            ns=$(echo "$line" | awk '{print $1}')
+            log_warn "  $ns: auto-import-secret exists (import may be in progress)"
+        done
+    fi
+}
+
+do_remove() {
+    local cluster_name=""
+    local force=false
+
+    if [[ $# -eq 0 ]]; then
+        log_error "Missing required argument: <cluster-name>"
+        usage
+        exit 1
+    fi
+
+    cluster_name="$1"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    log_step "Removing managed cluster: $cluster_name"
+
+    # Block local-cluster deletion
+    if [[ "$cluster_name" == "local-cluster" ]]; then
+        log_error "Cannot remove 'local-cluster' (hub self-management)"
+        log_info "The local-cluster is managed by ACM and should not be deleted manually."
+        return 1
+    fi
+
+    if ! resource_exists managedcluster "$cluster_name"; then
+        log_warn "ManagedCluster '$cluster_name' not found"
+        return 0
+    fi
+
+    # Show current state
+    local avail
+    avail=$($KUBE_CLI get managedcluster "$cluster_name" \
+        -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
+        2>/dev/null || echo "Unknown")
+    log_info "Current status: Available=$avail"
+
+    # Confirm
+    if [[ "$force" == "false" ]]; then
+        if ! confirm "Detach cluster '$cluster_name' from the hub?"; then
+            log_info "Cancelled"
+            return 0
+        fi
+    fi
+
+    # Delete ManagedCluster (cascade handles namespace, secrets, addons)
+    log_substep "Deleting ManagedCluster CR"
+    $KUBE_CLI delete managedcluster "$cluster_name" --wait=true --timeout=120s
+
+    log_success "ManagedCluster '$cluster_name' removed"
+    log_info "ACM will clean up the cluster namespace and hub-side resources"
+    if [[ "$avail" != "True" ]]; then
+        log_warn "Spoke was not Available — klusterlet on the spoke may need manual removal"
+    fi
+}
+
+# --- Main --------------------------------------------------------------------
+
+case "${1:-}" in
+    -h|--help|"") usage; exit 0 ;;
+esac
+
+init_acm_tools
+
+# Save and restore original context on exit, then switch to hub
+ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
+trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null 2>&1 || true' EXIT
+switch_context "$HUB_CONTEXT" || { log_error "Failed to switch to hub context"; exit 1; }
+
+case "$1" in
+    add)    shift; do_add "$@" ;;
+    status) do_status ;;
+    remove) shift; do_remove "$@" ;;
+    *)      log_error "Unknown command: $1"; usage; exit 1 ;;
+esac

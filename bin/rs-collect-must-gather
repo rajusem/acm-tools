@@ -465,7 +465,7 @@ do_analyze() {
             warning_events=$(grep -i "Warning" "$obs_events" 2>/dev/null | tail -5 || true)
             if [[ -n "$warning_events" ]]; then
                 local warning_count
-                warning_count=$(grep -ci "Warning" "$obs_events" 2>/dev/null || echo "0")
+                warning_count=$(grep -ci "Warning" "$obs_events" 2>/dev/null || true)
                 log_warn "$warning_count warning event(s) in observability namespace (showing last 5)"
                 echo "$warning_events" | while read -r line; do
                     echo -e "    ${YELLOW}$(echo "$line" | cut -c1-120)${NC}"

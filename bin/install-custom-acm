@@ -50,6 +50,9 @@ usage() {
     echo "  uninstall   Remove ACM (MCH + Subscription)"
     echo "  status      Show ACM installation status"
     echo ""
+    echo "Options (for uninstall):"
+    echo "  --force-remove  Detach all managed clusters before deleting MCH"
+    echo ""
     echo "Options (for install):"
     echo "  --version VER          ACM version, e.g., 2.16, 2.15 (sets channel to release-VER)"
     echo "  --mce-channel CHANNEL  MCE OLM channel (default: auto-derived from ACM version)"
@@ -258,7 +261,19 @@ EOF
     # 3. Copy pull secret into ACM namespace (needed by MCH for image pulls)
     copy_pull_secret_to_namespace "$ACM_NAMESPACE"
 
-    # 4. Create ACM Subscription
+    # 4. Verify channel exists in catalog before creating Subscription
+    log_substep "Verifying channel '$ACM_CHANNEL' exists in $ACM_SOURCE"
+    local available_channels
+    available_channels=$($KUBE_CLI get packagemanifest advanced-cluster-management \
+        -n openshift-marketplace -o jsonpath='{.status.channels[*].name}' 2>/dev/null || echo "")
+    if [[ -n "$available_channels" ]] && ! echo "$available_channels" | tr ' ' '\n' | grep -q "^${ACM_CHANNEL}$"; then
+        log_error "Channel '$ACM_CHANNEL' not found in $ACM_SOURCE catalog"
+        log_info "Available channels: $available_channels"
+        log_info "Use --catalog-source for pre-release builds, or choose an available version"
+        return 1
+    fi
+
+    # 5. Create ACM Subscription
     log_substep "Creating ACM Subscription (channel: $ACM_CHANNEL)"
     cat <<EOF | $KUBE_CLI apply -f -
 apiVersion: operators.coreos.com/v1alpha1
@@ -280,7 +295,7 @@ EOF
     local csv_ready=false
     while [[ $elapsed -lt 300 ]]; do
         local csv_name csv_phase
-        csv_name=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.currentCSV}')
+        csv_name=$(get_resource_field subscription.operators.coreos.com acm-operator-subscription "$ACM_NAMESPACE" '{.status.currentCSV}')
         if [[ -n "$csv_name" ]]; then
             csv_phase=$(get_resource_field csv "$csv_name" "$ACM_NAMESPACE" '{.status.phase}')
             if [[ "$csv_phase" == "Succeeded" ]]; then
@@ -360,24 +375,67 @@ EOF
 }
 
 do_uninstall() {
+    local force_remove=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force-remove) force_remove=true; shift ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+
     log_step "Uninstalling ACM"
+
+    # Remove managed clusters if --force-remove (MCH webhook blocks deletion if ManagedClusters exist)
+    if [[ "$force_remove" == "true" ]]; then
+        local mc_list
+        mc_list=$($KUBE_CLI get managedcluster --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | grep -v "^local-cluster$" || true)
+        if [[ -n "$mc_list" ]]; then
+            log_substep "Removing managed clusters (--force-remove)"
+            while IFS= read -r mc_name; do
+                [[ -z "$mc_name" ]] && continue
+                log_info "  Detaching: $mc_name"
+                $KUBE_CLI delete managedcluster "$mc_name" --wait=true --timeout=120s 2>/dev/null || true
+            done <<< "$mc_list"
+            log_success "Managed clusters removed"
+        fi
+    fi
 
     # Delete MCH
     if resource_exists multiclusterhub multiclusterhub "$ACM_NAMESPACE"; then
-        if confirm "Delete MultiClusterHub?"; then
+        if [[ "$force_remove" == "true" ]] || confirm "Delete MultiClusterHub?"; then
             log_substep "Deleting MultiClusterHub (this may take several minutes)"
-            $KUBE_CLI delete mch multiclusterhub -n "$ACM_NAMESPACE" --timeout=600s
-            log_success "MCH deleted"
+            $KUBE_CLI delete mch multiclusterhub -n "$ACM_NAMESPACE" --timeout=600s 2>/dev/null || {
+                # MCH delete can get stuck if local-cluster is blocking cleanup
+                log_warn "MCH delete timed out — removing local-cluster to unblock"
+                $KUBE_CLI delete managedcluster local-cluster --timeout=60s 2>/dev/null || \
+                    $KUBE_CLI patch managedcluster local-cluster --type=merge \
+                        -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+                # Wait for MCH to finish
+                local mch_elapsed=0
+                while [[ $mch_elapsed -lt 300 ]]; do
+                    if ! resource_exists multiclusterhub multiclusterhub "$ACM_NAMESPACE"; then
+                        break
+                    fi
+                    sleep 10
+                    mch_elapsed=$((mch_elapsed + 10))
+                done
+            }
+            if ! resource_exists multiclusterhub multiclusterhub "$ACM_NAMESPACE"; then
+                log_success "MCH deleted"
+            else
+                log_warn "MCH still exists — may need manual cleanup"
+            fi
         fi
     else
         log_info "MCH not found"
     fi
 
     # Delete Subscription
-    if resource_exists subscription acm-operator-subscription "$ACM_NAMESPACE"; then
-        if confirm "Delete ACM Subscription?"; then
+    if resource_exists subscription.operators.coreos.com acm-operator-subscription "$ACM_NAMESPACE"; then
+        if [[ "$force_remove" == "true" ]] || confirm "Delete ACM Subscription?"; then
             log_substep "Deleting Subscription"
-            $KUBE_CLI delete subscription acm-operator-subscription -n "$ACM_NAMESPACE"
+            $KUBE_CLI delete subscription.operators.coreos.com acm-operator-subscription -n "$ACM_NAMESPACE"
 
             # Delete all ACM CSVs (may be multiple after upgrades)
             local csv_list
@@ -401,10 +459,10 @@ do_status() {
 
     # Subscription
     local sub_state
-    sub_state=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.state}' || echo "")
+    sub_state=$(get_resource_field subscription.operators.coreos.com acm-operator-subscription "$ACM_NAMESPACE" '{.status.state}' || echo "")
     if [[ -n "$sub_state" ]]; then
         local sub_channel
-        sub_channel=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.spec.channel}' || echo "")
+        sub_channel=$(get_resource_field subscription.operators.coreos.com acm-operator-subscription "$ACM_NAMESPACE" '{.spec.channel}' || echo "")
         log_success "Subscription: $sub_state (channel: $sub_channel)"
     else
         log_warn "Subscription: not found"
@@ -412,7 +470,7 @@ do_status() {
 
     # CSV (use subscription's currentCSV to handle multiple CSVs after upgrades)
     local csv_name csv_phase
-    csv_name=$(get_resource_field subscription acm-operator-subscription "$ACM_NAMESPACE" '{.status.currentCSV}' || echo "")
+    csv_name=$(get_resource_field subscription.operators.coreos.com acm-operator-subscription "$ACM_NAMESPACE" '{.status.currentCSV}' || echo "")
     if [[ -n "$csv_name" ]]; then
         csv_phase=$(get_resource_field csv "$csv_name" "$ACM_NAMESPACE" '{.status.phase}' || echo "")
     fi
@@ -475,7 +533,7 @@ init_acm_tools
 
 case "${1:-install}" in
     install)    shift 2>/dev/null || true; do_install "$@" ;;
-    uninstall)  do_uninstall ;;
+    uninstall)  shift; do_uninstall "$@" ;;
     status)     do_status ;;
     --*)        do_install "$@" ;;
     *) log_error "Unknown command: $1"; usage; exit 1 ;;

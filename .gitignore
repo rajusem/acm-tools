@@ -6,6 +6,8 @@ must-gather-*/
 
 # Secrets (keep .example, ignore actual secrets)
 install-custom-acm/pull-secret.json
+*.kubeconfig
+auto-import-secret*
 
 # Temp files
 *.tmp

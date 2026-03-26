@@ -241,7 +241,7 @@ do_analyze() {
 
     if [[ "$mode" == "mcoa" && "$rs_active" == "true" ]]; then
         # MCOA mode — should have Placements and ManifestWorks
-        local placements_file="$dir/hub/resources/placements-mcoa.yaml"
+        local placements_file="$dir/hub/resources/placements.yaml"
         if [[ -f "$placements_file" ]]; then
             local ns_placement virt_placement
             ns_placement=$(grep "name: rs-placement" "$placements_file" 2>/dev/null | head -1 || true)
@@ -261,7 +261,6 @@ do_analyze() {
         fi
 
         # Check PlacementDecision — NoManagedClusterSetBindings
-        local pd_file="$dir/hub/resources/placementdecisions-mcoa.yaml"
         if [[ -f "$placements_file" ]] && grep -q "NoManagedClusterSetBindings" "$placements_file" 2>/dev/null; then
             log_error "Placement has NoManagedClusterSetBindings — clusters cannot be selected"
             log_info "  Placements must be in a namespace with a ManagedClusterSetBinding"
@@ -453,27 +452,24 @@ do_analyze() {
     fi
 
     # =====================================================================
-    # Check 7: ManagedCluster availability
+    # Check 7: Events
     # =====================================================================
-    local mc_file="$dir/hub/resources/managedclusteraddons.txt"
-    if [[ -f "$pods_acm" ]]; then
-        echo ""
-        log_step "Events (recent warnings)"
-        local obs_events="$dir/hub/resources/events-obs.txt"
-        if [[ -f "$obs_events" ]]; then
-            local warning_events
-            warning_events=$(grep -i "Warning" "$obs_events" 2>/dev/null | tail -5 || true)
-            if [[ -n "$warning_events" ]]; then
-                local warning_count
-                warning_count=$(grep -ci "Warning" "$obs_events" 2>/dev/null || true)
-                log_warn "$warning_count warning event(s) in observability namespace (showing last 5)"
-                echo "$warning_events" | while read -r line; do
-                    echo -e "    ${YELLOW}$(echo "$line" | cut -c1-120)${NC}"
-                done
-                ((warnings++))
-            else
-                log_success "No warning events in observability namespace"
-            fi
+    echo ""
+    log_step "Events (recent warnings)"
+    local obs_events="$dir/hub/resources/events-obs.txt"
+    if [[ -f "$obs_events" ]]; then
+        local warning_events
+        warning_events=$(grep -i "Warning" "$obs_events" 2>/dev/null | tail -5 || true)
+        if [[ -n "$warning_events" ]]; then
+            local warning_count
+            warning_count=$(grep -ci "Warning" "$obs_events" 2>/dev/null || true)
+            log_warn "$warning_count warning event(s) in observability namespace (showing last 5)"
+            echo "$warning_events" | while read -r line; do
+                echo -e "    ${YELLOW}$(echo "$line" | cut -c1-120)${NC}"
+            done
+            ((warnings++))
+        else
+            log_success "No warning events in observability namespace"
         fi
     fi
 
@@ -582,16 +578,12 @@ do_collect() {
     collect hub/resources/policies.yaml \
         $KUBE_CLI get policy -n "$GLOBAL_SET_NAMESPACE" -o yaml
 
-    log_substep "Placements (MCO)"
-    collect hub/resources/placements-mco.yaml \
+    log_substep "Placements"
+    collect hub/resources/placements.yaml \
         $KUBE_CLI get placement -n "$GLOBAL_SET_NAMESPACE" -o yaml
 
-    log_substep "Placements (MCOA)"
-    collect hub/resources/placements-mcoa.yaml \
-        $KUBE_CLI get placement -n "$GLOBAL_SET_NAMESPACE" -o yaml
-
-    log_substep "PlacementDecisions (MCOA)"
-    collect hub/resources/placementdecisions-mcoa.yaml \
+    log_substep "PlacementDecisions"
+    collect hub/resources/placementdecisions.yaml \
         $KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" -o yaml
 
     log_substep "PlacementBindings"
@@ -624,6 +616,23 @@ do_collect() {
         done
     done
 
+    # --- COO / Perses (MCOA mode) ---
+    log_substep "COO CSV status"
+    collect hub/resources/coo-csv.txt \
+        $KUBE_CLI get csv -n openshift-operators --no-headers
+
+    log_substep "PersesDashboards"
+    collect hub/resources/persesdashboards.txt \
+        $KUBE_CLI get persesdashboard -n "$ANALYTICS_NAMESPACE"
+
+    log_substep "PersesDatasources"
+    collect hub/resources/persesdatasources.txt \
+        $KUBE_CLI get persesdatasource -n "$ANALYTICS_NAMESPACE"
+
+    log_substep "UIPlugin"
+    collect hub/resources/uiplugin.yaml \
+        $KUBE_CLI get uiplugin monitoring -o yaml
+
     # --- Events ---
     log_substep "Events (observability namespace)"
     collect hub/resources/events-obs.txt \
@@ -639,13 +648,13 @@ do_collect() {
         echo "MCO Operator:"
         $KUBE_CLI get deployment multicluster-observability-operator \
             -n "$ACM_NAMESPACE" \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "(not found)"
         echo ""
         echo ""
         echo "MCOA Addon Manager:"
         $KUBE_CLI get deployment $MCOA_DEPLOY \
             -n "$OBS_NAMESPACE" \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "(not deployed)"
         echo ""
         echo ""
         echo "Image Override ConfigMap (ACM):"

@@ -54,6 +54,12 @@ show_status() {
     print_separator
     echo ""
 
+    if ! resource_exists mco "$MCO_NAME"; then
+        log_warn "MCO CR '$MCO_NAME' not found. Set up observability first:"
+        log_info "  bin/setup-observability"
+        return 0
+    fi
+
     # ── Mode ──
     local annotation
     annotation=$($KUBE_CLI get mco "$MCO_NAME" \
@@ -193,7 +199,7 @@ show_status() {
             local ctx
             ctx=$(mc_to_context "$mc")
             # Skip if we already checked this context (e.g. vm-spoke defaults to hub)
-            if echo "$checked_contexts" | grep -qw "$ctx"; then
+            if echo "$checked_contexts" | grep -w "$ctx" >/dev/null; then
                 continue
             fi
             checked_contexts="$checked_contexts $ctx"

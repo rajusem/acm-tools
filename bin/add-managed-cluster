@@ -75,7 +75,7 @@ check_acm_installed() {
 
 validate_cluster_name() {
     local name="$1"
-    if ! echo "$name" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; then
+    if ! echo "$name" | grep -E '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' >/dev/null; then
         log_error "Invalid cluster name: '$name'"
         log_info "Must be lowercase alphanumeric with dashes, starting and ending with alphanumeric"
         return 1
@@ -172,7 +172,7 @@ extract_spoke_kubeconfig() {
 
     # Warn if using token-based auth (may expire during import)
     # Send to stderr since stdout is captured by command substitution
-    if echo "$kubeconfig" | grep -q "token:"; then
+    if echo "$kubeconfig" | grep "token:" >/dev/null; then
         log_warn "Spoke kubeconfig uses token-based auth — token may expire during import" >&2
         log_info "Consider using a service account token for reliable long-term import" >&2
     fi
@@ -238,17 +238,7 @@ do_add() {
     # Check ACM is installed on hub (already on hub context from main)
     check_acm_installed
 
-    # Validate spoke context and connectivity (uses --context flag, no context switch)
-    validate_spoke_context "$spoke_context"
-
-    # Ensure spoke is not the hub itself
-    detect_hub_as_spoke "$spoke_context"
-
-    # Check if spoke is already attached to a hub
-    log_substep "Checking for existing klusterlet on spoke"
-    detect_existing_klusterlet "$spoke_context" "$force_import"
-
-    # Check if ManagedCluster already exists
+    # Check if ManagedCluster already exists on hub (before touching spoke)
     if resource_exists managedcluster "$cluster_name"; then
         local existing_available
         existing_available=$($KUBE_CLI get managedcluster "$cluster_name" \
@@ -260,14 +250,22 @@ do_add() {
             return 0
         else
             log_warn "ManagedCluster '$cluster_name' exists but is not Available (status: ${existing_available:-Unknown})"
-            if confirm "Re-create auto-import secret to retry import?"; then
-                log_info "Re-creating auto-import secret..."
-            else
+            if ! confirm "Re-create import manifests to retry import?"; then
                 log_info "Cancelled"
                 return 0
             fi
         fi
     fi
+
+    # Validate spoke context and connectivity (uses --context flag, no context switch)
+    validate_spoke_context "$spoke_context"
+
+    # Ensure spoke is not the hub itself
+    detect_hub_as_spoke "$spoke_context"
+
+    # Check if spoke is already attached to a hub
+    log_substep "Checking for existing klusterlet on spoke"
+    detect_existing_klusterlet "$spoke_context" "$force_import"
 
     # Create ManagedCluster CR (if not already existing from retry path)
     if ! resource_exists managedcluster "$cluster_name"; then

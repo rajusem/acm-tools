@@ -14,7 +14,7 @@ export MCOA_IMAGE_NAME="${MCOA_IMAGE_NAME:-multicluster-observability-addon}"
 # --- Cluster Contexts ---
 export HUB_CONTEXT="${HUB_CONTEXT:-hub}"
 export NAMESPACE_SPOKE_CONTEXT="${NAMESPACE_SPOKE_CONTEXT:-namespace-spoke}"
-export VM_SPOKE_CONTEXT="${VM_SPOKE_CONTEXT:-$HUB_CONTEXT}"
+export VM_SPOKE_CONTEXT="${VM_SPOKE_CONTEXT:-vm-spoke}"
 
 # --- Container Engine ---
 export CONTAINER_ENGINE="${CONTAINER_ENGINE:-$(command -v podman 2>/dev/null || command -v docker 2>/dev/null)}"

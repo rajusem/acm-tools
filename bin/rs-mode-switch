@@ -69,6 +69,14 @@ do_switch_mcoa() {
     local no_wait=false
     [[ "${1:-}" == "--no-wait" ]] && no_wait=true
 
+    local current_mode
+    current_mode=$(get_current_mode)
+    if [[ "$current_mode" == "mcoa" ]]; then
+        log_info "Already in MCOA mode — no change needed"
+        do_status
+        return 0
+    fi
+
     log_step "Switching to MCOA mode (ManifestWork-based)"
 
     # Set the annotation on MCO CR
@@ -142,6 +150,14 @@ do_switch_mco() {
     local no_wait=false
     [[ "${1:-}" == "--no-wait" ]] && no_wait=true
 
+    local current_mode
+    current_mode=$(get_current_mode)
+    if [[ "$current_mode" == "mco" ]]; then
+        log_info "Already in MCO mode — no change needed"
+        do_status
+        return 0
+    fi
+
     log_step "Switching to MCO mode (Policy-based)"
 
     # Remove the annotation from MCO CR
@@ -176,7 +192,7 @@ do_enable() {
         case "$1" in
             --ns-only)   virt_flag=false; shift ;;
             --virt-only) ns_flag=false; shift ;;
-            *) shift ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
         esac
     done
 

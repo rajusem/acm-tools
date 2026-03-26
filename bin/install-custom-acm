@@ -33,10 +33,13 @@ source "$SCRIPT_DIR/../lib/common.sh"
 ACM_VERSION="${ACM_VERSION:-2.16}"
 ACM_CHANNEL="${ACM_CHANNEL:-release-$ACM_VERSION}"
 MCE_CHANNEL="${MCE_CHANNEL:-}"
+MCE_SOURCE="${MCE_SOURCE:-}"
 ACM_SOURCE="${ACM_SOURCE:-redhat-operators}"
 ACM_SOURCE_NS="${ACM_SOURCE_NS:-openshift-marketplace}"
 CATALOG_REGISTRY="${CATALOG_REGISTRY:-quay.io:443/acm-d}"
 CATALOG_IMAGE="${CATALOG_IMAGE:-acm-dev-catalog}"
+MCE_CATALOG_IMAGE="${MCE_CATALOG_IMAGE:-mce-dev-catalog}"
+MCE_CATALOG_TAG=""
 CATALOG_TAG=""
 MCH_WAIT_TIMEOUT=600
 PULL_SECRET_DIR="$SCRIPT_DIR/../install-custom-acm"
@@ -56,6 +59,7 @@ usage() {
     echo "Options (for install):"
     echo "  --version VER          ACM version, e.g., 2.16, 2.15 (sets channel to release-VER)"
     echo "  --mce-channel CHANNEL  MCE OLM channel (default: auto-derived from ACM version)"
+    echo "  --mce-source SOURCE    MCE CatalogSource name (default: redhat-operators)"
     echo "  --channel CHANNEL      ACM OLM channel (default: $ACM_CHANNEL)"
     echo "  --source SOURCE        CatalogSource name (default: $ACM_SOURCE)"
     echo "  --source-ns NS         CatalogSource namespace (default: $ACM_SOURCE_NS)"
@@ -167,6 +171,7 @@ do_install() {
             --version)          ACM_VERSION="$2"; ACM_CHANNEL="release-$2"; shift 2 ;;
             --channel)          ACM_CHANNEL="$2"; shift 2 ;;
             --mce-channel)      MCE_CHANNEL="$2"; shift 2 ;;
+            --mce-source)       MCE_SOURCE="$2"; shift 2 ;;
             --source)           ACM_SOURCE="$2"; shift 2 ;;
             --source-ns)        ACM_SOURCE_NS="$2"; shift 2 ;;
             --wait-timeout)     MCH_WAIT_TIMEOUT="$2"; shift 2 ;;
@@ -210,11 +215,53 @@ do_install() {
         echo ""
     fi
 
-    # 0b. Apply custom CatalogSource if requested
+    # 0b. Apply custom CatalogSources if requested
     if [[ "$apply_catalog" == "true" ]]; then
-        local catalog_full_image="${CATALOG_REGISTRY}/${CATALOG_IMAGE}:${CATALOG_TAG}"
-        log_substep "Applying custom CatalogSource"
-        log_info "Catalog image: $catalog_full_image"
+        # Derive MCE catalog tag from MCE channel if not set
+        if [[ -z "$MCE_CATALOG_TAG" ]]; then
+            MCE_CATALOG_TAG="latest-${MCE_CHANNEL#stable-}"
+        fi
+        local acm_catalog_full="${CATALOG_REGISTRY}/${CATALOG_IMAGE}:${CATALOG_TAG}"
+        local mce_catalog_full="${CATALOG_REGISTRY}/${MCE_CATALOG_IMAGE}:${MCE_CATALOG_TAG}"
+
+        log_substep "Applying ImageDigestMirrorSet"
+        cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: image-mirror-custom
+spec:
+  imageDigestMirrors:
+    - mirrors:
+        - 'quay.io:443/acm-d'
+        - brew.registry.redhat.io/rh-osbs/rhacm2
+      source: registry.redhat.io/rhacm2
+    - mirrors:
+        - 'quay.io:443/acm-d'
+        - brew.registry.redhat.io/rh-osbs/multicluster-engine
+      source: registry.redhat.io/multicluster-engine
+    - mirrors:
+        - brew.registry.redhat.io/rh-osbs
+      source: registry-proxy.engineering.redhat.com/rh-osbs
+    - mirrors:
+        - brew.registry.redhat.io/rh-osbs/rhacm2
+      source: registry.stage.redhat.io/rhacm2
+    - mirrors:
+        - brew.registry.redhat.io/rh-osbs/multicluster-engine
+      source: registry.stage.redhat.io/multicluster-engine
+    - mirrors:
+        - brew.registry.redhat.io/rh-osbs/oadp
+      source: registry.stage.redhat.io/oadp
+    - mirrors:
+        - brew.registry.redhat.io/rh-osbs/oadp
+      source: registry.redhat.io/oadp
+    - mirrors:
+        - 'quay.io:443/acm-d'
+      source: registry.redhat.io/openshift4
+EOF
+
+        log_substep "Applying ACM CatalogSource"
+        log_info "ACM catalog image: $acm_catalog_full"
         cat <<EOF | $KUBE_CLI apply -f -
 apiVersion: operators.coreos.com/v1alpha1
 kind: CatalogSource
@@ -222,8 +269,8 @@ metadata:
   name: $CATALOG_IMAGE
   namespace: openshift-marketplace
 spec:
-  displayName: ACM Custom Registry
-  image: $catalog_full_image
+  displayName: Advanced Cluster Management
+  image: $acm_catalog_full
   publisher: Red Hat
   sourceType: grpc
   updateStrategy:
@@ -231,8 +278,30 @@ spec:
       interval: 10m
 EOF
         ACM_SOURCE="$CATALOG_IMAGE"
-        log_success "CatalogSource applied (source: $ACM_SOURCE)"
+        log_success "ACM CatalogSource applied (source: $ACM_SOURCE)"
+
+        log_substep "Applying MCE CatalogSource"
+        log_info "MCE catalog image: $mce_catalog_full"
+        cat <<EOF | $KUBE_CLI apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: $MCE_CATALOG_IMAGE
+  namespace: openshift-marketplace
+spec:
+  displayName: MultiCluster Engine
+  image: $mce_catalog_full
+  publisher: Red Hat
+  sourceType: grpc
+  updateStrategy:
+    registryPoll:
+      interval: 10m
+EOF
+        MCE_SOURCE="$MCE_CATALOG_IMAGE"
+        log_success "MCE CatalogSource applied (source: $MCE_SOURCE)"
+
         wait_for_catalog_source "$ACM_SOURCE"
+        wait_for_catalog_source "$MCE_SOURCE"
         echo ""
     fi
 
@@ -266,7 +335,7 @@ EOF
     local available_channels
     available_channels=$($KUBE_CLI get packagemanifest advanced-cluster-management \
         -n openshift-marketplace -o jsonpath='{.status.channels[*].name}' 2>/dev/null || echo "")
-    if [[ -n "$available_channels" ]] && ! echo "$available_channels" | tr ' ' '\n' | grep -q "^${ACM_CHANNEL}$"; then
+    if [[ -n "$available_channels" ]] && ! echo "$available_channels" | tr ' ' '\n' | grep "^${ACM_CHANNEL}$" >/dev/null; then
         log_error "Channel '$ACM_CHANNEL' not found in $ACM_SOURCE catalog"
         log_info "Available channels: $available_channels"
         log_info "Use --catalog-source for pre-release builds, or choose an available version"
@@ -329,8 +398,12 @@ EOF
         log_info "MultiClusterHub already exists, skipping creation"
     else
         log_substep "Creating MultiClusterHub"
+        # MCE comes from redhat-operators unless user explicitly set --source
+        # (custom ACM dev catalogs don't contain MCE packages)
+        local mce_source="${MCE_SOURCE:-redhat-operators}"
+        local mce_source_ns="openshift-marketplace"
         local mce_sub_spec
-        mce_sub_spec="{\"channel\":\"$MCE_CHANNEL\",\"source\":\"$ACM_SOURCE\",\"sourceNamespace\":\"$ACM_SOURCE_NS\"}"
+        mce_sub_spec="{\"channel\":\"$MCE_CHANNEL\",\"source\":\"$mce_source\",\"sourceNamespace\":\"$mce_source_ns\"}"
         cat <<EOF | $KUBE_CLI apply -f -
 apiVersion: operator.open-cluster-management.io/v1
 kind: MultiClusterHub
@@ -342,7 +415,7 @@ metadata:
 spec:
   imagePullSecret: multiclusterhub-operator-pull-secret
 EOF
-        log_info "MCH configured with MCE source: $ACM_SOURCE (channel: $MCE_CHANNEL)"
+        log_info "MCH configured with MCE source: $mce_source (channel: $MCE_CHANNEL)"
     fi
 
     # Wait for MCH to be Running

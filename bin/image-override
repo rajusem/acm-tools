@@ -83,7 +83,7 @@ do_apply() {
     # Create temp file for ConfigMap
     local tmpfile
     tmpfile=$(mktemp /tmp/image-override-XXXXXX)
-    trap 'rm -f "$tmpfile"' EXIT
+    trap 'rm -f "$tmpfile"' RETURN
     echo "$json" > "$tmpfile"
 
     # Apply to both namespaces
@@ -96,7 +96,7 @@ do_apply() {
     done
 
     rm -f "$tmpfile"
-    trap - EXIT
+    trap - RETURN
 
     # Remove deprecated annotation if present
     $KUBE_CLI annotate mch multiclusterhub -n "$ACM_NAMESPACE" \

@@ -101,6 +101,7 @@ bin/add-managed-cluster add namespace-spoke               # Import from kubeconf
 bin/add-managed-cluster add vm-spoke --name my-vm-cluster  # Import with custom name
 bin/add-managed-cluster add namespace-spoke --no-wait      # Import without waiting
 bin/add-managed-cluster add vm-spoke --force-import        # Clean existing klusterlet and re-import
+bin/add-managed-cluster add vm-spoke --sync-pull-secret    # Sync hub's quay.io credentials to spoke
 bin/add-managed-cluster status                             # List managed clusters
 bin/add-managed-cluster remove namespace-spoke             # Remove (with confirmation)
 bin/add-managed-cluster remove namespace-spoke --force     # Remove without confirmation
@@ -109,6 +110,8 @@ bin/add-managed-cluster remove namespace-spoke --force     # Remove without conf
 Creates a ManagedCluster CR on the hub, then extracts the klusterlet import manifests and applies them on the spoke via `--context`. This works regardless of hub→spoke network connectivity (only requires spoke→hub). The ManagedCluster is labeled `vendor: OpenShift`. A `KlusterletAddonConfig` is also created to enable policy addons (policy controller, application manager, search collector) — these are required for MCO Policy-based right-sizing to enforce PrometheusRules on spokes. Observability addon auto-deploys via MCO/MCOA after import.
 
 Before importing, the script checks if the spoke already has a klusterlet installed (from a previous hub attachment). If detected, it blocks with an error showing the existing hub URL. Use `--force-import` to clean up the existing klusterlet and re-import.
+
+**Pull secret sync for dev builds:** When using `--sync-pull-secret`, the script extracts `quay.io:443` credentials from the hub's global pull secret and merges them into the spoke's global pull secret. This is needed when using dev/pre-release ACM builds (installed via `--catalog-source`), because klusterlet images are pulled from `quay.io:443/acm-d` by digest reference and the spoke needs credentials to pull them. The sync is idempotent — if the spoke already has `quay.io:443` credentials, it skips. If the sync fails, import continues with a warning.
 
 The `remove` command performs a **detach** — it removes ACM's management but leaves the spoke cluster intact. The klusterlet agent on the spoke may need manual removal if the spoke is unreachable.
 

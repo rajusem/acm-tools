@@ -388,6 +388,7 @@ ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
 if [[ -n "$ORIGINAL_CONTEXT" ]]; then
     trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null' EXIT
 fi
+switch_context "$HUB_CONTEXT" || { log_error "Failed to switch to hub context"; exit 1; }
 
 if [[ "$WATCH_MODE" == "true" ]]; then
     while true; do

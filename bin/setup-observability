@@ -264,15 +264,85 @@ do_uninstall() {
     log_step "Removing MCO CR"
 
     if resource_exists mco "$MCO_NAME"; then
+        # Detect RS mode BEFORE deletion (MCO CR annotation is gone after delete)
+        local rs_mode="mco"
+        local annotation
+        # Dots in annotation key must be escaped for jsonpath
+        local escaped_annotation="${RS_ANNOTATION//./\\.}"
+        annotation=$(get_resource_field mco "$MCO_NAME" "" \
+            "{.metadata.annotations['${escaped_annotation}']}" 2>/dev/null || true)
+        [[ "$annotation" == "v1" ]] && rs_mode="mcoa"
+
         if confirm "Delete MCO CR '$MCO_NAME'?"; then
             $KUBE_CLI delete mco "$MCO_NAME" --wait=true --timeout=120s
             log_success "MCO CR deleted"
+
+            # Verify right-sizing resources are cleaned up
+            echo ""
+            log_step "Verifying right-sizing resource cleanup"
+            verify_rs_cleanup "$rs_mode"
         else
             log_info "Cancelled"
         fi
     else
         log_info "MCO CR not found, nothing to delete"
     fi
+}
+
+# verify_rs_cleanup checks that right-sizing resources are cleaned up after MCO deletion.
+# Usage: verify_rs_cleanup <mode>   where mode is "mco" or "mcoa"
+verify_rs_cleanup() {
+    local mode="${1:-mco}"
+    local max_wait=60
+    local interval=5
+    local elapsed=0
+
+    while [[ $elapsed -lt $max_wait ]]; do
+        local remaining=()
+
+        # Placements in global-set (both modes)
+        for name in rs-placement rs-virt-placement; do
+            if $KUBE_CLI get placement "$name" -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+                remaining+=("placement/$name ($GLOBAL_SET_NAMESPACE)")
+            fi
+        done
+
+        # Policies and PlacementBindings (MCO mode only)
+        if [[ "$mode" == "mco" ]]; then
+            for name in rs-prom-rules-policy rs-virt-prom-rules-policy; do
+                if $KUBE_CLI get policy.policy.open-cluster-management.io "$name" -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+                    remaining+=("policy/$name ($GLOBAL_SET_NAMESPACE)")
+                fi
+            done
+            for name in rs-policyset-binding rs-virt-policyset-binding; do
+                if $KUBE_CLI get placementbinding "$name" -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+                    remaining+=("placementbinding/$name ($GLOBAL_SET_NAMESPACE)")
+                fi
+            done
+        fi
+
+        # ConfigMaps in observability namespace (both modes — may be gone via namespace GC)
+        for name in rs-namespace-config rs-virt-config; do
+            if $KUBE_CLI get configmap "$name" -n "$OBS_NAMESPACE" &>/dev/null; then
+                remaining+=("configmap/$name ($OBS_NAMESPACE)")
+            fi
+        done
+
+        if [[ ${#remaining[@]} -eq 0 ]]; then
+            log_success "All right-sizing resources cleaned up ($mode mode)"
+            return 0
+        fi
+
+        log_info "Waiting for RS resource cleanup... (${elapsed}s/${max_wait}s) — ${#remaining[@]} remaining"
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    # Report remaining resources
+    log_warn "Right-sizing resources still exist after ${max_wait}s ($mode mode):"
+    for r in "${remaining[@]}"; do
+        log_warn "  $r"
+    done
 }
 
 do_status() {

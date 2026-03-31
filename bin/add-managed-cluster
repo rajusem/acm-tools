@@ -6,6 +6,7 @@
 # Usage:
 #   add-managed-cluster add <context> [--name <name>]    # Import a cluster
 #   add-managed-cluster add <context> --force-import     # Clean existing klusterlet and re-import
+#   add-managed-cluster add <context> --sync-pull-secret # Sync hub's quay.io credentials to spoke
 #   add-managed-cluster status                           # List managed clusters
 #   add-managed-cluster remove <cluster-name>            # Remove (detach) a managed cluster
 #   add-managed-cluster remove <cluster-name> --force    # Remove without confirmation
@@ -14,6 +15,11 @@
 # as an ACM managed cluster. Creates a ManagedCluster CR on the hub, then
 # applies klusterlet import manifests on the spoke via --context (works
 # regardless of hub→spoke connectivity, only requires spoke→hub).
+#
+# When using --sync-pull-secret, the script extracts quay.io:443 credentials
+# from the hub's global pull secret and merges them into the spoke's global
+# pull secret. This is needed for dev/pre-release builds where klusterlet
+# images are pulled from quay.io:443/acm-d (digest-referenced).
 #
 # Before importing, checks if the spoke already has a klusterlet installed.
 # If detected, blocks with an error. Use --force-import to clean up the
@@ -27,6 +33,7 @@
 #   add-managed-cluster add namespace-spoke
 #   add-managed-cluster add vm-spoke --name my-vm-cluster
 #   add-managed-cluster add namespace-spoke --force-import
+#   add-managed-cluster add vm-spoke --sync-pull-secret
 #   add-managed-cluster status
 #   add-managed-cluster remove namespace-spoke
 # =============================================================================
@@ -47,10 +54,11 @@ usage() {
     echo "  remove <name>   Remove (detach) a managed cluster"
     echo ""
     echo "Options (for add):"
-    echo "  --name NAME     ManagedCluster name (default: context name)"
-    echo "  --force-import  Clean up existing klusterlet on spoke and re-import"
-    echo "  --no-wait       Skip waiting for cluster to become Available"
-    echo "  --timeout N     Wait timeout in seconds (default: 120)"
+    echo "  --name NAME          ManagedCluster name (default: context name)"
+    echo "  --force-import       Clean up existing klusterlet on spoke and re-import"
+    echo "  --sync-pull-secret   Sync hub's quay.io:443 credentials to spoke's global pull secret"
+    echo "  --no-wait            Skip waiting for cluster to become Available"
+    echo "  --timeout N          Wait timeout in seconds (default: 120)"
     echo ""
     echo "Options (for remove):"
     echo "  --force         Skip confirmation prompt"
@@ -59,6 +67,7 @@ usage() {
     echo "  $(basename "$0") add namespace-spoke"
     echo "  $(basename "$0") add vm-spoke --name my-vm-cluster"
     echo "  $(basename "$0") add namespace-spoke --no-wait"
+    echo "  $(basename "$0") add vm-spoke --sync-pull-secret"
     echo "  $(basename "$0") status"
     echo "  $(basename "$0") remove namespace-spoke"
 }
@@ -198,6 +207,70 @@ wait_for_namespace() {
     return 1
 }
 
+sync_spoke_pull_secret() {
+    local spoke_ctx="$1"
+
+    log_substep "Syncing pull secret credentials to spoke"
+
+    # Extract hub's global pull secret
+    local hub_secret
+    hub_secret=$($KUBE_CLI get secret/pull-secret -n openshift-config \
+        -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null | base64 -d)
+
+    if [[ -z "$hub_secret" ]]; then
+        log_warn "Could not read hub's global pull secret — skipping sync" >&2
+        return 0
+    fi
+
+    # Extract quay.io:443 entry from hub
+    local quay_auth
+    quay_auth=$(echo "$hub_secret" | jq -r '.auths["quay.io:443"] // empty' 2>/dev/null)
+
+    if [[ -z "$quay_auth" ]]; then
+        log_info "Hub pull secret has no quay.io:443 entry — nothing to sync" >&2
+        return 0
+    fi
+
+    # Extract spoke's current global pull secret
+    local spoke_secret
+    spoke_secret=$($KUBE_CLI --context="$spoke_ctx" get secret/pull-secret -n openshift-config \
+        -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null | base64 -d)
+
+    if [[ -z "$spoke_secret" ]]; then
+        log_warn "Could not read spoke's global pull secret — skipping sync" >&2
+        return 0
+    fi
+
+    # Check if spoke already has quay.io:443 credentials
+    local spoke_quay
+    spoke_quay=$(echo "$spoke_secret" | jq -r '.auths["quay.io:443"] // empty' 2>/dev/null)
+
+    if [[ -n "$spoke_quay" ]]; then
+        log_info "Spoke already has quay.io:443 credentials — skipping sync"
+        return 0
+    fi
+
+    # Merge quay.io:443 into spoke's pull secret
+    local merged
+    merged=$(echo "$spoke_secret" | jq --argjson quay "{\"quay.io:443\": $quay_auth}" \
+        '.auths += $quay')
+
+    # Apply merged pull secret to spoke via temp file
+    local tmpfile
+    tmpfile=$(mktemp /tmp/spoke-pull-secret-XXXXXX)
+    trap 'rm -f "$tmpfile"' RETURN
+    echo "$merged" > "$tmpfile"
+
+    $KUBE_CLI --context="$spoke_ctx" set data secret/pull-secret -n openshift-config \
+        --from-file=.dockerconfigjson="$tmpfile"
+
+    rm -f "$tmpfile"
+    trap - RETURN
+
+    log_success "Synced quay.io:443 credentials to spoke"
+    log_info "Spoke nodes will restart to pick up the updated pull secret"
+}
+
 # --- Subcommands -------------------------------------------------------------
 
 do_add() {
@@ -205,6 +278,7 @@ do_add() {
     local cluster_name=""
     local no_wait=false
     local force_import=false
+    local sync_pull_secret=false
     local wait_timeout=120
 
     # Parse: first positional arg is context
@@ -220,9 +294,10 @@ do_add() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --name)         cluster_name="$2"; shift 2 ;;
-            --no-wait)      no_wait=true; shift ;;
-            --force-import) force_import=true; shift ;;
-            --timeout)      wait_timeout="$2"; shift 2 ;;
+            --no-wait)           no_wait=true; shift ;;
+            --force-import)      force_import=true; shift ;;
+            --sync-pull-secret)  sync_pull_secret=true; shift ;;
+            --timeout)           wait_timeout="$2"; shift 2 ;;
             *) log_error "Unknown option: $1"; usage; exit 1 ;;
         esac
     done
@@ -266,6 +341,12 @@ do_add() {
     # Check if spoke is already attached to a hub
     log_substep "Checking for existing klusterlet on spoke"
     detect_existing_klusterlet "$spoke_context" "$force_import"
+
+    # Sync pull secret to spoke (needed for dev catalog images)
+    if [[ "$sync_pull_secret" == "true" ]]; then
+        sync_spoke_pull_secret "$spoke_context" || \
+            log_warn "Pull secret sync failed — import will continue but spoke may fail to pull images"
+    fi
 
     # Create ManagedCluster CR (if not already existing from retry path)
     if ! resource_exists managedcluster "$cluster_name"; then

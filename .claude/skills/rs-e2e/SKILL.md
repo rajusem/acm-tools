@@ -82,6 +82,13 @@ oc --context=hub get pod -n open-cluster-management -l name=multicluster-observa
 # 8. Does IsMCOTerminating flag have stale state from a previous MCO deletion?
 # (plain bool in operator memory — persists until operator pod restarts)
 oc --context=hub logs deploy/multicluster-observability-operator -n open-cluster-management --tail=20 2>&1 | grep "MCO is terminating, skip reconcile"
+
+# 9. Is local-cluster Available? (stale bootstrap-hub-kubeconfig blocks ManifestWork delivery)
+oc --context=hub get managedcluster local-cluster -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' 2>&1
+
+# If Available=Unknown, check bootstrap-hub-kubeconfig target
+oc --context=hub get secret bootstrap-hub-kubeconfig -n open-cluster-management-agent \
+  -o jsonpath='{.data.kubeconfig}' | base64 -d | grep "server:"
 ```
 
 Based on the results, follow the appropriate path:
@@ -94,6 +101,7 @@ Based on the results, follow the appropriate path:
 | ACM installed, MCO not installed, orphans exist | Report orphans. Install MCO via `bin/setup-observability install` — the MCO analytics controller will handle stale resources on next reconcile. |
 | MCO installed but not Ready | Wait up to 120s for Ready, if still not Ready → STOP with diagnostic info |
 | MCO installed, `IsMCOTerminating` stale logs found | Restart operator: `oc --context=hub rollout restart deploy/multicluster-observability-operator -n open-cluster-management`, wait for rollout, then re-check |
+| local-cluster `Available: Unknown`, bootstrap-hub-kubeconfig points to wrong hub | Re-apply import manifests: `oc get secret local-cluster-import -n local-cluster -o jsonpath='{.data.crds\.yaml}' \| base64 -d \| oc apply -f -` then `oc get secret local-cluster-import -n local-cluster -o jsonpath='{.data.import\.yaml}' \| base64 -d \| oc apply -f -`, delete `hub-kubeconfig-secret`, restart all pods in `open-cluster-management-agent`. Wait 60s for `Available: True`. |
 | MCO Ready, RS not in spec (fresh install) | The analytics controller auto-patches MCO CR to set `enabled: true` for both RS features on first reconcile (`ensureRightSizingDefaults`). Wait 30s and verify spec was populated. If not, patch explicitly. |
 | MCO Ready, RS resources exist | Continue to Phase 1 |
 
@@ -108,8 +116,8 @@ Report the detected state clearly before proceeding.
 oc --context=hub get mco observability -o jsonpath='{.metadata.annotations.observability\.open-cluster-management\.io/right-sizing-capable}'
 ```
 
-- Annotation = `v1` → MCOA mode
-- Empty/missing → MCO mode (default)
+- Annotation present → MCOA mode (convention: set value to `"true"`)
+- Annotation absent → MCO mode (default)
 
 **Check RS feature state in MCO CR:**
 
@@ -225,6 +233,13 @@ Then check Policy compliance status:
 oc --context=hub get policy rs-prom-rules-policy -n open-cluster-management-global-set -o jsonpath='{.status}'
 ```
 
+If Policy shows non-compliant on a spoke, check that the spoke has `KlusterletAddonConfig` with `policyController: true` — without it, `config-policy-controller` and `governance-policy-framework` addons are not installed and Policy enforcement doesn't work:
+```bash
+oc --context=hub get klusterletaddonconfig -n <spoke-name> -o jsonpath='{.spec.policyController.enabled}'
+oc --context=hub get managedclusteraddon -n <spoke-name> --no-headers | grep -E "config-policy|governance"
+```
+If missing, `bin/add-managed-cluster add` creates it automatically. Report missing KlusterletAddonConfig as a diagnostic note, not a test FAIL.
+
 **MCOA mode** — Check ManifestWorks on hub (no spoke access needed):
 
 ```bash
@@ -251,6 +266,10 @@ ASK USER FOR CONFIRMATION before this step — it deletes the MCO CR.
 
 If user passed `--skip-uninstall`, skip this phase entirely and go to summary.
 
+#### Test 4a — Delete MCO in MCO mode (Policy-based)
+
+The cluster should already be in MCO mode from Phases 1-3.
+
 ```bash
 echo "y" | bin/setup-observability uninstall
 ```
@@ -260,18 +279,73 @@ The `setup-observability uninstall` script calls `verify_rs_cleanup` internally 
 After uninstall, independently verify no RS resources remain:
 
 ```bash
-# Placements (both modes)
+# Placements
 oc --context=hub get placement rs-placement rs-virt-placement -n open-cluster-management-global-set 2>&1
 
-# ConfigMaps (both modes)
+# ConfigMaps
 oc --context=hub get configmap rs-namespace-config rs-virt-config -n open-cluster-management-observability 2>&1
 
-# MCO mode also: Policies and PlacementBindings
+# Policies and PlacementBindings (MCO mode)
 oc --context=hub get policy rs-prom-rules-policy rs-virt-prom-rules-policy -n open-cluster-management-global-set 2>&1
 oc --context=hub get placementbinding rs-policyset-binding rs-virt-policyset-binding -n open-cluster-management-global-set 2>&1
 ```
 
 **Result:** PASS if all RS resources are gone, FAIL with details of which resources remain.
+
+#### Test 4b — Delete MCO in MCOA mode (ManifestWork-based)
+
+Reinstall MCO, switch to MCOA mode, verify MCOA resources exist, then delete MCO.
+
+```bash
+# Reinstall MCO
+bin/setup-observability install
+```
+
+Wait for MCO Ready. Ensure both RS features are enabled, then switch to MCOA mode:
+
+```bash
+oc --context=hub patch mco observability --type merge -p '{"spec":{"capabilities":{"platform":{"analytics":{"namespaceRightSizingRecommendation":{"enabled":true},"virtualizationRightSizingRecommendation":{"enabled":true}}}}}}'
+oc --context=hub annotate mco observability observability.open-cluster-management.io/right-sizing-capable=true --overwrite
+```
+
+Wait 60s. Verify MCOA mode is active before deleting:
+- MCOA pod running
+- specHash populated on all managed clusters
+- ManifestWorks with PrometheusRules exist
+- Placements and ConfigMaps exist
+
+Then delete MCO:
+
+```bash
+echo "y" | bin/setup-observability uninstall
+```
+
+After uninstall, verify ALL MCOA-mode RS resources are cleaned up:
+
+```bash
+# Placements
+oc --context=hub get placement rs-placement rs-virt-placement -n open-cluster-management-global-set 2>&1
+
+# ConfigMaps
+oc --context=hub get configmap rs-namespace-config rs-virt-config -n open-cluster-management-observability 2>&1
+
+# CMA (ClusterManagementAddOn) — should be deleted
+oc --context=hub get clustermanagementaddon multicluster-observability-addon 2>&1
+
+# MCA (ManagedClusterAddon) — should be deleted on all clusters
+for mc in $(oc --context=hub get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+  oc --context=hub get managedclusteraddon multicluster-observability-addon -n "$mc" 2>&1
+done
+
+# ManifestWorks with RS PrometheusRules — should be 0 on all clusters
+for mc in $(oc --context=hub get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+  count=$(oc --context=hub get manifestwork -n "$mc" -o json 2>/dev/null | \
+    jq '[.items[]?.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs"))] | length' 2>/dev/null || echo 0)
+  echo "$mc: $count RS PrometheusRules in ManifestWork"
+done
+```
+
+**Result:** PASS if all RS resources are gone (Placements, ConfigMaps, CMA, MCA, ManifestWorks), FAIL with details of which resources remain.
 
 ### Phase 5: Mode switch test (only if `--mode-switch` requested)
 
@@ -287,7 +361,7 @@ Wait for MCO Ready. Verify RS resources exist in MCO mode first.
 **Test 5a — Switch MCO -> MCOA:**
 
 ```bash
-oc --context=hub annotate mco observability observability.open-cluster-management.io/right-sizing-capable=v1
+oc --context=hub annotate mco observability observability.open-cluster-management.io/right-sizing-capable=true
 ```
 
 Wait 60s (mode switch involves CMA creation, MCOA pod startup, ManifestWork generation). Verify:
@@ -295,7 +369,16 @@ Wait 60s (mode switch involves CMA creation, MCOA pod startup, ManifestWork gene
 - Placements RETAINED: `rs-placement`, `rs-virt-placement` (now managed by MCOA ResourceCreator)
 - ConfigMaps RETAINED: `rs-namespace-config`, `rs-virt-config` (now managed by MCOA)
 - MCOA pod running in `open-cluster-management-observability`
-- ManifestWorks with PrometheusRules created in managed cluster namespaces
+- MCA `desiredConfig.specHash` populated (non-empty) on all managed clusters — empty specHash means MCOA addon framework will NOT create ManifestWorks (false PASS scenario)
+  ```bash
+  # Check specHash for each managed cluster
+  for mc in $(oc --context=hub get managedcluster -o jsonpath='{.items[*].metadata.name}'); do
+    oc --context=hub get managedclusteraddon multicluster-observability-addon -n "$mc" \
+      -o jsonpath='{.status.configReferences[0].desiredConfig.specHash}'
+    echo " ($mc)"
+  done
+  ```
+- ManifestWorks with PrometheusRules created in managed cluster namespaces (will be 0 if specHash is empty)
 
 **Test 5b — Switch MCOA -> MCO:**
 
@@ -336,7 +419,8 @@ Test                              Result    Notes
 2e. Disable both features         PASS/FAIL
 2f. Re-enable both features       PASS/FAIL
 3. Spoke PrometheusRules          PASS/FAIL/SKIP
-4. Uninstall cleanup              PASS/FAIL/SKIP
+4a. Uninstall cleanup (MCO mode)  PASS/FAIL/SKIP
+4b. Uninstall cleanup (MCOA mode) PASS/FAIL/SKIP
 5a. MCO -> MCOA switch            PASS/FAIL/SKIP
 5b. MCOA -> MCO switch            PASS/FAIL/SKIP
 ============================================================

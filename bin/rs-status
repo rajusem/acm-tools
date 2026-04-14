@@ -67,7 +67,7 @@ show_status() {
 
     local mode="MCO (Policy-based)"
     local mode_color="$BLUE"
-    if [[ "$annotation" == "v1" ]]; then
+    if [[ -n "$annotation" ]]; then
         mode="MCOA (ManifestWork-based)"
         mode_color="$GREEN"
     fi
@@ -121,7 +121,7 @@ show_status() {
 
     # ── Mode-specific resources ──
     echo ""
-    if [[ "$annotation" == "v1" ]]; then
+    if [[ -n "$annotation" ]]; then
         # MCOA mode
         echo -e "${BOLD}  MCOA Resources:${NC}"
 
@@ -137,6 +137,25 @@ show_status() {
                 echo -e "    ${RED}$p: not found${NC}"
             fi
         done
+
+        # MCA specHash (required for MCOA addon framework to create ManifestWorks)
+        echo ""
+        echo -e "${BOLD}  ManagedClusterAddon specHash:${NC}"
+        local any_empty_hash=false
+        for spoke_name in $($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            local spec_hash
+            spec_hash=$($KUBE_CLI get managedclusteraddon "$MCOA_NAME" -n "$spoke_name" \
+                -o jsonpath='{.status.configReferences[0].desiredConfig.specHash}' 2>/dev/null || echo "")
+            if [[ -n "$spec_hash" ]]; then
+                echo -e "    ${GREEN}$spoke_name: $spec_hash${NC}"
+            else
+                echo -e "    ${RED}$spoke_name: EMPTY (MCOA will not create ManifestWorks)${NC}"
+                any_empty_hash=true
+            fi
+        done
+        if [[ "$any_empty_hash" == "true" ]]; then
+            echo -e "    ${RED}FIX: MCO operator must populate desiredConfig.specHash on MCA${NC}"
+        fi
 
         # ManifestWorks
         echo ""
@@ -262,7 +281,7 @@ show_status() {
         fi
     done
 
-    if [[ "$annotation" == "v1" ]] || [[ "$mcoa_has_other_caps" == "true" ]]; then
+    if [[ -n "$annotation" ]] || [[ "$mcoa_has_other_caps" == "true" ]]; then
         # MCOA should be running
         if [[ -n "$mcoa_pod_status" ]]; then
             echo -e "    ${GREEN}MCOA: $mcoa_pod_status${NC}"
@@ -279,7 +298,7 @@ show_status() {
     fi
 
     # ── COO + Perses ──
-    if [[ "$annotation" == "v1" ]]; then
+    if [[ -n "$annotation" ]]; then
         local coo_ns="openshift-cluster-observability-operator"
         echo ""
         echo -e "${BOLD}  Cluster Observability Operator (COO):${NC}"
@@ -351,7 +370,7 @@ show_status_json() {
     virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null || echo "null")
 
     local mode="mco"
-    [[ "$annotation" == "v1" ]] && mode="mcoa"
+    [[ -n "$annotation" ]] && mode="mcoa"
 
     jq -n \
         --arg mode "$mode" \

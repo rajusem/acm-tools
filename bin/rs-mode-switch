@@ -10,10 +10,11 @@
 #   rs-mode-switch enable         # Enable right-sizing in MCO CR
 #   rs-mode-switch disable        # Disable right-sizing in MCO CR
 #
-# Handles all the workarounds automatically:
+# Handles all the coordination automatically:
 #   - ADC state sync wait
-#   - ConfigMap trigger for MCO mode
+#   - ConfigMap trigger for faster MCO mode convergence
 #   - MCOA addon manager restart after mode switch
+#   - COO auto-install wait (MCOA mode)
 # =============================================================================
 
 set -euo pipefail
@@ -40,7 +41,7 @@ get_current_mode() {
     local annotation
     annotation=$(get_resource_field mco "$MCO_NAME" "" \
         "{.metadata.annotations.${RS_ANNOTATION//./\\.}}" || echo "")
-    if [[ "$annotation" == "v1" ]]; then
+    if [[ -n "$annotation" ]]; then
         echo "mcoa"
     else
         echo "mco"
@@ -80,9 +81,9 @@ do_switch_mcoa() {
     log_step "Switching to MCOA mode (ManifestWork-based)"
 
     # Set the annotation on MCO CR
-    log_substep "Setting MCO CR annotation: right-sizing-capable=v1"
+    log_substep "Setting MCO CR annotation: right-sizing-capable=true"
     $KUBE_CLI annotate mco "$MCO_NAME" \
-        "$RS_ANNOTATION=v1" --overwrite
+        "$RS_ANNOTATION=true" --overwrite
 
     if [[ "$no_wait" == "false" ]]; then
         # Wait for MCO to detect annotation, sync ADC, and clean up Policies
@@ -166,7 +167,9 @@ do_switch_mco() {
         "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
 
     if [[ "$no_wait" == "false" ]]; then
-        # Trigger ConfigMap change to force Policy creation
+        # Trigger ConfigMap change to accelerate Policy creation.
+        # MCO v77+ has freshEnable detection that creates resources on first reconcile,
+        # but the ConfigMap patch fires the predicate sooner for faster convergence.
         log_substep "Triggering ConfigMap change to force Policy creation"
         $KUBE_CLI patch configmap rs-namespace-config \
             -n "$OBS_NAMESPACE" \
@@ -295,6 +298,27 @@ do_status() {
         virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null)
         log_info "  platformNamespaceRightSizing:      ${ns_adc:-not set (auto-enables)}"
         log_info "  platformVirtualizationRightSizing:  ${virt_adc:-not set (auto-enables)}"
+
+        # MCA specHash check
+        echo ""
+        log_info "ManagedClusterAddon specHash:"
+        local mc_specHash_ok=true
+        local mc_list
+        mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        for mc_name in $mc_list; do
+            local spec_hash
+            spec_hash=$($KUBE_CLI get managedclusteraddon "$MCOA_NAME" -n "$mc_name" \
+                -o jsonpath='{.status.configReferences[0].desiredConfig.specHash}' 2>/dev/null || echo "")
+            if [[ -n "$spec_hash" ]]; then
+                log_success "  $mc_name: $spec_hash"
+            else
+                log_error "  $mc_name: EMPTY (MCOA will not create ManifestWorks)"
+                mc_specHash_ok=false
+            fi
+        done
+        if [[ "$mc_specHash_ok" == "false" ]]; then
+            log_error "  FIX: MCO operator must populate desiredConfig.specHash on MCA"
+        fi
     fi
 
     # Hub resources (not-found is expected when right-sizing is disabled)

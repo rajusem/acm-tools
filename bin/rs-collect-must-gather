@@ -73,7 +73,7 @@ do_analyze() {
     if [[ -f "$mco_cr" ]]; then
         annotation=$(grep -A10 "annotations:" "$mco_cr" 2>/dev/null | \
             grep "right-sizing-capable" | awk '{print $2}' || true)
-        if [[ "$annotation" == "v1" ]]; then
+        if [[ -n "$annotation" ]]; then
             mode="mcoa"
         elif ! grep -q "command failed" "$mco_cr" 2>/dev/null; then
             mode="mco"
@@ -722,7 +722,7 @@ do_collect() {
         # Mode
         annotation=$(grep -A10 "annotations:" "$output_dir/hub/resources/mco-cr.yaml" 2>/dev/null | \
             grep "right-sizing-capable" | awk '{print $2}' || echo "not found")
-        echo "Right-sizing mode: $(if [[ "$annotation" == "v1" ]]; then echo "MCOA"; else echo "MCO"; fi) (MCO CR annotation: $annotation)"
+        echo "Right-sizing mode: $(if [[ -n "$annotation" ]]; then echo "MCOA"; else echo "MCO"; fi) (MCO CR annotation: $annotation)"
 
         # RS state
         echo ""

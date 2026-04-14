@@ -271,7 +271,7 @@ do_uninstall() {
         local escaped_annotation="${RS_ANNOTATION//./\\.}"
         annotation=$(get_resource_field mco "$MCO_NAME" "" \
             "{.metadata.annotations['${escaped_annotation}']}" 2>/dev/null || true)
-        [[ "$annotation" == "v1" ]] && rs_mode="mcoa"
+        [[ -n "$annotation" ]] && rs_mode="mcoa"
 
         if confirm "Delete MCO CR '$MCO_NAME'?"; then
             $KUBE_CLI delete mco "$MCO_NAME" --wait=true --timeout=120s

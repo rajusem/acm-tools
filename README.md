@@ -165,7 +165,7 @@ The mode is controlled by a single annotation on the MCO CR (`MultiClusterObserv
 ```bash
 # Switch to MCOA mode (ManifestWork-based)
 kubectl annotate mco observability \
-    observability.open-cluster-management.io/right-sizing-capable=v1 --overwrite
+    observability.open-cluster-management.io/right-sizing-capable=true --overwrite
 
 # Switch to MCO mode (Policy-based) — remove the annotation
 kubectl annotate mco observability \

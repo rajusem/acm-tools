@@ -89,6 +89,21 @@ do_switch_mcoa() {
         # Wait for MCO to detect annotation, sync ADC, and clean up Policies
         wait_with_message 30 "Waiting for MCO to sync ADC and clean up Policies"
 
+        # Verify MCO Policy resources are cleaned up
+        log_substep "Verifying MCO Policy resource cleanup"
+        local mco_cleanup_ok=true
+        if $KUBE_CLI get policy rs-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+            log_warn "MCO Policy rs-prom-rules-policy still exists — may need more time"
+            mco_cleanup_ok=false
+        fi
+        if $KUBE_CLI get policy rs-virt-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+            log_warn "MCO Policy rs-virt-prom-rules-policy still exists — may need more time"
+            mco_cleanup_ok=false
+        fi
+        if [[ "$mco_cleanup_ok" == "true" ]]; then
+            log_success "MCO Policy resources cleaned up"
+        fi
+
         # Restart addon manager to pick up new ADC state
         log_substep "Restarting MCOA addon manager"
         $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
@@ -167,9 +182,30 @@ do_switch_mco() {
         "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
 
     if [[ "$no_wait" == "false" ]]; then
+        # Wait for MCOA to detect ADC change and clean up its resources
+        wait_with_message 30 "Waiting for MCOA to clean up Placements and ConfigMaps"
+
+        # Verify MCOA Placements are cleaned up
+        log_substep "Verifying MCOA resource cleanup"
+        local mcoa_cleanup_ok=true
+        if $KUBE_CLI get placement rs-placement -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+            log_warn "MCOA Placement rs-placement still exists — deleting"
+            $KUBE_CLI delete placement rs-placement -n "$GLOBAL_SET_NAMESPACE" --ignore-not-found 2>/dev/null || true
+            mcoa_cleanup_ok=false
+        fi
+        if $KUBE_CLI get placement rs-virt-placement -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+            log_warn "MCOA Placement rs-virt-placement still exists — deleting"
+            $KUBE_CLI delete placement rs-virt-placement -n "$GLOBAL_SET_NAMESPACE" --ignore-not-found 2>/dev/null || true
+            mcoa_cleanup_ok=false
+        fi
+        if [[ "$mcoa_cleanup_ok" == "true" ]]; then
+            log_success "MCOA Placements cleaned up"
+        fi
+
         # Trigger ConfigMap change to accelerate Policy creation.
         # MCO v77+ has freshEnable detection that creates resources on first reconcile,
         # but the ConfigMap patch fires the predicate sooner for faster convergence.
+        # Note: MCOA may have deleted ConfigMaps — MCO will recreate them via EnsureRSConfigMapExists.
         log_substep "Triggering ConfigMap change to force Policy creation"
         $KUBE_CLI patch configmap rs-namespace-config \
             -n "$OBS_NAMESPACE" \

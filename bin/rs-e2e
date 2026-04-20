@@ -1,0 +1,1814 @@
+#!/bin/bash
+# =============================================================================
+# rs-e2e — End-to-end validation of right-sizing resource lifecycle
+# =============================================================================
+#
+# Usage:
+#   rs-e2e [options] [mco|mcoa]
+#   rs-e2e --skip-uninstall          # Run phases 0-3 only
+#   rs-e2e --mode-switch             # Include mode switching tests (phases 5-12)
+#   rs-e2e --build mco               # Build, push, and apply MCO image first
+#   rs-e2e --phases 0,1,2a           # Run specific phases only
+#
+# Phases:
+#   0    Pre-flight checks
+#   1    Baseline resource verification
+#   2a   Disable namespace RS only
+#   2b   Swap features (ns on, virt off)
+#   2c   Disable both features
+#   2d   Re-enable both features
+#   3    Spoke PrometheusRule validation
+#   4a   Uninstall cleanup (MCO mode)
+#   4b   Uninstall cleanup (MCOA mode)
+#   5a   MCO -> MCOA switch            (--mode-switch)
+#   5b   MCOA -> MCO switch            (--mode-switch)
+#   6    Version mismatch test          (--mode-switch)
+#   7    SpecHash freshness test        (--mode-switch)
+#   8    ConfigMap predicate side-effect (--mode-switch)
+#   9    Placement filter test          (--mode-switch)
+#   10a  Both-disabled in MCOA mode     (--mode-switch)
+#   10b  Re-enable both in MCOA mode    (--mode-switch)
+#   11a  ConfigMap propagation MCO      (--mode-switch)
+#   11b  ConfigMap propagation MCOA     (--mode-switch)
+#   12a  MCOA uninstall + reinstall     (--mode-switch)
+#   12b  Mode switch after reinstall    (--mode-switch)
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+: "${TIMEOUT_E2E_RECONCILE:=90}"
+: "${TIMEOUT_E2E_MODE_SWITCH:=60}"
+
+# =============================================================================
+# Global State
+# =============================================================================
+
+CURRENT_MODE=""
+FORCE_MODE=""
+INITIAL_SPEC_HASHES=""
+MW_PR_COUNT=0
+
+SKIP_UNINSTALL=false
+MODE_SWITCH=false
+BUILD_TARGET=""
+IMAGE_OVERRIDE_ONLY=false
+SELECTED_PHASES=""
+AUTO_CONFIRM=false
+
+RESULT_IDS=()
+RESULT_NAMES=()
+RESULT_STATUSES=()
+RESULT_NOTES=()
+TOTAL_PASS=0
+TOTAL_FAIL=0
+TOTAL_SKIP=0
+PHASE_FAIL_REASON=""
+PHASE_SKIP_REASON=""
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] [mco|mcoa]
+
+Options:
+  --skip-uninstall       Run phases 0-3 only (no MCO deletion)
+  --mode-switch          Include phases 5-12 (mode switching tests)
+  --build mco|mcoa|both  Build, push, and apply custom images before tests
+  --image-override       Apply existing image-override.json (no build)
+  --phases PHASES        Run specific phases (comma-separated: 0,1,2a,2b)
+  --yes                  Auto-confirm destructive phases (no prompts)
+  -h, --help             Show this help
+
+Positional:
+  mco|mcoa               Force testing a specific mode (default: auto-detect)
+
+Examples:
+  $(basename "$0") --skip-uninstall
+  $(basename "$0") --mode-switch
+  $(basename "$0") --build mco --skip-uninstall
+  $(basename "$0") --phases 0,1,2a,2d
+  $(basename "$0") --mode-switch --yes    # Full run, no prompts
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --skip-uninstall) SKIP_UNINSTALL=true; shift ;;
+            --mode-switch)    MODE_SWITCH=true; shift ;;
+            --build)
+                BUILD_TARGET="${2:-}"
+                [[ -z "$BUILD_TARGET" ]] && { log_error "--build requires mco|mcoa|both"; exit 1; }
+                shift 2 ;;
+            --image-override) IMAGE_OVERRIDE_ONLY=true; shift ;;
+            --yes|-y)         AUTO_CONFIRM=true; shift ;;
+            --phases)
+                SELECTED_PHASES="${2:-}"
+                [[ -z "$SELECTED_PHASES" ]] && { log_error "--phases requires comma-separated list"; exit 1; }
+                shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            mco|mcoa)  FORCE_MODE="$1"; shift ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$SELECTED_PHASES" ]]; then
+        if [[ "$SKIP_UNINSTALL" == "true" ]]; then
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,3"
+        elif [[ "$MODE_SWITCH" == "false" ]]; then
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,3,4a,4b"
+        fi
+    fi
+}
+
+# =============================================================================
+# Result Tracking
+# =============================================================================
+
+record_result() {
+    local id="$1" name="$2" status="$3" notes="${4:-}"
+    RESULT_IDS+=("$id")
+    RESULT_NAMES+=("$name")
+    RESULT_STATUSES+=("$status")
+    RESULT_NOTES+=("$notes")
+
+    case "$status" in
+        PASS) ((TOTAL_PASS++)) || true; log_success "Phase $id: PASS" ;;
+        FAIL) ((TOTAL_FAIL++)) || true; log_error "Phase $id: FAIL — $notes" ;;
+        SKIP) ((TOTAL_SKIP++)) || true; log_warn "Phase $id: SKIP — $notes" ;;
+    esac
+}
+
+phase_selected() {
+    local id="$1"
+    [[ -z "$SELECTED_PHASES" ]] && return 0
+    echo ",$SELECTED_PHASES," | grep ",$id," >/dev/null
+}
+
+run_phase() {
+    local id="$1" name="$2" fn="$3"
+
+    if ! phase_selected "$id"; then
+        record_result "$id" "$name" "SKIP" "not selected"
+        return 0
+    fi
+
+    echo ""
+    log_step "Phase $id: $name"
+    print_separator
+
+    PHASE_FAIL_REASON=""
+    PHASE_SKIP_REASON=""
+
+    set +e
+    "$fn"
+    local rc=$?
+    set -e
+
+    if [[ $rc -eq 0 ]]; then
+        record_result "$id" "$name" "PASS" ""
+    elif [[ $rc -eq 2 ]]; then
+        record_result "$id" "$name" "SKIP" "${PHASE_SKIP_REASON:-skipped}"
+    else
+        record_result "$id" "$name" "FAIL" "${PHASE_FAIL_REASON:-unknown}"
+    fi
+}
+
+# =============================================================================
+# Utility Helpers
+# =============================================================================
+
+e2e_confirm() {
+    if [[ "$AUTO_CONFIRM" == "true" ]]; then
+        log_info "Auto-confirmed: $1"
+        return 0
+    fi
+    confirm "$@"
+}
+
+assert_exists() {
+    local type="$1" name="$2" namespace="${3:-}"
+    if resource_exists "$type" "$name" "$namespace"; then
+        log_success "  $type/$name exists"
+        return 0
+    else
+        log_error "  $type/$name NOT FOUND"
+        return 1
+    fi
+}
+
+assert_not_exists() {
+    local type="$1" name="$2" namespace="${3:-}"
+    if resource_exists "$type" "$name" "$namespace"; then
+        log_error "  $type/$name still EXISTS"
+        return 1
+    else
+        log_success "  $type/$name absent"
+        return 0
+    fi
+}
+
+not_resource_exists() {
+    ! resource_exists "$@"
+}
+
+wait_for_reconcile() {
+    local seconds="${1:-$TIMEOUT_E2E_RECONCILE}"
+    local reason="${2:-Waiting for controller reconciliation}"
+    wait_with_message "$seconds" "$reason"
+}
+
+wait_until() {
+    local max_wait="$1" interval="$2" desc="$3"
+    shift 3
+    local elapsed=0
+    while [[ $elapsed -lt $max_wait ]]; do
+        if "$@" 2>/dev/null; then
+            printf "\r%-60s\r" " " >&2
+            return 0
+        fi
+        printf "\r  ${BLUE}%s (%ds/%ds)...${NC}  " "$desc" "$elapsed" "$max_wait" >&2
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+    printf "\r%-60s\r" " " >&2
+    return 1
+}
+
+get_current_mode() {
+    local annotation
+    annotation=$(get_resource_field mco "$MCO_NAME" "" \
+        "{.metadata.annotations.${RS_ANNOTATION//./\\.}}" || echo "")
+    if [[ -n "$annotation" ]]; then
+        echo "mcoa"
+    else
+        echo "mco"
+    fi
+}
+
+patch_rs_features() {
+    local ns_enabled="$1" virt_enabled="$2"
+    $KUBE_CLI patch mco "$MCO_NAME" --type=merge -p "{
+        \"spec\": {
+            \"capabilities\": {
+                \"platform\": {
+                    \"analytics\": {
+                        \"namespaceRightSizingRecommendation\": {\"enabled\": $ns_enabled},
+                        \"virtualizationRightSizingRecommendation\": {\"enabled\": $virt_enabled}
+                    }
+                }
+            }
+        }
+    }"
+}
+
+ensure_mode() {
+    local target="$1"
+    local current
+    current=$(get_current_mode)
+    if [[ "$current" == "$target" ]]; then
+        return 0
+    fi
+    log_substep "Switching to $target mode (precondition)"
+    if [[ "$target" == "mcoa" ]]; then
+        $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
+        wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for MCOA reconciliation"
+        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" 2>/dev/null || true
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+        wait_for_reconcile 30 "Waiting for ManifestWork generation"
+    else
+        $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
+        $KUBE_CLI patch configmap rs-namespace-config -n "$OBS_NAMESPACE" \
+            --type=merge -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+        $KUBE_CLI patch configmap rs-virt-config -n "$OBS_NAMESPACE" \
+            --type=merge -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+        wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for MCO reconciliation"
+    fi
+    CURRENT_MODE="$target"
+}
+
+ensure_mco_installed() {
+    if resource_exists mco "$MCO_NAME"; then
+        local ready
+        ready=$(get_resource_field mco "$MCO_NAME" "" \
+            '{.status.conditions[?(@.type=="Ready")].status}' || echo "")
+        if [[ "$ready" == "True" ]]; then
+            return 0
+        fi
+        log_substep "MCO exists but not Ready, waiting..."
+        local elapsed=0
+        while [[ $elapsed -lt $TIMEOUT_MCO_READY ]]; do
+            ready=$(get_resource_field mco "$MCO_NAME" "" \
+                '{.status.conditions[?(@.type=="Ready")].status}' || echo "")
+            if [[ "$ready" == "True" ]]; then
+                log_success "MCO is Ready"
+                return 0
+            fi
+            printf "\r  ${BLUE}Waiting for MCO Ready (%ds/%ds)...${NC}  " "$elapsed" "$TIMEOUT_MCO_READY" >&2
+            sleep 10
+            elapsed=$((elapsed + 10))
+        done
+        printf "\r%-60s\r" " " >&2
+        log_error "MCO not Ready after ${TIMEOUT_MCO_READY}s"
+        return 1
+    fi
+
+    log_substep "MCO not installed, running setup-observability install"
+    "$SCRIPT_DIR/setup-observability" install
+}
+
+# =============================================================================
+# ADC & Resource Verification
+# =============================================================================
+
+verify_adc_state() {
+    local expected_ns="$1" expected_virt="$2"
+    local errors=0
+
+    local adc_json
+    adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" \
+        -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "")
+
+    if [[ -z "$adc_json" ]]; then
+        log_warn "  ADC not found"
+        return 0
+    fi
+
+    local actual_ns
+    actual_ns=$(echo "$adc_json" | jq -r \
+        '.spec.customizedVariables[]? | select(.name=="platformNamespaceRightSizing") | .value' \
+        2>/dev/null || echo "")
+    local actual_virt
+    actual_virt=$(echo "$adc_json" | jq -r \
+        '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' \
+        2>/dev/null || echo "")
+
+    if [[ "$actual_ns" != "$expected_ns" ]]; then
+        log_error "  ADC namespace RS: '$actual_ns' (expected '$expected_ns')"
+        ((errors++)) || true
+    else
+        log_success "  ADC namespace RS: $actual_ns"
+    fi
+
+    if [[ "$actual_virt" != "$expected_virt" ]]; then
+        log_error "  ADC virt RS: '$actual_virt' (expected '$expected_virt')"
+        ((errors++)) || true
+    else
+        log_success "  ADC virt RS: $actual_virt"
+    fi
+
+    return $errors
+}
+
+count_mw_prometheusrules() {
+    MW_PR_COUNT=0
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+
+    for mc in $mc_list; do
+        local count=0
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            local c
+            c=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null | \
+                jq '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs"))] | length' \
+                2>/dev/null || echo 0)
+            count=$((count + c))
+        done
+        MW_PR_COUNT=$((MW_PR_COUNT + count))
+        if [[ $count -gt 0 ]]; then
+            log_success "    $mc: $count RS PrometheusRule(s)"
+        else
+            log_warn "    $mc: 0 RS PrometheusRules"
+        fi
+    done
+}
+
+verify_all_rs_resources_exist() {
+    local mode="$1"
+    local errors=0
+
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    if [[ "$mode" == "mco" ]]; then
+        assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    fi
+
+    if [[ "$mode" == "mcoa" ]]; then
+        log_substep "Checking ManifestWork PrometheusRules"
+        count_mw_prometheusrules
+        if [[ $MW_PR_COUNT -eq 0 ]]; then
+            log_error "  ManifestWorks: 0 RS PrometheusRules (expected > 0)"
+            ((errors++)) || true
+        else
+            log_success "  ManifestWorks: $MW_PR_COUNT total RS PrometheusRule(s)"
+        fi
+    fi
+
+    return $errors
+}
+
+verify_all_rs_resources_deleted() {
+    local mode="$1"
+    local errors=0
+
+    assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    if [[ "$mode" == "mco" ]]; then
+        assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_not_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    fi
+
+    if [[ "$mode" == "mcoa" ]]; then
+        log_substep "Checking ManifestWork PrometheusRules"
+        count_mw_prometheusrules
+        if [[ $MW_PR_COUNT -gt 0 ]]; then
+            log_error "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s) remain"
+            ((errors++)) || true
+        else
+            log_success "  ManifestWorks: 0 RS PrometheusRules (clean)"
+        fi
+    fi
+
+    return $errors
+}
+
+verify_spec_hashes_populated() {
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    local errors=0
+    for mc in $mc_list; do
+        local hash
+        hash=$($KUBE_CLI get managedclusteraddon "$MCOA_NAME" -n "$mc" \
+            -o jsonpath='{.status.configReferences[0].desiredConfig.specHash}' 2>/dev/null || echo "")
+        if [[ -n "$hash" ]]; then
+            log_success "  $mc: specHash=$hash"
+        else
+            log_error "  $mc: specHash EMPTY"
+            ((errors++)) || true
+        fi
+    done
+    return $errors
+}
+
+get_all_spec_hashes() {
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    local hashes=""
+    for mc in $mc_list; do
+        local hash
+        hash=$($KUBE_CLI get managedclusteraddon "$MCOA_NAME" -n "$mc" \
+            -o jsonpath='{.status.configReferences[0].desiredConfig.specHash}' 2>/dev/null || echo "EMPTY")
+        log_info "    $mc: $hash" >&2
+        hashes="${hashes:+$hashes|}$hash"
+    done
+    echo "$hashes"
+}
+
+# =============================================================================
+# Pre-phase: Image Build & Deploy
+# =============================================================================
+
+prephase_build() {
+    local target="$BUILD_TARGET"
+
+    log_step "Pre-phase: Custom Image Build & Deploy"
+    print_separator
+
+    local override_json="$SCRIPT_DIR/../image-override.json"
+
+    if [[ ! -f "$override_json" ]]; then
+        log_error "image-override.json not found: $override_json"
+        return 1
+    fi
+    if ! jq empty "$override_json" 2>/dev/null; then
+        log_error "Invalid JSON in image-override.json"
+        return 1
+    fi
+    if [[ -z "$CONTAINER_ENGINE" ]]; then
+        log_error "No container engine found (podman or docker required)"
+        return 1
+    fi
+
+    if [[ "$target" == "mco" || "$target" == "both" ]]; then
+        local current_tag
+        current_tag=$(jq -r '.[] | select(.["image-key"]=="multicluster_observability_operator") | .["image-tag"]' "$override_json")
+        local num="${current_tag#v}"
+        if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+            log_error "Cannot auto-increment MCO tag '$current_tag' — expected v<number>"
+            return 1
+        fi
+        local new_tag="v$((num + 1))"
+        log_info "MCO tag: $current_tag -> $new_tag"
+
+        if [[ ! -d "$MCO_REPO_DIR" ]]; then
+            log_error "MCO repo not found: $MCO_REPO_DIR"
+            log_info "Set MCO_REPO_DIR in config.sh or environment"
+            return 1
+        fi
+
+        local full_tag="$ACM_TOOLS_REGISTRY/$MCO_IMAGE_NAME:$new_tag"
+        log_substep "Building $full_tag"
+        $CONTAINER_ENGINE build --platform "$BUILD_PLATFORM" --no-cache \
+            -t "$full_tag" -f "$MCO_REPO_DIR/$MCO_DOCKERFILE" "$MCO_REPO_DIR"
+
+        log_substep "Pushing $full_tag"
+        $CONTAINER_ENGINE push "$full_tag"
+
+        local tmp
+        tmp=$(jq --arg tag "$new_tag" \
+            '[.[] | if .["image-key"]=="multicluster_observability_operator" then .["image-tag"]=$tag else . end]' \
+            "$override_json")
+        echo "$tmp" > "$override_json"
+    fi
+
+    if [[ "$target" == "mcoa" || "$target" == "both" ]]; then
+        local current_tag
+        current_tag=$(jq -r '.[] | select(.["image-key"]=="multicluster_observability_addon") | .["image-tag"]' "$override_json")
+        local num="${current_tag#v}"
+        if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+            log_error "Cannot auto-increment MCOA tag '$current_tag' — expected v<number>"
+            return 1
+        fi
+        local new_tag="v$((num + 1))"
+        log_info "MCOA tag: $current_tag -> $new_tag"
+
+        if [[ ! -d "$MCOA_REPO_DIR" ]]; then
+            log_error "MCOA repo not found: $MCOA_REPO_DIR"
+            log_info "Set MCOA_REPO_DIR in config.sh or environment"
+            return 1
+        fi
+
+        local full_tag="$ACM_TOOLS_REGISTRY/$MCOA_IMAGE_NAME:$new_tag"
+        log_substep "Building $full_tag"
+        $CONTAINER_ENGINE build --platform "$BUILD_PLATFORM" --no-cache \
+            -t "$full_tag" -f "$MCOA_REPO_DIR/$MCOA_DOCKERFILE" "$MCOA_REPO_DIR"
+
+        log_substep "Pushing $full_tag"
+        $CONTAINER_ENGINE push "$full_tag"
+
+        local tmp
+        tmp=$(jq --arg tag "$new_tag" \
+            '[.[] | if .["image-key"]=="multicluster_observability_addon" then .["image-tag"]=$tag else . end]' \
+            "$override_json")
+        echo "$tmp" > "$override_json"
+    fi
+
+    log_substep "Applying image overrides"
+    "$SCRIPT_DIR/image-override" apply
+
+    log_substep "Verifying pod images"
+    local mco_image
+    mco_image=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
+        -l name=multicluster-observability-operator \
+        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
+    log_info "  MCO operator: $mco_image"
+
+    local mcoa_image
+    mcoa_image=$($KUBE_CLI get pod -n "$OBS_NAMESPACE" \
+        -l app=multicluster-observability-addon-manager \
+        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
+    log_info "  MCOA addon:   $mcoa_image"
+
+    log_success "Pre-phase complete"
+}
+
+prephase_image_override() {
+    log_step "Pre-phase: Apply Image Override"
+    print_separator
+    "$SCRIPT_DIR/image-override" apply
+    log_success "Image override applied"
+}
+
+# =============================================================================
+# Phase 0: Pre-flight
+# =============================================================================
+
+phase_0() {
+    log_substep "Checking cluster connectivity"
+    if ! $KUBE_CLI cluster-info &>/dev/null; then
+        PHASE_FAIL_REASON="Cluster unreachable"
+        return 1
+    fi
+    log_success "  Cluster reachable"
+
+    log_substep "Checking ACM installation"
+    if ! $KUBE_CLI get mch -A --no-headers 2>/dev/null | grep -v "^$" >/dev/null; then
+        PHASE_FAIL_REASON="ACM not installed — run bin/install-custom-acm"
+        return 1
+    fi
+    log_success "  ACM installed"
+
+    log_substep "Checking MCO installation"
+    if ! resource_exists mco "$MCO_NAME"; then
+        log_warn "  MCO not installed — installing via setup-observability"
+        "$SCRIPT_DIR/setup-observability" install
+        if ! resource_exists mco "$MCO_NAME"; then
+            PHASE_FAIL_REASON="Failed to install MCO"
+            return 1
+        fi
+    fi
+    log_success "  MCO installed"
+
+    log_substep "Checking MCO Ready status"
+    local ready
+    ready=$(get_resource_field mco "$MCO_NAME" "" \
+        '{.status.conditions[?(@.type=="Ready")].status}' || echo "")
+    if [[ "$ready" != "True" ]]; then
+        log_warn "  MCO not Ready, waiting up to ${TIMEOUT_MCO_READY}s..."
+        local elapsed=0
+        while [[ $elapsed -lt $TIMEOUT_MCO_READY ]]; do
+            ready=$(get_resource_field mco "$MCO_NAME" "" \
+                '{.status.conditions[?(@.type=="Ready")].status}' || echo "")
+            if [[ "$ready" == "True" ]]; then break; fi
+            printf "\r  ${BLUE}Waiting for MCO Ready (%ds/%ds)...${NC}  " "$elapsed" "$TIMEOUT_MCO_READY" >&2
+            sleep 10
+            elapsed=$((elapsed + 10))
+        done
+        printf "\r%-60s\r" " " >&2
+        if [[ "$ready" != "True" ]]; then
+            PHASE_FAIL_REASON="MCO not Ready after ${TIMEOUT_MCO_READY}s"
+            return 1
+        fi
+    fi
+    log_success "  MCO Ready"
+
+    log_substep "Checking managed clusters"
+    local mc_count
+    mc_count=$($KUBE_CLI get managedcluster --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$mc_count" -eq 0 ]]; then
+        log_warn "  No managed clusters found — spoke tests will be limited"
+    else
+        local mc_names
+        mc_names=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        log_success "  $mc_count managed cluster(s): $mc_names"
+    fi
+
+    log_substep "Checking for orphaned RS resources"
+    local orphans=0
+    for rname in rs-placement rs-virt-placement; do
+        if resource_exists placement "$rname" "$GLOBAL_SET_NAMESPACE"; then
+            log_info "  Found placement/$rname (will be managed by MCO)"
+            ((orphans++)) || true
+        fi
+    done
+    if [[ $orphans -eq 0 ]]; then
+        log_success "  No orphaned RS resources"
+    fi
+
+    log_substep "Checking current images"
+    local mco_image
+    mco_image=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
+        -l name=multicluster-observability-operator \
+        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
+    log_info "  MCO operator: $mco_image"
+
+    log_substep "Checking for stale IsMCOTerminating flag"
+    local terminating_logs
+    terminating_logs=$($KUBE_CLI logs deploy/multicluster-observability-operator \
+        -n "$ACM_NAMESPACE" --tail=20 2>/dev/null | \
+        grep "MCO is terminating, skip reconcile" || true)
+    if [[ -n "$terminating_logs" ]]; then
+        log_warn "  Stale IsMCOTerminating flag — restarting operator"
+        $KUBE_CLI rollout restart deploy/multicluster-observability-operator -n "$ACM_NAMESPACE"
+        $KUBE_CLI rollout status deploy/multicluster-observability-operator \
+            -n "$ACM_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s"
+        wait_for_reconcile 30 "Waiting for operator restart"
+    else
+        log_success "  No stale IsMCOTerminating flag"
+    fi
+
+    log_substep "Checking local-cluster status"
+    local lc_available
+    lc_available=$($KUBE_CLI get managedcluster local-cluster \
+        -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' 2>/dev/null || echo "")
+    if [[ "$lc_available" == "True" ]]; then
+        log_success "  local-cluster: Available"
+    elif [[ -n "$lc_available" ]]; then
+        log_warn "  local-cluster: Available=$lc_available"
+    fi
+
+    log_substep "Checking RS auto-defaults"
+    local ns_enabled
+    ns_enabled=$(get_resource_field mco "$MCO_NAME" "" \
+        '{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' || echo "")
+    if [[ -z "$ns_enabled" ]]; then
+        log_info "  RS features not in MCO spec — waiting for auto-defaults"
+        wait_for_reconcile 90 "Waiting for ensureRightSizingDefaults"
+        ns_enabled=$(get_resource_field mco "$MCO_NAME" "" \
+            '{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' || echo "")
+    fi
+    if [[ "$ns_enabled" == "true" ]]; then
+        log_success "  RS auto-defaults populated"
+    else
+        log_info "  RS features will be enabled in Phase 1"
+    fi
+
+    return 0
+}
+
+# =============================================================================
+# Phase 1: Baseline
+# =============================================================================
+
+phase_1() {
+    local errors=0
+
+    CURRENT_MODE=$(get_current_mode)
+    log_info "  Detected mode: $CURRENT_MODE"
+
+    if [[ -n "$FORCE_MODE" && "$FORCE_MODE" != "$CURRENT_MODE" ]]; then
+        log_substep "Forcing $FORCE_MODE mode"
+        ensure_mode "$FORCE_MODE" || {
+            PHASE_FAIL_REASON="Could not switch to $FORCE_MODE mode"
+            return 1
+        }
+        CURRENT_MODE="$FORCE_MODE"
+    fi
+
+    log_substep "Ensuring both RS features enabled"
+    patch_rs_features true true
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resources creation" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Running rs-status"
+    "$SCRIPT_DIR/rs-status" --hub-only 2>/dev/null || true
+
+    log_substep "Verifying all RS resources"
+    verify_all_rs_resources_exist "$CURRENT_MODE" || ((errors++)) || true
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors resource(s) missing"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 2: Feature Toggle Tests
+# =============================================================================
+
+phase_2a() {
+    local errors=0
+
+    log_substep "Disabling namespace RS only"
+    patch_rs_features false true
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Verifying namespace resources deleted"
+    assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    fi
+
+    log_substep "Verifying virt resources retained"
+    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    fi
+
+    log_substep "Checking ADC state"
+    verify_adc_state "disabled" "enabled" || ((errors++)) || true
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_2b() {
+    local errors=0
+
+    log_substep "Swapping features: namespace on, virtualization off"
+    patch_rs_features true false
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "feature swap reconciliation" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Verifying namespace resources restored"
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    fi
+
+    log_substep "Verifying virt resources deleted"
+    assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_not_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    fi
+
+    log_substep "Checking ADC state"
+    verify_adc_state "enabled" "disabled" || ((errors++)) || true
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_2c() {
+    local errors=0
+
+    log_substep "Disabling both RS features"
+    patch_rs_features false false
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "full resource cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Verifying all RS resources deleted"
+    verify_all_rs_resources_deleted "$CURRENT_MODE" || ((errors++)) || true
+
+    log_substep "Checking ADC state"
+    verify_adc_state "disabled" "disabled" || ((errors++)) || true
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_2d() {
+    local errors=0
+
+    log_substep "Re-enabling both RS features"
+    patch_rs_features true true
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resource restoration" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Verifying all RS resources restored"
+    verify_all_rs_resources_exist "$CURRENT_MODE" || ((errors++)) || true
+
+    log_substep "Checking ADC state"
+    verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 3: Spoke Validation
+# =============================================================================
+
+phase_3() {
+    local errors=0
+
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        log_substep "Checking PlacementDecisions"
+        local pd_clusters
+        pd_clusters=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
+            -l cluster.open-cluster-management.io/placement=rs-placement \
+            -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
+        if [[ -n "$pd_clusters" ]]; then
+            log_success "  PlacementDecision clusters: $pd_clusters"
+        else
+            log_error "  No clusters in PlacementDecision"
+            ((errors++)) || true
+        fi
+
+        log_substep "Checking Policy compliance"
+        local compliance
+        compliance=$($KUBE_CLI get policy rs-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" \
+            -o jsonpath='{.status.compliant}' 2>/dev/null || echo "")
+        if [[ "$compliance" == "Compliant" ]]; then
+            log_success "  Policy rs-prom-rules-policy: Compliant"
+        else
+            log_warn "  Policy rs-prom-rules-policy: ${compliance:-unknown} (may need KlusterletAddonConfig)"
+        fi
+
+    else
+        log_substep "Checking ManifestWork PrometheusRules (MCOA mode)"
+        count_mw_prometheusrules
+        if [[ $MW_PR_COUNT -gt 0 ]]; then
+            log_success "  $MW_PR_COUNT total RS PrometheusRule(s) in ManifestWorks"
+        else
+            log_error "  No RS PrometheusRules in ManifestWorks"
+            ((errors++)) || true
+        fi
+    fi
+
+    log_substep "Checking spoke PrometheusRules directly"
+    local spoke_checked=false
+    for ctx_name in "$NAMESPACE_SPOKE_CONTEXT" "$VM_SPOKE_CONTEXT"; do
+        if $KUBE_CLI --context="$ctx_name" cluster-info &>/dev/null 2>&1; then
+            local pr_count
+            pr_count=$($KUBE_CLI --context="$ctx_name" get prometheusrule -n openshift-monitoring \
+                --no-headers 2>/dev/null | grep -c -i "rs-\|acm-rs" || true)
+            if [[ "$pr_count" -gt 0 ]]; then
+                log_success "  Spoke $ctx_name: $pr_count RS PrometheusRule(s)"
+            else
+                log_warn "  Spoke $ctx_name: 0 RS PrometheusRules"
+            fi
+            spoke_checked=true
+        fi
+    done
+    if [[ "$spoke_checked" == "false" ]]; then
+        log_info "  No spoke contexts reachable — hub-only validation sufficient"
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors check(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 4: Uninstall Cleanup
+# =============================================================================
+
+phase_4a() {
+    if ! e2e_confirm "Phase 4a will DELETE the MCO CR (MCO mode). Continue?"; then
+        PHASE_SKIP_REASON="user declined"
+        return 2
+    fi
+
+    local errors=0
+
+    ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
+
+    log_substep "Deleting MCO via setup-observability uninstall"
+    echo "y" | "$SCRIPT_DIR/setup-observability" uninstall
+
+    log_substep "Independently verifying RS resource cleanup"
+    wait_until "$TIMEOUT_RS_CLEANUP" 5 "RS resource cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    verify_all_rs_resources_deleted "mco" || ((errors++)) || true
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors resource(s) remain after uninstall"
+        return 1
+    fi
+    return 0
+}
+
+phase_4b() {
+    if ! e2e_confirm "Phase 4b will reinstall MCO, switch to MCOA, then delete again. Continue?"; then
+        PHASE_SKIP_REASON="user declined"
+        return 2
+    fi
+
+    local errors=0
+
+    log_substep "Reinstalling MCO"
+    "$SCRIPT_DIR/setup-observability" install
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO reinstall failed"; return 1; }
+
+    log_substep "Enabling RS features"
+    patch_rs_features true true
+    wait_for_reconcile "$TIMEOUT_E2E_RECONCILE" "Waiting for RS resources"
+
+    log_substep "Switching to MCOA mode"
+    $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for MCOA mode"
+    $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+    wait_for_reconcile 30 "Waiting for ManifestWork generation"
+
+    log_substep "Verifying MCOA resources before deletion"
+    verify_all_rs_resources_exist "mcoa" || log_warn "  Some MCOA resources missing before deletion"
+
+    log_substep "Deleting MCO (MCOA mode)"
+    echo "y" | "$SCRIPT_DIR/setup-observability" uninstall
+
+    log_substep "Verifying RS resource cleanup"
+    wait_until "$TIMEOUT_RS_CLEANUP" 5 "RS resource cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    verify_all_rs_resources_deleted "mcoa" || ((errors++)) || true
+
+    log_substep "Verifying MCOA-specific cleanup"
+    assert_not_exists clustermanagementaddon "$MCOA_NAME" "" || ((errors++)) || true
+
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        if resource_exists managedclusteraddon "$MCOA_NAME" "$mc"; then
+            log_error "  MCA $MCOA_NAME still exists in $mc"
+            ((errors++)) || true
+        fi
+    done
+
+    CURRENT_MODE=""
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors resource(s) remain after MCOA uninstall"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 5: Mode Switch Tests
+# =============================================================================
+
+phase_5a() {
+    if ! e2e_confirm "Phase 5a will switch to MCOA mode. Continue?"; then
+        PHASE_SKIP_REASON="user declined"
+        return 2
+    fi
+
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
+
+    log_substep "Enabling both RS features"
+    patch_rs_features true true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resource creation" \
+        resource_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Setting MCO CR annotation: right-sizing-capable=true"
+    $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
+
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for mode switch reconciliation"
+
+    log_substep "Restarting MCOA addon manager"
+    $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+    wait_for_reconcile 30 "Waiting for ManifestWork generation"
+
+    log_substep "Verifying MCO -> MCOA transition"
+    assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Checking MCA specHash"
+    verify_spec_hashes_populated || ((errors++)) || true
+
+    log_substep "Checking ManifestWork PrometheusRules"
+    count_mw_prometheusrules
+    if [[ $MW_PR_COUNT -eq 0 ]]; then
+        log_error "  ManifestWorks: 0 RS PrometheusRules"
+        ((errors++)) || true
+    else
+        log_success "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s)"
+    fi
+
+    log_substep "Checking ADC state"
+    verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_5b() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+
+    log_substep "Removing MCO CR annotation"
+    $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
+
+    log_substep "Triggering ConfigMap change for faster Policy creation"
+    $KUBE_CLI patch configmap rs-namespace-config -n "$OBS_NAMESPACE" \
+        --type=merge -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+    $KUBE_CLI patch configmap rs-virt-config -n "$OBS_NAMESPACE" \
+        --type=merge -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for MCO mode reconciliation"
+
+    log_substep "Verifying MCOA -> MCO transition"
+    assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Checking ManifestWork PrometheusRules removed"
+    count_mw_prometheusrules
+    if [[ $MW_PR_COUNT -gt 0 ]]; then
+        log_error "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s) remain"
+        ((errors++)) || true
+    else
+        log_success "  ManifestWorks: 0 RS PrometheusRules (clean)"
+    fi
+
+    log_substep "Checking ADC state"
+    verify_adc_state "disabled" "disabled" || ((errors++)) || true
+
+    CURRENT_MODE="mco"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 6: Version Mismatch
+# =============================================================================
+
+phase_6() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
+
+    log_substep "Setting annotation with non-standard value: v99"
+    $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=v99" --overwrite
+
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for delegation with v99 annotation"
+
+    log_substep "Verifying delegation occurs regardless of annotation value"
+    assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
+    log_substep "Removing annotation (back to MCO mode)"
+    $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
+    $KUBE_CLI patch configmap rs-namespace-config -n "$OBS_NAMESPACE" \
+        --type=merge -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+    $KUBE_CLI patch configmap rs-virt-config -n "$OBS_NAMESPACE" \
+        --type=merge -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for MCO mode restoration"
+
+    log_substep "Verifying MCO mode restored"
+    assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    CURRENT_MODE="mco"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 7: SpecHash Freshness
+# =============================================================================
+
+phase_7() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+
+    log_substep "Recording initial specHash values"
+    INITIAL_SPEC_HASHES=$(get_all_spec_hashes)
+    log_info "  Initial hashes: $INITIAL_SPEC_HASHES"
+
+    if echo "$INITIAL_SPEC_HASHES" | grep "EMPTY" >/dev/null; then
+        log_error "  Some specHash values are empty — cannot test freshness"
+        PHASE_FAIL_REASON="Empty specHash values"
+        return 1
+    fi
+
+    log_substep "Disabling virtualization RS to trigger ADC change"
+    patch_rs_features true false
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for ADC update and specHash refresh"
+
+    log_substep "Checking specHash changed"
+    local new_hashes
+    new_hashes=$(get_all_spec_hashes)
+    log_info "  New hashes: $new_hashes"
+
+    if [[ "$new_hashes" == "$INITIAL_SPEC_HASHES" ]]; then
+        log_error "  SpecHash did NOT change after ADC update"
+        ((errors++)) || true
+    else
+        log_success "  SpecHash changed correctly"
+    fi
+
+    if echo "$new_hashes" | grep "EMPTY" >/dev/null; then
+        log_error "  Some specHash values became empty"
+        ((errors++)) || true
+    fi
+
+    log_substep "Re-enabling virtualization RS"
+    patch_rs_features true true
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for specHash restoration"
+
+    log_substep "Checking specHash restored to original"
+    local restored_hashes
+    restored_hashes=$(get_all_spec_hashes)
+    log_info "  Restored hashes: $restored_hashes"
+
+    if [[ "$restored_hashes" == "$INITIAL_SPEC_HASHES" ]]; then
+        log_success "  SpecHash restored to original value"
+    else
+        log_warn "  SpecHash differs from original (may be acceptable if ADC content changed)"
+    fi
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 8: ConfigMap Predicate Side-Effect
+# =============================================================================
+
+phase_8() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+
+    log_substep "Verifying no Policies exist (MCOA mode baseline)"
+    assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || {
+        log_warn "  Policy already exists — test precondition not met"
+    }
+
+    log_substep "Modifying RS ConfigMap (adding testKey)"
+    $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
+        jq '.data.config = (.data.config // "{}" | fromjson | .testKey = "testValue" | tojson)' | \
+        $KUBE_CLI apply -f -
+
+    wait_for_reconcile "$TIMEOUT_E2E_RECONCILE" "Waiting for potential side-effect"
+
+    log_substep "Verifying NO Policy created as side-effect"
+    assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Reverting ConfigMap change"
+    $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
+        jq '.data.config = (.data.config | fromjson | del(.testKey) | tojson)' | \
+        $KUBE_CLI apply -f -
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="ConfigMap change created Policy side-effect"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 9: Placement Filter
+# =============================================================================
+
+phase_9() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+
+    local spoke_name
+    spoke_name=$($KUBE_CLI get managedcluster \
+        -o jsonpath='{.items[?(@.metadata.name!="local-cluster")].metadata.name}' 2>/dev/null | awk '{print $1}')
+
+    if [[ -z "$spoke_name" ]]; then
+        PHASE_SKIP_REASON="No non-local-cluster spoke available"
+        return 2
+    fi
+
+    log_substep "Default placement — checking all clusters selected"
+    local default_pd
+    default_pd=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
+        -l cluster.open-cluster-management.io/placement=rs-placement \
+        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
+    local default_count
+    default_count=$(echo "$default_pd" | wc -w | tr -d ' ')
+    log_info "  Default: $default_count cluster(s) selected: $default_pd"
+
+    log_substep "Applying placement filter to select only $spoke_name"
+    local filter_json
+    filter_json=$(jq -nc --arg name "$spoke_name" \
+        '{"spec":{"predicates":[{"requiredClusterSelector":{"labelSelector":{"matchLabels":{"name":$name}}}}]}}')
+
+    $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
+        jq --arg filter "$filter_json" '.data.placementFilter = $filter' | \
+        $KUBE_CLI apply -f -
+
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for placement filter to take effect"
+
+    log_substep "Verifying namespace placement restricted"
+    local filtered_pd
+    filtered_pd=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
+        -l cluster.open-cluster-management.io/placement=rs-placement \
+        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
+    local filtered_count
+    filtered_count=$(echo "$filtered_pd" | wc -w | tr -d ' ')
+
+    if [[ "$filtered_count" -le 1 ]]; then
+        if echo "$filtered_pd" | grep "$spoke_name" >/dev/null 2>&1; then
+            log_success "  Namespace placement filtered to $spoke_name"
+        elif [[ "$filtered_count" -eq 0 ]]; then
+            log_warn "  Namespace placement: 0 clusters (filter may not match any label)"
+        else
+            log_error "  Namespace placement: unexpected cluster: $filtered_pd"
+            ((errors++)) || true
+        fi
+    else
+        log_error "  Namespace placement: expected 1 cluster, got $filtered_count: $filtered_pd"
+        ((errors++)) || true
+    fi
+
+    log_substep "Verifying virt placement unaffected"
+    local virt_pd
+    virt_pd=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
+        -l cluster.open-cluster-management.io/placement=rs-virt-placement \
+        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
+    local virt_count
+    virt_count=$(echo "$virt_pd" | wc -w | tr -d ' ')
+    if [[ "$virt_count" -ge "$default_count" ]]; then
+        log_success "  Virt placement unaffected: $virt_count cluster(s)"
+    else
+        log_warn "  Virt placement count changed: $virt_count (was $default_count)"
+    fi
+
+    log_substep "Resetting placement filter"
+    $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
+        jq 'del(.data.placementFilter)' | \
+        $KUBE_CLI apply -f -
+
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for default placement restoration"
+
+    log_substep "Verifying default placement restored"
+    local restored_pd
+    restored_pd=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
+        -l cluster.open-cluster-management.io/placement=rs-placement \
+        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
+    local restored_count
+    restored_count=$(echo "$restored_pd" | wc -w | tr -d ' ')
+    if [[ "$restored_count" -ge "$default_count" ]]; then
+        log_success "  Default placement restored: $restored_count cluster(s)"
+    else
+        log_warn "  Placement not fully restored: $restored_count (was $default_count)"
+    fi
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 10: Both-Disabled MCOA
+# =============================================================================
+
+phase_10a() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+
+    log_substep "Ensuring both features enabled first"
+    patch_rs_features true true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resources creation" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Disabling both RS features in MCOA mode"
+    patch_rs_features false false
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "full MCOA resource cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Verifying all RS resources deleted"
+    verify_all_rs_resources_deleted "mcoa" || ((errors++)) || true
+
+    log_substep "Checking ADC state"
+    verify_adc_state "disabled" "disabled" || ((errors++)) || true
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_10b() {
+    local errors=0
+
+    log_substep "Re-enabling both RS features in MCOA mode"
+    patch_rs_features true true
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA resource restoration" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Verifying all RS resources restored"
+    verify_all_rs_resources_exist "mcoa" || ((errors++)) || true
+
+    log_substep "Checking ADC state"
+    verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 11: ConfigMap Propagation
+# =============================================================================
+
+phase_11a() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
+
+    log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
+    $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
+        jq '.data.config = (.data.config | fromjson | .prometheusRuleConfig.recommendationPercentage = 120 | tojson)' | \
+        $KUBE_CLI apply -f -
+
+    wait_for_reconcile "$TIMEOUT_E2E_RECONCILE" "Waiting for Policy update"
+
+    log_substep "Checking Policy contains updated percentage"
+    local policy_json
+    policy_json=$($KUBE_CLI get policy rs-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" -o json 2>/dev/null || echo "{}")
+    if echo "$policy_json" | grep "120" >/dev/null 2>&1; then
+        log_success "  Policy updated with percentage 120"
+    else
+        log_error "  Policy does not contain percentage 120"
+        ((errors++)) || true
+    fi
+
+    log_substep "Reverting: recommendationPercentage 120 -> 110"
+    $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
+        jq '.data.config = (.data.config | fromjson | .prometheusRuleConfig.recommendationPercentage = 110 | tojson)' | \
+        $KUBE_CLI apply -f -
+
+    CURRENT_MODE="mco"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="ConfigMap change not propagated to Policy"
+        return 1
+    fi
+    return 0
+}
+
+phase_11b() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+
+    log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
+    $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
+        jq '.data.config = (.data.config | fromjson | .prometheusRuleConfig.recommendationPercentage = 120 | tojson)' | \
+        $KUBE_CLI apply -f -
+
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for ManifestWork update"
+
+    log_substep "Checking ManifestWork contains updated percentage"
+    local found_120=false
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            if $KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null | grep "120" >/dev/null 2>&1; then
+                found_120=true
+                log_success "  ManifestWork in $mc updated with percentage 120"
+                break 2
+            fi
+        done
+    done
+    if [[ "$found_120" == "false" ]]; then
+        log_error "  No ManifestWork contains percentage 120"
+        ((errors++)) || true
+    fi
+
+    log_substep "Reverting: recommendationPercentage 120 -> 110"
+    $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
+        jq '.data.config = (.data.config | fromjson | .prometheusRuleConfig.recommendationPercentage = 110 | tojson)' | \
+        $KUBE_CLI apply -f -
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="ConfigMap change not propagated to ManifestWork"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 12: MCO Reinstall After MCOA
+# =============================================================================
+
+phase_12a() {
+    if ! e2e_confirm "Phase 12a will delete MCO in MCOA mode and reinstall. Continue?"; then
+        PHASE_SKIP_REASON="user declined"
+        return 2
+    fi
+
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+
+    log_substep "Enabling both RS features"
+    patch_rs_features true true
+    wait_for_reconcile "$TIMEOUT_E2E_RECONCILE" "Waiting for RS resources"
+
+    log_substep "Deleting MCO (MCOA mode)"
+    echo "y" | "$SCRIPT_DIR/setup-observability" uninstall
+
+    log_substep "Verifying RS cleanup"
+    wait_until "$TIMEOUT_RS_CLEANUP" 5 "RS resource cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    verify_all_rs_resources_deleted "mcoa" || log_warn "  Some resources remain"
+
+    log_substep "Reinstalling MCO"
+    "$SCRIPT_DIR/setup-observability" install
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO reinstall failed"; return 1; }
+
+    CURRENT_MODE=$(get_current_mode)
+    log_info "  Post-reinstall mode: $CURRENT_MODE"
+
+    if [[ "$CURRENT_MODE" != "mco" ]]; then
+        log_error "  Expected MCO mode after reinstall, got: $CURRENT_MODE"
+        ((errors++)) || true
+    else
+        log_success "  MCO starts in default MCO mode"
+    fi
+
+    log_substep "Waiting for RS auto-defaults"
+    wait_for_reconcile 90 "Waiting for ensureRightSizingDefaults"
+
+    local ns_enabled
+    ns_enabled=$(get_resource_field mco "$MCO_NAME" "" \
+        '{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' || echo "")
+    if [[ "$ns_enabled" == "true" ]]; then
+        log_success "  RS features auto-enabled"
+    else
+        log_warn "  RS features not auto-enabled, enabling manually"
+        patch_rs_features true true
+        wait_for_reconcile "$TIMEOUT_E2E_RECONCILE" "Waiting for RS resources"
+    fi
+
+    log_substep "Checking for stale IsMCOTerminating"
+    local terminating
+    terminating=$($KUBE_CLI logs deploy/multicluster-observability-operator \
+        -n "$ACM_NAMESPACE" --tail=20 2>/dev/null | \
+        grep "MCO is terminating, skip reconcile" || true)
+    if [[ -n "$terminating" ]]; then
+        log_error "  Stale IsMCOTerminating detected after reinstall"
+        ((errors++)) || true
+    else
+        log_success "  No stale IsMCOTerminating flag"
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors issue(s) after reinstall"
+        return 1
+    fi
+    return 0
+}
+
+phase_12b() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+
+    log_substep "Switching to MCOA mode"
+    $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for MCOA mode"
+    $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+    wait_for_reconcile 30 "Waiting for ManifestWork generation"
+
+    log_substep "Verifying MCOA mode active"
+    assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Checking specHash populated"
+    verify_spec_hashes_populated || ((errors++)) || true
+
+    log_substep "Checking ManifestWork PrometheusRules"
+    count_mw_prometheusrules
+    if [[ $MW_PR_COUNT -eq 0 ]]; then
+        log_error "  ManifestWorks: 0 RS PrometheusRules"
+        ((errors++)) || true
+    else
+        log_success "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s)"
+    fi
+
+    log_substep "Checking ADC state"
+    verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
+    log_substep "Switching back to MCO mode"
+    $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
+    $KUBE_CLI patch configmap rs-namespace-config -n "$OBS_NAMESPACE" \
+        --type=merge -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+    $KUBE_CLI patch configmap rs-virt-config -n "$OBS_NAMESPACE" \
+        --type=merge -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+
+    wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for MCO mode restoration"
+
+    log_substep "Verifying MCO mode restored"
+    assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Checking ADC state"
+    verify_adc_state "disabled" "disabled" || ((errors++)) || true
+
+    CURRENT_MODE="mco"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 13: Summary
+# =============================================================================
+
+phase_13_summary() {
+    echo ""
+    print_separator
+    echo -e "${BOLD}Right-Sizing E2E Results${NC}"
+    print_separator
+
+    local cluster_url
+    cluster_url=$($KUBE_CLI cluster-info 2>/dev/null | head -1 | awk '{print $NF}' || echo "unknown")
+    local mc_count
+    mc_count=$($KUBE_CLI get managedcluster --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+    local mc_names
+    mc_names=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "none")
+    local acm_version
+    acm_version=$($KUBE_CLI get mch multiclusterhub -n "$ACM_NAMESPACE" \
+        -o jsonpath='{.status.currentVersion}' 2>/dev/null || echo "unknown")
+    local current_mode
+    current_mode=$(get_current_mode 2>/dev/null || echo "unknown")
+
+    echo -e "  Cluster:          $cluster_url"
+    echo -e "  ACM Version:      $acm_version"
+    echo -e "  Mode:             $current_mode"
+    echo -e "  Managed Clusters: $mc_count ($mc_names)"
+    echo ""
+
+    printf "  ${BOLD}%-6s %-42s %-8s %s${NC}\n" "ID" "Test" "Result" "Notes"
+    printf "  %-6s %-42s %-8s %s\n" "----" "----" "------" "-----"
+
+    for i in "${!RESULT_IDS[@]}"; do
+        local id="${RESULT_IDS[$i]}"
+        local name="${RESULT_NAMES[$i]}"
+        local status="${RESULT_STATUSES[$i]}"
+        local notes="${RESULT_NOTES[$i]}"
+
+        local color="$NC"
+        case "$status" in
+            PASS) color="$GREEN" ;;
+            FAIL) color="$RED" ;;
+            SKIP) color="$YELLOW" ;;
+        esac
+
+        printf "  %-6s %-42s ${color}%-8s${NC} %s\n" \
+            "$id" "$name" "$status" "$notes"
+    done
+
+    echo ""
+    print_separator
+    echo -e "  ${GREEN}PASS: $TOTAL_PASS${NC}  ${RED}FAIL: $TOTAL_FAIL${NC}  ${YELLOW}SKIP: $TOTAL_SKIP${NC}"
+    print_separator
+
+    if [[ $TOTAL_FAIL -gt 0 ]]; then
+        echo ""
+        log_warn "Some tests failed. Run 'bin/rs-status' for current state."
+    fi
+
+    local uninstall_ran=false
+    for i in "${!RESULT_IDS[@]}"; do
+        if [[ "${RESULT_IDS[$i]}" =~ ^4 || "${RESULT_IDS[$i]}" =~ ^12a ]]; then
+            if [[ "${RESULT_STATUSES[$i]}" == "PASS" ]]; then
+                uninstall_ran=true
+            fi
+        fi
+    done
+    if [[ "$uninstall_ran" == "true" ]]; then
+        if ! resource_exists mco "$MCO_NAME" 2>/dev/null; then
+            echo ""
+            log_info "MCO was deleted during tests. Reinstall with:"
+            log_info "  bin/setup-observability install"
+        fi
+    fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    parse_args "$@"
+
+    init_acm_tools
+    init_hub_context
+
+    echo ""
+    log_step "Right-Sizing E2E Validation"
+    print_separator
+    if [[ -n "$SELECTED_PHASES" ]]; then
+        log_info "Selected phases: $SELECTED_PHASES"
+    else
+        log_info "Running all phases"
+    fi
+    if [[ -n "$FORCE_MODE" ]]; then
+        log_info "Forced mode: $FORCE_MODE"
+    fi
+
+    if [[ -n "$BUILD_TARGET" ]]; then
+        prephase_build || { log_error "Build pre-phase failed"; exit 1; }
+    elif [[ "$IMAGE_OVERRIDE_ONLY" == "true" ]]; then
+        prephase_image_override || { log_error "Image override failed"; exit 1; }
+    fi
+
+    run_phase "0"   "Pre-flight checks"              phase_0
+    run_phase "1"   "Baseline resource verification"  phase_1
+    run_phase "2a"  "Disable namespace RS only"       phase_2a
+    run_phase "2b"  "Swap features (ns on, virt off)" phase_2b
+    run_phase "2c"  "Disable both features"           phase_2c
+    run_phase "2d"  "Re-enable both features"         phase_2d
+    run_phase "3"   "Spoke validation"                phase_3
+    run_phase "4a"  "Uninstall cleanup (MCO mode)"    phase_4a
+    run_phase "4b"  "Uninstall cleanup (MCOA mode)"   phase_4b
+    run_phase "5a"  "MCO -> MCOA switch"              phase_5a
+    run_phase "5b"  "MCOA -> MCO switch"              phase_5b
+    run_phase "6"   "Version mismatch"                phase_6
+    run_phase "7"   "SpecHash freshness"              phase_7
+    run_phase "8"   "ConfigMap predicate side-effect"  phase_8
+    run_phase "9"   "Placement filter"                phase_9
+    run_phase "10a" "Both-disabled MCOA"              phase_10a
+    run_phase "10b" "Re-enable both MCOA"             phase_10b
+    run_phase "11a" "ConfigMap propagation (MCO)"     phase_11a
+    run_phase "11b" "ConfigMap propagation (MCOA)"    phase_11b
+    run_phase "12a" "MCOA uninstall + reinstall"      phase_12a
+    run_phase "12b" "Mode switch after reinstall"     phase_12b
+
+    phase_13_summary
+
+    [[ $TOTAL_FAIL -eq 0 ]]
+}
+
+main "$@"

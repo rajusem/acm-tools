@@ -1,0 +1,11 @@
+# ShellCheck configuration for acm-tools
+# See https://www.shellcheck.net/wiki/
+
+# Allow sourcing from paths relative to script dir (common pattern in this repo)
+external-sources=true
+
+# SC2034: Variable appears unused — false positives for variables consumed by sourced scripts
+disable=SC2034
+
+# SC2155: Declare and assign separately — accepted style in this codebase
+disable=SC2155

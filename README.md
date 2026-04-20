@@ -190,6 +190,50 @@ bin/rs-status --json                         # JSON output for scripting
 
 Shows: mode (MCO/MCOA), MCO CR state, ADC state, ConfigMaps, mode-specific resources (Policies or Placements/ManifestWorks), spoke PrometheusRules, operator pods, and images.
 
+### rs-e2e
+
+End-to-end validation of right-sizing resource lifecycle across MCO and MCOA modes.
+
+```bash
+bin/rs-e2e                                   # Phases 0-4b (core tests)
+bin/rs-e2e --mode-switch                     # All phases 0-12 (includes MCOA mode switching)
+bin/rs-e2e --skip-uninstall                  # Phases 0-3 only (no MCO deletion)
+bin/rs-e2e --phases 0,1,2a,2d               # Run specific phases
+bin/rs-e2e --build mco                       # Build MCO image, then run tests
+bin/rs-e2e --build both                      # Build MCO + MCOA images, then run tests
+bin/rs-e2e --image-override                  # Apply image-override.json, then run tests
+bin/rs-e2e --mode-switch --yes               # Full run, auto-confirm destructive phases
+bin/rs-e2e mcoa                              # Force testing in MCOA mode
+```
+
+Runs automated test phases that validate the full right-sizing resource lifecycle:
+
+| Phase | Test | Notes |
+|-------|------|-------|
+| 0 | Pre-flight (cluster state detection) | Auto-detects and fixes stale state |
+| 1 | Baseline resource verification | Verifies all expected resources exist |
+| 2a-2d | Feature toggle | Disable ns / swap / disable both / re-enable |
+| 3 | Spoke PrometheusRule validation | Hub-side + direct spoke check |
+| 4a | Uninstall cleanup — MCO mode | Deletes MCO, verifies RS resource cleanup |
+| 4b | Uninstall cleanup — MCOA mode | Reinstalls, switches to MCOA, deletes |
+| 5a/5b | Mode switch (MCO↔MCOA) | `--mode-switch` required |
+| 6 | Version mismatch | Any annotation value triggers delegation |
+| 7 | SpecHash freshness | Verifies hash changes with ADC spec |
+| 8 | ConfigMap predicate side-effect | ConfigMap edit doesn't create Policies |
+| 9 | Placement filter | Per-feature cluster selection |
+| 10a/10b | Both-disabled in MCOA mode | Critical ManifestWork pruning test |
+| 11a/11b | ConfigMap propagation | PrometheusRule content updates end-to-end |
+| 12a/12b | MCO reinstall after MCOA | Full lifecycle + IsMCOTerminating recovery |
+
+Phases 5-12 require `--mode-switch` (or explicit `--phases` selection). Destructive phases (4a, 4b, 12a) prompt for confirmation unless `--yes` is passed.
+
+**Environment variables:**
+
+- `TIMEOUT_E2E_RECONCILE` — Seconds to wait after MCO spec patches (default: 90)
+- `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
+
+The `--build` flag reads repo paths from `config.sh` (`MCO_REPO_DIR`, `MCOA_REPO_DIR`), auto-increments the tag in `image-override.json`, builds with `$CONTAINER_ENGINE`, pushes to `$ACM_TOOLS_REGISTRY`, and applies the override before running tests.
+
 ### rs-collect-must-gather
 
 Gather and analyze a diagnostic bundle for right-sizing troubleshooting.

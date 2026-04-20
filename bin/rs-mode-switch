@@ -57,15 +57,6 @@ get_rs_state() {
     echo "${ns_enabled:-unset}:${virt_enabled:-unset}"
 }
 
-check_coo_installed() {
-    local coo_csv
-    coo_csv=$($KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | grep -i cluster-observability-operator || true)
-    if [[ -n "$coo_csv" ]]; then
-        return 0
-    fi
-    return 1
-}
-
 do_switch_mcoa() {
     local no_wait=false
     [[ "${1:-}" == "--no-wait" ]] && no_wait=true
@@ -87,7 +78,7 @@ do_switch_mcoa() {
 
     if [[ "$no_wait" == "false" ]]; then
         # Wait for MCO to detect annotation, sync ADC, and clean up Policies
-        wait_with_message 30 "Waiting for MCO to sync ADC and clean up Policies"
+        wait_with_message "$TIMEOUT_MODE_SWITCH" "Waiting for MCO to sync ADC and clean up Policies"
 
         # Verify MCO Policy resources are cleaned up
         log_substep "Verifying MCO Policy resource cleanup"
@@ -109,13 +100,13 @@ do_switch_mcoa() {
         $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
             -n "$OBS_NAMESPACE" 2>/dev/null
         $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" --timeout=120s 2>/dev/null
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null
 
-        wait_with_message 30 "Waiting for ManifestWork reconciliation"
+        wait_with_message "$TIMEOUT_MODE_SWITCH" "Waiting for ManifestWork reconciliation"
 
         # Wait for COO to be auto-installed by MCOA
         log_substep "Waiting for COO auto-installation by MCOA"
-        local coo_timeout=120
+        local coo_timeout=$TIMEOUT_COO_INSTALL
         local coo_installed=false
         for ((i=0; i<coo_timeout; i+=10)); do
             if check_coo_installed; then
@@ -132,7 +123,7 @@ do_switch_mcoa() {
 
             # Wait for Perses pod to be ready
             log_substep "Waiting for Perses pod"
-            local perses_timeout=90
+            local perses_timeout=$TIMEOUT_PERSES_READY
             local perses_ready=false
             local coo_ns="openshift-cluster-observability-operator"
             for ((i=0; i<perses_timeout; i+=10)); do
@@ -487,11 +478,7 @@ case "${1:-}" in
 esac
 
 init_acm_tools
-
-# Save and restore original context on exit, then switch to hub
-ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
-trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null 2>&1 || true' EXIT
-switch_context "$HUB_CONTEXT" || { log_error "Failed to switch to hub context"; exit 1; }
+init_hub_context
 
 case "$1" in
     mcoa)    shift; do_switch_mcoa "$@" ;;

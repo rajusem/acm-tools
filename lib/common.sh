@@ -82,10 +82,10 @@ wait_with_message() {
     local seconds=$1
     local message="${2:-Waiting}"
     for ((i=seconds; i>0; i--)); do
-        printf "\r  ${BLUE}%s (%ds remaining)...${NC}  " "$message" "$i"
+        printf "\r  ${BLUE}%s (%ds remaining)...${NC}  " "$message" "$i" >&2
         sleep 1
     done
-    printf "\r%-60s\r" " "
+    printf "\r%-60s\r" " " >&2
 }
 
 # Check if a resource exists
@@ -133,4 +133,29 @@ load_config
 init_acm_tools() {
     ensure_cli
     check_cluster_connection
+}
+
+# Save current context, set EXIT trap to restore it, and switch to hub.
+# Call after init_acm_tools (requires $KUBE_CLI and $HUB_CONTEXT).
+init_hub_context() {
+    ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
+    trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null 2>&1 || true' EXIT
+    switch_context "$HUB_CONTEXT" || { log_error "Failed to switch to hub context"; exit 1; }
+}
+
+# Map a ManagedCluster name to its kubeconfig context.
+# Falls back to the cluster name itself if no mapping exists.
+mc_to_context() {
+    case "$1" in
+        local-cluster)   echo "$HUB_CONTEXT" ;;
+        namespace-spoke) echo "$NAMESPACE_SPOKE_CONTEXT" ;;
+        vm-spoke)        echo "$VM_SPOKE_CONTEXT" ;;
+        *)               echo "$1" ;;
+    esac
+}
+
+# Check if Cluster Observability Operator (COO) is installed.
+check_coo_installed() {
+    $KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | \
+        awk '{print $1}' | grep "^cluster-observability-operator" >/dev/null 2>&1
 }

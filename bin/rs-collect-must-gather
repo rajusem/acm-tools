@@ -498,12 +498,7 @@ do_collect() {
     local skip_spoke="$4"
 
     init_acm_tools
-
-    # Save current context and restore on exit
-    ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
-    if [[ -n "$ORIGINAL_CONTEXT" ]]; then
-        trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null' EXIT
-    fi
+    init_hub_context
 
     mkdir -p "$output_dir"/{hub/{logs,resources,manifests},spoke}
 

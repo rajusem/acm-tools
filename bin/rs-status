@@ -29,13 +29,14 @@ usage() {
 
 HUB_ONLY=false
 SPOKE="$NAMESPACE_SPOKE_CONTEXT"
+SPOKE_FILTER_SET=false
 WATCH_MODE=false
 JSON_MODE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --hub-only) HUB_ONLY=true; shift ;;
-        --spoke)    SPOKE="$2"; shift 2 ;;
+        --spoke)    SPOKE="$2"; SPOKE_FILTER_SET=true; shift 2 ;;
         --watch)    WATCH_MODE=true; shift ;;
         --json)     JSON_MODE=true; shift ;;
         -h|--help)  usage; exit 0 ;;
@@ -202,21 +203,15 @@ show_status() {
         echo ""
         echo -e "${BOLD}  Spoke PrometheusRules:${NC}"
 
-        # Map managed cluster names to kubeconfig contexts
-        mc_to_context() {
-            case "$1" in
-                local-cluster)   echo "$HUB_CONTEXT" ;;
-                namespace-spoke) echo "$NAMESPACE_SPOKE_CONTEXT" ;;
-                vm-spoke)        echo "$VM_SPOKE_CONTEXT" ;;
-                *)               echo "$1" ;;
-            esac
-        }
-
         local mc_list checked_contexts=""
         mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
         for mc in $mc_list; do
             local ctx
             ctx=$(mc_to_context "$mc")
+
+            if [[ "$SPOKE_FILTER_SET" == "true" && "$ctx" != "$SPOKE" ]]; then
+                continue
+            fi
             # Skip if we already checked this context (e.g. vm-spoke defaults to hub)
             if echo "$checked_contexts" | grep -w "$ctx" >/dev/null; then
                 continue
@@ -240,6 +235,9 @@ show_status() {
                 echo -e "    ${RED}$mc ($ctx): could not connect${NC}"
             fi
         done
+        if [[ "$SPOKE_FILTER_SET" == "true" && -z "${checked_contexts// }" ]]; then
+            echo -e "    ${YELLOW}No managed cluster mapped to spoke context '$SPOKE'${NC}"
+        fi
         switch_context "$HUB_CONTEXT" &>/dev/null || true
     fi
 
@@ -302,12 +300,11 @@ show_status() {
         local coo_ns="openshift-cluster-observability-operator"
         echo ""
         echo -e "${BOLD}  Cluster Observability Operator (COO):${NC}"
-        local coo_csv
-        coo_csv=$($KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | grep -i cluster-observability-operator || true)
-        if [[ -n "$coo_csv" ]]; then
+        if check_coo_installed; then
             local coo_phase
-            coo_phase=$(echo "$coo_csv" | awk '{print $NF}')
-            echo -e "    ${GREEN}COO: installed ($coo_phase)${NC}"
+            coo_phase=$($KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | \
+                awk '/^cluster-observability-operator/{print $NF}')
+            echo -e "    ${GREEN}COO: installed (${coo_phase:-unknown})${NC}"
         else
             echo -e "    ${RED}COO: not installed (required for Perses dashboards)${NC}"
         fi
@@ -400,14 +397,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 init_acm_tools
-
-# Save current context and restore on exit (in case script is interrupted
-# while connected to a spoke cluster)
-ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
-if [[ -n "$ORIGINAL_CONTEXT" ]]; then
-    trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null' EXIT
-fi
-switch_context "$HUB_CONTEXT" || { log_error "Failed to switch to hub context"; exit 1; }
+init_hub_context
 
 if [[ "$WATCH_MODE" == "true" ]]; then
     while true; do

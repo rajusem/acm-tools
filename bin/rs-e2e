@@ -572,20 +572,9 @@ prephase_build() {
     fi
 
     log_substep "Applying image overrides"
-    "$SCRIPT_DIR/image-override" apply
-
-    log_substep "Verifying pod images"
-    local mco_image
-    mco_image=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
-        -l name=multicluster-observability-operator \
-        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
-    log_info "  MCO operator: $mco_image"
-
-    local mcoa_image
-    mcoa_image=$($KUBE_CLI get pod -n "$OBS_NAMESPACE" \
-        -l app=multicluster-observability-addon-manager \
-        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
-    log_info "  MCOA addon:   $mcoa_image"
+    IMAGE_OVERRIDE_ONLY=true
+    prephase_image_override
+    IMAGE_OVERRIDE_ONLY=false
 
     log_success "Pre-phase complete"
 }
@@ -593,8 +582,74 @@ prephase_build() {
 prephase_image_override() {
     log_step "Pre-phase: Apply Image Override"
     print_separator
+
+    local override_json="$SCRIPT_DIR/../image-override.json"
+    if [[ ! -f "$override_json" ]]; then
+        log_error "image-override.json not found"
+        return 1
+    fi
+
+    local expected_mco expected_mcoa
+    expected_mco=$(jq -r '.[] | select(.["image-key"]=="multicluster_observability_operator") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' "$override_json" 2>/dev/null || echo "")
+    expected_mcoa=$(jq -r '.[] | select(.["image-key"]=="multicluster_observability_addon") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' "$override_json" 2>/dev/null || echo "")
+
     "$SCRIPT_DIR/image-override" apply
-    log_success "Image override applied"
+
+    # Also patch mch-image-manifest so MCO uses the correct MCOA image
+    # (MCH in Pending state won't propagate ConfigMap-based overrides)
+    if [[ -n "$expected_mcoa" ]]; then
+        local manifest_cm
+        manifest_cm=$($KUBE_CLI get configmap -n "$ACM_NAMESPACE" --no-headers 2>/dev/null | \
+            awk '/^mch-image-manifest/{print $1}' | head -1)
+        if [[ -n "$manifest_cm" ]]; then
+            log_substep "Patching $manifest_cm with MCOA image"
+            $KUBE_CLI patch configmap "$manifest_cm" -n "$ACM_NAMESPACE" --type merge \
+                -p "{\"data\":{\"multicluster_observability_addon\":\"$expected_mcoa\"}}"
+        fi
+    fi
+
+    # Patch MCO deployment directly if image doesn't match
+    if [[ -n "$expected_mco" ]]; then
+        local current_mco
+        current_mco=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
+            -l name=multicluster-observability-operator \
+            -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "")
+        if [[ "$current_mco" != "$expected_mco" ]]; then
+            log_substep "Patching MCO deployment with $expected_mco"
+            $KUBE_CLI set image deployment/multicluster-observability-operator \
+                multicluster-observability-operator="$expected_mco" \
+                -n "$ACM_NAMESPACE"
+        fi
+    fi
+
+    # Wait for MCO pod to run the expected image
+    if [[ -n "$expected_mco" ]]; then
+        log_substep "Waiting for MCO pod to run expected image"
+        if ! wait_until 120 10 "Waiting for MCO image" \
+            test "$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
+                -l name=multicluster-observability-operator \
+                -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null)" = "$expected_mco"; then
+            log_warn "MCO pod did not pick up $expected_mco within 120s"
+        fi
+    fi
+
+    log_substep "Verifying pod images"
+    local mco_image mcoa_image
+    mco_image=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
+        -l name=multicluster-observability-operator \
+        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
+    log_info "  MCO operator: $mco_image"
+    if [[ -n "$expected_mco" && "$mco_image" != "$expected_mco" ]]; then
+        log_error "  Expected: $expected_mco"
+        return 1
+    fi
+
+    mcoa_image=$($KUBE_CLI get pod -n "$OBS_NAMESPACE" \
+        -l app=multicluster-observability-addon-manager \
+        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "not running")
+    log_info "  MCOA addon:   $mcoa_image"
+
+    log_success "Image override applied and verified"
 }
 
 # =============================================================================
@@ -1329,13 +1384,31 @@ phase_9() {
     default_count=$(echo "$default_pd" | wc -w | tr -d ' ')
     log_info "  Default: $default_count cluster(s) selected: $default_pd"
 
+    # Label the spoke cluster so the Placement predicate can select it
+    log_substep "Labeling $spoke_name for placement filter"
+    $KUBE_CLI label managedcluster "$spoke_name" rs-e2e-filter=selected --overwrite
+
     log_substep "Applying placement filter to select only $spoke_name"
-    local filter_json
-    filter_json=$(jq -nc --arg name "$spoke_name" \
-        '{"spec":{"predicates":[{"requiredClusterSelector":{"labelSelector":{"matchLabels":{"name":$name}}}}]}}')
+    # Update the placementConfiguration YAML key (not placementFilter — that key doesn't exist).
+    # yaml.v2 uses lowercased field names for OCM structs (no yaml tags).
+    local placement_yaml
+    placement_yaml=$(cat <<'PLACEMENTEOF'
+spec:
+  predicates:
+  - requiredclusterselector:
+      labelselector:
+        matchlabels:
+          rs-e2e-filter: selected
+  tolerations:
+  - key: cluster.open-cluster-management.io/unreachable
+    operator: Exists
+  - key: cluster.open-cluster-management.io/unavailable
+    operator: Exists
+PLACEMENTEOF
+)
 
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq --arg filter "$filter_json" '.data.placementFilter = $filter' | \
+        jq --arg pc "$placement_yaml" '.data.placementConfiguration = $pc' | \
         $KUBE_CLI apply -f -
 
     wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for placement filter to take effect"
@@ -1376,9 +1449,25 @@ phase_9() {
     fi
 
     log_substep "Resetting placement filter"
+    # Restore default placement: empty predicates + tolerations (selects all clusters)
+    local default_placement_yaml
+    default_placement_yaml=$(cat <<'DEFAULTEOF'
+spec:
+  predicates: []
+  tolerations:
+  - key: cluster.open-cluster-management.io/unreachable
+    operator: Exists
+  - key: cluster.open-cluster-management.io/unavailable
+    operator: Exists
+DEFAULTEOF
+)
+
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq 'del(.data.placementFilter)' | \
+        jq --arg pc "$default_placement_yaml" '.data.placementConfiguration = $pc' | \
         $KUBE_CLI apply -f -
+
+    # Remove the test label
+    $KUBE_CLI label managedcluster "$spoke_name" rs-e2e-filter- --overwrite 2>/dev/null || true
 
     wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for default placement restoration"
 
@@ -1475,8 +1564,9 @@ phase_11a() {
     ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
 
     log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
+    # ConfigMap data keys are YAML strings (not JSON): prometheusRuleConfig, placementConfiguration
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.config = (.data.config | fromjson | .prometheusRuleConfig.recommendationPercentage = 120 | tojson)' | \
+        jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")' | \
         $KUBE_CLI apply -f -
 
     wait_for_reconcile "$TIMEOUT_E2E_RECONCILE" "Waiting for Policy update"
@@ -1493,7 +1583,7 @@ phase_11a() {
 
     log_substep "Reverting: recommendationPercentage 120 -> 110"
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.config = (.data.config | fromjson | .prometheusRuleConfig.recommendationPercentage = 110 | tojson)' | \
+        jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 120"; "recommendationPercentage: 110")' | \
         $KUBE_CLI apply -f -
 
     CURRENT_MODE="mco"
@@ -1512,9 +1602,18 @@ phase_11b() {
     ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
 
     log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
+    # ConfigMap data keys are YAML strings (not JSON): prometheusRuleConfig, placementConfiguration
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.config = (.data.config | fromjson | .prometheusRuleConfig.recommendationPercentage = 120 | tojson)' | \
+        jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")' | \
         $KUBE_CLI apply -f -
+
+    # ConfigMap changes alone don't trigger ManifestWork regeneration — Build() reads
+    # ConfigMap data at generation time, which requires an addon framework trigger.
+    # Restart MCOA to force re-evaluation of all ManifestWorks.
+    log_substep "Restarting MCOA addon manager to trigger ManifestWork regeneration"
+    $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
 
     wait_for_reconcile "$TIMEOUT_E2E_MODE_SWITCH" "Waiting for ManifestWork update"
 
@@ -1538,7 +1637,7 @@ phase_11b() {
 
     log_substep "Reverting: recommendationPercentage 120 -> 110"
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.config = (.data.config | fromjson | .prometheusRuleConfig.recommendationPercentage = 110 | tojson)' | \
+        jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 120"; "recommendationPercentage: 110")' | \
         $KUBE_CLI apply -f -
 
     CURRENT_MODE="mcoa"

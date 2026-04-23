@@ -101,6 +101,7 @@ bin/add-managed-cluster add namespace-spoke               # Import from kubeconf
 bin/add-managed-cluster add vm-spoke --name my-vm-cluster  # Import with custom name
 bin/add-managed-cluster add namespace-spoke --no-wait      # Import without waiting
 bin/add-managed-cluster add vm-spoke --force-import        # Clean existing klusterlet and re-import
+bin/add-managed-cluster add hub --force-import             # Repair local-cluster klusterlet
 bin/add-managed-cluster add vm-spoke --sync-pull-secret    # Sync hub's quay.io credentials to spoke
 bin/add-managed-cluster status                             # List managed clusters
 bin/add-managed-cluster remove namespace-spoke             # Remove (with confirmation)
@@ -109,7 +110,7 @@ bin/add-managed-cluster remove namespace-spoke --force     # Remove without conf
 
 Creates a ManagedCluster CR on the hub, then extracts the klusterlet import manifests and applies them on the spoke via `--context`. This works regardless of hub→spoke network connectivity (only requires spoke→hub). The ManagedCluster is labeled `vendor: OpenShift`. A `KlusterletAddonConfig` is also created to enable policy addons (policy controller, application manager, search collector) — these are required for MCO Policy-based right-sizing to enforce PrometheusRules on spokes. Observability addon auto-deploys via MCO/MCOA after import.
 
-Before importing, the script checks if the spoke already has a klusterlet installed (from a previous hub attachment). If detected, it blocks with an error showing the existing hub URL. Use `--force-import` to clean up the existing klusterlet and re-import.
+Before importing, the script checks if the spoke already has a klusterlet installed (from a previous hub attachment). If detected, it blocks with an error showing the existing hub URL. Use `--force-import` to clean up the existing klusterlet and re-import. For `local-cluster`, `--force-import` repairs the klusterlet in-place (full cleanup + re-apply import manifests) — useful when local-cluster shows `Available: Unknown` after a hub change.
 
 **Pull secret sync for dev builds:** When using `--sync-pull-secret`, the script extracts `quay.io:443` credentials from the hub's global pull secret and merges them into the spoke's global pull secret. This is needed when using dev/pre-release ACM builds (installed via `--catalog-source`), because klusterlet images are pulled from `quay.io:443/acm-d` by digest reference and the spoke needs credentials to pull them. The sync is idempotent — if the spoke already has `quay.io:443` credentials, it skips. If the sync fails, import continues with a warning.
 
@@ -195,37 +196,64 @@ Shows: mode (MCO/MCOA), MCO CR state, ADC state, ConfigMaps, mode-specific resou
 End-to-end validation of right-sizing resource lifecycle across MCO and MCOA modes.
 
 ```bash
-bin/rs-e2e                                   # Phases 0-4b (core tests)
-bin/rs-e2e --mode-switch                     # All phases 0-12 (includes MCOA mode switching)
+bin/rs-e2e                                   # Phases 0-4, 13-14 (core tests)
+bin/rs-e2e --mode-switch                     # All phases 0-16 (includes MCOA mode switching)
 bin/rs-e2e --skip-uninstall                  # Phases 0-3 only (no MCO deletion)
-bin/rs-e2e --phases 0,1,2a,2d               # Run specific phases
+bin/rs-e2e --phases 0-3,5,9a                 # Run specific phases (ranges OK)
 bin/rs-e2e --build mco                       # Build MCO image, then run tests
 bin/rs-e2e --build both                      # Build MCO + MCOA images, then run tests
 bin/rs-e2e --image-override                  # Apply image-override.json, then run tests
-bin/rs-e2e --mode-switch --yes               # Full run, auto-confirm destructive phases
+bin/rs-e2e --mode-switch                     # All phases (prompts for destructive)
+bin/rs-e2e --mode-switch --yes               # All phases, auto-confirm destructive
 bin/rs-e2e mcoa                              # Force testing in MCOA mode
 ```
 
-Runs automated test phases that validate the full right-sizing resource lifecycle:
+Runs automated test phases that validate the full right-sizing resource lifecycle. Phases are grouped to minimize mode switches:
 
-| Phase | Test | Notes |
-|-------|------|-------|
-| 0 | Pre-flight (cluster state detection) | Auto-detects and fixes stale state |
-| 1 | Baseline resource verification | Verifies all expected resources exist |
-| 2a-2d | Feature toggle | Disable ns / swap / disable both / re-enable |
-| 3 | Spoke PrometheusRule validation | Hub-side + direct spoke check |
-| 4a | Uninstall cleanup — MCO mode | Deletes MCO, verifies RS resource cleanup |
-| 4b | Uninstall cleanup — MCOA mode | Reinstalls, switches to MCOA, deletes |
-| 5a/5b | Mode switch (MCO↔MCOA) | `--mode-switch` required |
-| 6 | Version mismatch | Any annotation value triggers delegation |
-| 7 | SpecHash freshness | Verifies hash changes with ADC spec |
-| 8 | ConfigMap predicate side-effect | ConfigMap edit doesn't create Policies |
-| 9 | Placement filter | Per-feature cluster selection |
-| 10a/10b | Both-disabled in MCOA mode | Critical ManifestWork pruning test |
-| 11a/11b | ConfigMap propagation | PrometheusRule content updates end-to-end |
-| 12a/12b | MCO reinstall after MCOA | Full lifecycle + IsMCOTerminating recovery |
+**Group 1: MCO-mode tests** (default run)
 
-Phases 5-12 require `--mode-switch` (or explicit `--phases` selection). Destructive phases (4a, 4b, 12a) prompt for confirmation unless `--yes` is passed.
+| Phase | Test | What it validates |
+|-------|------|-------------------|
+| 0 | Pre-flight | Cluster reachable, ACM installed, MCO installed and Ready, managed clusters available. Auto-installs MCO if missing, fixes stale IsMCOTerminating state, waits for RS auto-defaults. |
+| 1 | Baseline verification | All RS resources exist for current mode: Placements, ConfigMaps, Policies (MCO) or ManifestWorks (MCOA), PlacementBindings, ADC state. |
+| 2a | Disable namespace RS | Disables namespace RS only — verifies namespace resources deleted (Placement, ConfigMap, Policy) while virt resources retained. Checks ADC reflects partial state. |
+| 2b | Swap features | Swaps to namespace on + virt off — verifies namespace resources restored and virt resources deleted. |
+| 2c | Disable both | Disables both RS features — verifies all RS resources cleaned up. |
+| 2d | Re-enable both | Re-enables both features — verifies full resource restoration. |
+| 3 | Spoke validation | Checks PlacementDecisions select managed clusters, verifies PrometheusRules exist on spokes (hub-side ManifestWork check + direct spoke `--context` check). |
+| 4 | ConfigMap propagation (MCO) | Modifies `rs-namespace-config` ConfigMap (recommendationPercentage 110→120), verifies Policy updates with new value, then reverts. Tests MCO's ConfigMap→Policy pipeline. |
+
+**Group 2: MCOA-mode tests** (`--mode-switch` required)
+
+| Phase | Test | What it validates |
+|-------|------|-------------------|
+| 5 | MCO → MCOA switch | Sets `right-sizing-capable` annotation, restarts addon manager. Verifies Policies deleted, ManifestWorks with PrometheusRules created, ADC shows enabled state, specHash populated. |
+| 6 | SpecHash freshness | Disables virt RS to trigger ADC change, polls for specHash change (up to 60s). Re-enables and verifies hash restores. Tests that ADC spec changes propagate to ManifestWork specHash. |
+| 7 | ConfigMap predicate | Edits ConfigMap data without MCO spec change. Verifies no Policy side-effects in MCOA mode (ConfigMap predicate should not trigger Policy creation). |
+| 8 | Placement filter | Applies `placementConfiguration` with label selector to restrict cluster selection. Verifies PlacementDecisions filter to matching clusters only, then restores defaults. Uses yaml.v2 lowercased field names. |
+| 9a | Disable namespace RS (MCOA) | Same as 2a but in MCOA mode — verifies MCOA handles partial feature disable correctly. |
+| 9b | Swap features (MCOA) | Same as 2b but in MCOA mode — verifies MCOA handles feature swap correctly. |
+| 9c | Disable both (MCOA) | Same as 2c but in MCOA mode — verifies MCOA cleans up all RS resources. Placements may persist due to addon framework InstallStrategy (logged as warning, not failure). |
+| 9d | Re-enable both (MCOA) | Same as 2d but in MCOA mode — verifies MCOA restores all RS resources including ManifestWorks. |
+| 10 | ConfigMap propagation (MCOA) | Same as phase 4 but in MCOA mode — modifies ConfigMap, verifies ManifestWork PrometheusRules update with new value. Tests MCOA's ConfigMap→ManifestWork pipeline. |
+
+**Group 3: Mode round-trip tests** (`--mode-switch` required)
+
+| Phase | Test | What it validates |
+|-------|------|-------------------|
+| 11 | MCOA → MCO switch | Removes annotation, waits for Placement creation and stabilization (addon framework race). Verifies Policies restored, ManifestWork PrometheusRules removed, ADC shows managed-by-mco. |
+| 12 | Version mismatch | Sets annotation to non-standard value (`v99`). Verifies delegation occurs regardless of annotation value (any truthy value triggers MCOA mode). Restores MCO mode afterwards. |
+
+**Group 4: Destructive tests** (prompt for confirmation unless `--yes`)
+
+| Phase | Test | What it validates |
+|-------|------|-------------------|
+| 13 | Uninstall cleanup (MCO) | Deletes MCO CR via `setup-observability uninstall`. Verifies all RS resources cleaned up: Placements, ConfigMaps, Policies, PlacementBindings deleted. |
+| 14 | Uninstall cleanup (MCOA) | Reinstalls MCO, enables RS, switches to MCOA mode, then deletes MCO. Verifies MCOA-specific cleanup: ManifestWork PrometheusRules removed, ClusterManagementAddon deleted. |
+| 15 | MCOA uninstall + reinstall | Deletes MCO in MCOA mode, reinstalls, verifies RS auto-defaults re-populate. Checks for stale IsMCOTerminating flag (operator caches terminating state in memory — requires pod restart). |
+| 16 | Mode switch after reinstall | After fresh MCO install, performs full MCO→MCOA→MCO round-trip. Verifies ManifestWorks created in MCOA mode and Policies restored after switching back to MCO. |
+
+Phases 5-12, 15-16 require `--mode-switch` (or explicit `--phases` selection). Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.
 
 **Environment variables:**
 

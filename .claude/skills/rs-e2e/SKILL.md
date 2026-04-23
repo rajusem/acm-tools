@@ -5,11 +5,11 @@ Run end-to-end validation of right-sizing resource lifecycle on the current clus
 ## Arguments (optional)
 
 - `--skip-uninstall` — Run phases 0-3 only, don't delete MCO at the end
-- `--mode-switch` — Also test MCO-to-MCOA mode switching (adds phases 5-12)
+- `--mode-switch` — Also test MCO-to-MCOA mode switching (adds phases 5-12, 15-16)
 - `--build mco|mcoa|both` — Build, push, and apply custom image(s) before running tests
 - `--image-override` — Apply existing `image-override.json` without building
-- `--phases 0,1,2a,2d` — Run specific phases only
-- `--yes` — Auto-confirm destructive phases (4a, 4b, 12a)
+- `--phases 0-3,5,9a` — Run specific phases (comma-separated, ranges OK)
+- `--yes` — Auto-confirm destructive phases (13, 14, 15)
 - `mco` or `mcoa` — Force testing a specific mode (default: auto-detect)
 
 ## Workflow
@@ -21,13 +21,13 @@ Run `bin/rs-e2e` with the appropriate flags. The script is fully automated and h
 | User wants | Command |
 |------------|---------|
 | Quick validation | `bin/rs-e2e --skip-uninstall` |
-| Core tests (phases 0-4b) | `bin/rs-e2e` |
+| Core tests (phases 0-4, 13-14) | `bin/rs-e2e` |
 | Full run with mode switching | `bin/rs-e2e --mode-switch` |
 | Full run, no prompts | `bin/rs-e2e --mode-switch --yes` |
 | Build MCO image then test | `bin/rs-e2e --build mco` |
 | Build both images then test | `bin/rs-e2e --build both --mode-switch` |
 | Deploy existing override then test | `bin/rs-e2e --image-override` |
-| Specific phases | `bin/rs-e2e --phases 0,1,2a,2d` |
+| Specific phases | `bin/rs-e2e --phases 0-3,5,9a` |
 | Force MCOA mode | `bin/rs-e2e mcoa` |
 
 ### Execution
@@ -46,18 +46,21 @@ The script prints phase-by-phase results with PASS/FAIL status and a summary tab
 |-------|------|----------|
 | 0 | Pre-flight (cluster state detection) | — |
 | 1 | Baseline resource verification | — |
-| 2a-2d | Feature toggle (disable/swap/both/re-enable) | — |
+| 2a-2d | Feature toggle MCO (disable/swap/both/re-enable) | — |
 | 3 | Spoke PrometheusRule validation | — |
-| 4a | Uninstall cleanup — MCO mode | Destructive (prompts) |
-| 4b | Uninstall cleanup — MCOA mode | Destructive (prompts) |
-| 5a/5b | Mode switch (MCO↔MCOA) | `--mode-switch` |
-| 6 | Version mismatch (any annotation value) | `--mode-switch` |
-| 7 | SpecHash freshness after ADC change | `--mode-switch` |
-| 8 | ConfigMap predicate side-effect | `--mode-switch` |
-| 9 | Placement filter (cluster selection) | `--mode-switch` |
-| 10a/10b | Both-disabled in MCOA mode | `--mode-switch` |
-| 11a/11b | ConfigMap propagation (MCO + MCOA) | `--mode-switch` |
-| 12a/12b | MCO reinstall after MCOA | `--mode-switch` |
+| 4 | ConfigMap propagation (MCO) | — |
+| 5 | MCO → MCOA switch | `--mode-switch` |
+| 6 | SpecHash freshness after ADC change | `--mode-switch` |
+| 7 | ConfigMap predicate side-effect | `--mode-switch` |
+| 8 | Placement filter (cluster selection) | `--mode-switch` |
+| 9a-9d | Feature toggle MCOA (disable/swap/both/re-enable) | `--mode-switch` |
+| 10 | ConfigMap propagation (MCOA) | `--mode-switch` |
+| 11 | MCOA → MCO switch | `--mode-switch` |
+| 12 | Version mismatch (any annotation value) | `--mode-switch` |
+| 13 | Uninstall cleanup — MCO mode | Destructive (prompts) |
+| 14 | Uninstall cleanup — MCOA mode | Destructive (prompts) |
+| 15 | MCOA uninstall + reinstall | `--mode-switch`, destructive |
+| 16 | Mode switch after reinstall | `--mode-switch` |
 
 ## Troubleshooting failures
 

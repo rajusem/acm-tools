@@ -6,6 +6,7 @@
 # Usage:
 #   add-managed-cluster add <context> [--name <name>]    # Import a cluster
 #   add-managed-cluster add <context> --force-import     # Clean existing klusterlet and re-import
+#   add-managed-cluster add hub --force-import           # Repair local-cluster klusterlet
 #   add-managed-cluster add <context> --sync-pull-secret # Sync hub's quay.io credentials to spoke
 #   add-managed-cluster status                           # List managed clusters
 #   add-managed-cluster remove <cluster-name>            # Remove (detach) a managed cluster
@@ -33,6 +34,7 @@
 #   add-managed-cluster add namespace-spoke
 #   add-managed-cluster add vm-spoke --name my-vm-cluster
 #   add-managed-cluster add namespace-spoke --force-import
+#   add-managed-cluster add hub --force-import           # Repair local-cluster
 #   add-managed-cluster add vm-spoke --sync-pull-secret
 #   add-managed-cluster status
 #   add-managed-cluster remove namespace-spoke
@@ -55,7 +57,7 @@ usage() {
     echo ""
     echo "Options (for add):"
     echo "  --name NAME          ManagedCluster name (default: context name)"
-    echo "  --force-import       Clean up existing klusterlet on spoke and re-import"
+    echo "  --force-import       Clean up existing klusterlet and re-import (also repairs local-cluster)"
     echo "  --sync-pull-secret   Sync hub's quay.io:443 credentials to spoke's global pull secret"
     echo "  --no-wait            Skip waiting for cluster to become Available"
     echo "  --timeout N          Wait timeout in seconds (default: 120)"
@@ -114,17 +116,90 @@ validate_spoke_context() {
 
 detect_hub_as_spoke() {
     local spoke_ctx="$1"
+    local force="$2"
     local spoke_api hub_api
 
     spoke_api=$($KUBE_CLI config view --context="$spoke_ctx" --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
     hub_api=$($KUBE_CLI config view --context="$HUB_CONTEXT" --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
 
     if [[ "$spoke_api" == "$hub_api" ]]; then
+        if [[ "$force" == "true" ]]; then
+            # local-cluster repair: return special exit code to signal do_add
+            return 2
+        fi
         log_error "Context '$spoke_ctx' points to the same API server as the hub ($hub_api)"
         log_error "The hub cluster is already managed as 'local-cluster'"
-        log_info "Use a different cluster context for spoke import"
+        log_info "Use --force-import to repair local-cluster klusterlet"
         return 1
     fi
+}
+
+fix_local_cluster() {
+    log_step "Repairing local-cluster klusterlet"
+    echo ""
+
+    log_substep "Cleaning up existing klusterlet on hub"
+    $KUBE_CLI delete klusterlet klusterlet --ignore-not-found --timeout=30s 2>/dev/null || true
+    $KUBE_CLI delete namespace open-cluster-management-agent --ignore-not-found --timeout=60s 2>/dev/null || true
+    $KUBE_CLI delete namespace open-cluster-management-agent-addon --ignore-not-found --timeout=60s 2>/dev/null || true
+    $KUBE_CLI delete crd klusterlets.operator.open-cluster-management.io --ignore-not-found 2>/dev/null || true
+    $KUBE_CLI delete clusterrole klusterlet klusterlet-bootstrap-kubeconfig \
+        open-cluster-management:klusterlet-admin-aggregate-clusterrole --ignore-not-found 2>/dev/null || true
+    $KUBE_CLI delete clusterrolebinding klusterlet --ignore-not-found 2>/dev/null || true
+    log_success "Existing klusterlet cleaned up"
+
+    log_substep "Waiting for import secret to be generated"
+    local import_elapsed=0
+    while [[ $import_elapsed -lt 60 ]]; do
+        if resource_exists secret "local-cluster-import" "local-cluster"; then
+            break
+        fi
+        sleep 2
+        import_elapsed=$((import_elapsed + 2))
+    done
+
+    if ! resource_exists secret "local-cluster-import" "local-cluster"; then
+        log_error "Import secret 'local-cluster-import' not found after 60s"
+        return 1
+    fi
+
+    log_substep "Applying klusterlet CRDs"
+    $KUBE_CLI get secret local-cluster-import -n local-cluster \
+        -o jsonpath='{.data.crds\.yaml}' | base64 -d | $KUBE_CLI apply -f -
+
+    log_substep "Applying import manifests"
+    $KUBE_CLI get secret local-cluster-import -n local-cluster \
+        -o jsonpath='{.data.import\.yaml}' | base64 -d | $KUBE_CLI apply -f -
+
+    log_success "Klusterlet reinstalled on hub"
+
+    log_substep "Waiting for local-cluster to become Available (timeout: ${TIMEOUT_CLUSTER_IMPORT}s)"
+    local elapsed=0
+    local available=false
+    while [[ $elapsed -lt $TIMEOUT_CLUSTER_IMPORT ]]; do
+        local mc_status
+        mc_status=$($KUBE_CLI get managedcluster local-cluster \
+            -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
+            2>/dev/null || echo "")
+        if [[ "$mc_status" == "True" ]]; then
+            available=true
+            break
+        fi
+        printf "\r  ${BLUE}Waiting for local-cluster to become Available (%ds/%ds)...${NC}  " "$elapsed" "$TIMEOUT_CLUSTER_IMPORT"
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    printf "\r%-70s\r" " "
+
+    echo ""
+    print_separator
+    if [[ "$available" == "true" ]]; then
+        log_success "local-cluster repaired and Available"
+    else
+        log_warn "local-cluster not Available after ${TIMEOUT_CLUSTER_IMPORT}s"
+        log_info "Check: $KUBE_CLI get managedcluster local-cluster"
+    fi
+    print_separator
 }
 
 detect_existing_klusterlet() {
@@ -335,8 +410,15 @@ do_add() {
     # Validate spoke context and connectivity (uses --context flag, no context switch)
     validate_spoke_context "$spoke_context"
 
-    # Ensure spoke is not the hub itself
-    detect_hub_as_spoke "$spoke_context"
+    # Ensure spoke is not the hub itself (unless repairing local-cluster)
+    local hub_check_rc=0
+    detect_hub_as_spoke "$spoke_context" "$force_import" || hub_check_rc=$?
+    if [[ $hub_check_rc -eq 2 ]]; then
+        fix_local_cluster
+        return $?
+    elif [[ $hub_check_rc -ne 0 ]]; then
+        return 1
+    fi
 
     # Check if spoke is already attached to a hub
     log_substep "Checking for existing klusterlet on spoke"

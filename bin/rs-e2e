@@ -6,7 +6,7 @@
 # Usage:
 #   rs-e2e [options] [mco|mcoa]
 #   rs-e2e --skip-uninstall          # Run phases 0-3 only
-#   rs-e2e --mode-switch             # Include mode switching tests (phases 4-16)
+#   rs-e2e --mode-switch             # Include mode switching tests (phases 5-12, 15-16)
 #   rs-e2e --build mco               # Build, push, and apply MCO image first
 #   rs-e2e --phases 0-3,5,13-16      # Run specific phases (ranges OK)
 #
@@ -20,7 +20,7 @@
 #   2c   Disable both features
 #   2d   Re-enable both features
 #   3    Spoke PrometheusRule validation
-#   4    ConfigMap propagation (MCO)    (--mode-switch)
+#   4    ConfigMap propagation (MCO)
 #
 #   Group 2: MCOA-mode tests (1 mode switch)
 #   5    MCO -> MCOA switch            (--mode-switch)
@@ -85,7 +85,7 @@ Usage: $(basename "$0") [options] [mco|mcoa]
 
 Options:
   --skip-uninstall       Run phases 0-3 only (no MCO deletion)
-  --mode-switch          Include phases 4-16 (mode switching tests)
+  --mode-switch          Include phases 5-12, 15-16 (mode switching tests)
   --build mco|mcoa|both  Build, push, and apply custom images before tests
   --image-override       Apply existing image-override.json (no build)
   --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a)
@@ -129,7 +129,7 @@ parse_args() {
         if [[ "$SKIP_UNINSTALL" == "true" ]]; then
             SELECTED_PHASES="0,1,2a,2b,2c,2d,3"
         elif [[ "$MODE_SWITCH" == "false" ]]; then
-            SELECTED_PHASES="0,1,2a,2b,2c,2d,3,13,14"
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,3,4,13,14"
         fi
     fi
 
@@ -997,6 +997,8 @@ phase_2b() {
 
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "feature swap reconciliation" \
         resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
+        not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
 
     log_substep "Verifying namespace resources restored"
     assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
@@ -1058,6 +1060,8 @@ phase_2d() {
 
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resource restoration" \
         resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource restoration" \
+        resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
 
     log_substep "Verifying all RS resources restored"
     verify_all_rs_resources_exist "$CURRENT_MODE" || ((errors++)) || true
@@ -1699,8 +1703,12 @@ phase_9b() {
 
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA placement restoration" \
         resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA virt placement restoration" \
+        resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA configmap restoration" \
         resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA virt configmap restoration" \
+        resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
 
     log_substep "Verifying all RS resources restored"
     verify_all_rs_resources_exist "mcoa" || ((errors++)) || true
@@ -1952,7 +1960,7 @@ phase_16() {
 # Phase 13: Summary
 # =============================================================================
 
-phase_13_summary() {
+print_summary() {
     echo ""
     print_separator
     echo -e "${BOLD}Right-Sizing E2E Results${NC}"
@@ -2078,7 +2086,7 @@ main() {
     run_phase "15"  "MCOA uninstall + reinstall"      phase_15
     run_phase "16"  "Mode switch after reinstall"     phase_16
 
-    phase_13_summary
+    print_summary
 
     [[ $TOTAL_FAIL -eq 0 ]]
 }

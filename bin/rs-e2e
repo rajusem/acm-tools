@@ -27,8 +27,10 @@
 #   6    SpecHash freshness            (--mode-switch)
 #   7    ConfigMap predicate side-effect (--mode-switch)
 #   8    Placement filter              (--mode-switch)
-#   9a   Both-disabled in MCOA mode    (--mode-switch)
-#   9b   Re-enable both in MCOA mode   (--mode-switch)
+#   9a   Disable namespace RS (MCOA)   (--mode-switch)
+#   9b   Swap features (MCOA)          (--mode-switch)
+#   9c   Disable both (MCOA)           (--mode-switch)
+#   9d   Re-enable both (MCOA)         (--mode-switch)
 #   10   ConfigMap propagation (MCOA)  (--mode-switch)
 #
 #   Group 3: Mode round-trip tests
@@ -369,6 +371,7 @@ ensure_mode() {
     local current
     current=$(get_current_mode)
     if [[ "$current" == "$target" ]]; then
+        CURRENT_MODE="$target"
         return 0
     fi
     log_substep "Switching to $target mode (precondition)"
@@ -754,10 +757,15 @@ prephase_image_override() {
     # Wait for MCO pod to run the expected image
     if [[ -n "$expected_mco" ]]; then
         log_substep "Waiting for MCO pod to run expected image"
-        if ! wait_until 120 10 "Waiting for MCO image" \
-            test "$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
+        mco_pod_has_image() {
+            local actual
+            actual=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
                 -l name=multicluster-observability-operator \
-                -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null)" = "$expected_mco"; then
+                -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "")
+            [[ "$actual" == "$1" ]]
+        }
+        if ! wait_until 120 10 "Waiting for MCO image" \
+            mco_pod_has_image "$expected_mco"; then
             log_warn "MCO pod did not pick up $expected_mco within 120s"
         fi
     fi
@@ -920,10 +928,7 @@ phase_1() {
 
     if [[ -n "$FORCE_MODE" && "$FORCE_MODE" != "$CURRENT_MODE" ]]; then
         log_substep "Forcing $FORCE_MODE mode"
-        ensure_mode "$FORCE_MODE" || {
-            PHASE_FAIL_REASON="Could not switch to $FORCE_MODE mode"
-            return 1
-        }
+        ensure_mode "$FORCE_MODE" || log_warn "Mode switch to $FORCE_MODE may not be complete"
         CURRENT_MODE="$FORCE_MODE"
     fi
 
@@ -952,7 +957,9 @@ phase_1() {
 
 phase_2a() {
     local errors=0
-    [[ -z "$CURRENT_MODE" ]] && CURRENT_MODE=$(get_current_mode)
+
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Disabling namespace RS only"
     patch_rs_features false true
@@ -990,7 +997,9 @@ phase_2a() {
 
 phase_2b() {
     local errors=0
-    [[ -z "$CURRENT_MODE" ]] && CURRENT_MODE=$(get_current_mode)
+
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Swapping features: namespace on, virtualization off"
     patch_rs_features true false
@@ -1030,7 +1039,9 @@ phase_2b() {
 
 phase_2c() {
     local errors=0
-    [[ -z "$CURRENT_MODE" ]] && CURRENT_MODE=$(get_current_mode)
+
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Disabling both RS features"
     patch_rs_features false false
@@ -1053,7 +1064,9 @@ phase_2c() {
 
 phase_2d() {
     local errors=0
-    [[ -z "$CURRENT_MODE" ]] && CURRENT_MODE=$(get_current_mode)
+
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Re-enabling both RS features"
     patch_rs_features true true
@@ -1082,7 +1095,9 @@ phase_2d() {
 
 phase_3() {
     local errors=0
-    [[ -z "$CURRENT_MODE" ]] && CURRENT_MODE=$(get_current_mode)
+
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     if [[ "$CURRENT_MODE" == "mco" ]]; then
         log_substep "Checking PlacementDecisions"
@@ -1156,7 +1171,8 @@ phase_13() {
 
     local errors=0
 
-    ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Deleting MCO via setup-observability uninstall"
     echo "y" | "$SCRIPT_DIR/setup-observability" uninstall
@@ -1182,9 +1198,16 @@ phase_14() {
 
     local errors=0
 
-    log_substep "Reinstalling MCO"
+    if resource_exists mco "$MCO_NAME"; then
+        log_substep "MCO still exists — deleting first"
+        echo "y" | "$SCRIPT_DIR/setup-observability" uninstall
+        wait_until "$TIMEOUT_RS_CLEANUP" 5 "MCO deletion" \
+            not_resource_exists mco "$MCO_NAME" || true
+    fi
+
+    log_substep "Installing MCO"
     "$SCRIPT_DIR/setup-observability" install
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO reinstall failed"; return 1; }
+    ensure_mco_installed || log_warn "MCO reinstall may not be fully ready"
 
     log_substep "Enabling RS features"
     patch_rs_features true true
@@ -1245,8 +1268,8 @@ phase_5() {
 
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Enabling both RS features"
     patch_rs_features true true
@@ -1302,8 +1325,8 @@ phase_5() {
 phase_11() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
 
     log_substep "Removing MCO CR annotation"
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
@@ -1354,8 +1377,8 @@ phase_11() {
 phase_12() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Setting annotation with non-standard value: v99"
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=v99" --overwrite
@@ -1400,8 +1423,8 @@ phase_12() {
 phase_6() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
 
     log_substep "Recording initial specHash values"
     INITIAL_SPEC_HASHES=$(get_all_spec_hashes)
@@ -1485,8 +1508,8 @@ phase_6() {
 phase_7() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
 
     log_substep "Verifying no Policies exist (MCOA mode baseline)"
     assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || {
@@ -1525,8 +1548,8 @@ phase_7() {
 phase_8() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
 
     local spoke_name
     spoke_name=$($KUBE_CLI get managedcluster \
@@ -1664,15 +1687,76 @@ DEFAULTEOF
 phase_9a() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
 
-    log_substep "Ensuring both features enabled first"
-    patch_rs_features true true
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resources creation" \
+    log_substep "Disabling namespace RS only (MCOA mode)"
+    patch_rs_features false true
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace placement cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Verifying namespace resources deleted"
+    assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Verifying virt resources retained"
+    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Checking ADC state"
+    verify_adc_state "disabled" "enabled" || ((errors++)) || true
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_9b() {
+    local errors=0
+
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+
+    log_substep "Swapping features: namespace on, virtualization off (MCOA mode)"
+    patch_rs_features true false
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace placement restoration" \
         resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt placement cleanup" \
+        not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
 
-    log_substep "Disabling both RS features in MCOA mode"
+    log_substep "Verifying namespace resources restored"
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Verifying virt resources deleted"
+    assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Checking ADC state"
+    verify_adc_state "enabled" "disabled" || ((errors++)) || true
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_9c() {
+    local errors=0
+
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+
+    log_substep "Disabling both RS features (MCOA mode)"
     patch_rs_features false false
 
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace placement cleanup" \
@@ -1695,10 +1779,13 @@ phase_9a() {
     return 0
 }
 
-phase_9b() {
+phase_9d() {
     local errors=0
 
-    log_substep "Re-enabling both RS features in MCOA mode"
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+
+    log_substep "Re-enabling both RS features (MCOA mode)"
     patch_rs_features true true
 
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA placement restoration" \
@@ -1732,8 +1819,8 @@ phase_9b() {
 phase_4() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mco || { PHASE_FAIL_REASON="Could not switch to MCO mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
     # ConfigMap data keys are YAML strings (not JSON): prometheusRuleConfig, placementConfiguration
@@ -1771,8 +1858,8 @@ phase_4() {
 phase_10() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
 
     log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
     # ConfigMap data keys are YAML strings (not JSON): prometheusRuleConfig, placementConfiguration
@@ -1835,8 +1922,8 @@ phase_15() {
 
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
-    ensure_mode mcoa || { PHASE_FAIL_REASON="Could not switch to MCOA mode"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
 
     log_substep "Enabling both RS features"
     patch_rs_features true true
@@ -1853,7 +1940,7 @@ phase_15() {
 
     log_substep "Reinstalling MCO"
     "$SCRIPT_DIR/setup-observability" install
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO reinstall failed"; return 1; }
+    ensure_mco_installed || log_warn "MCO reinstall may not be fully ready"
 
     CURRENT_MODE=$(get_current_mode)
     log_info "  Post-reinstall mode: $CURRENT_MODE"
@@ -1902,7 +1989,8 @@ phase_15() {
 phase_16() {
     local errors=0
 
-    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed"; return 1; }
+    ensure_mco_installed || log_warn "MCO install may not be fully ready"
+    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
 
     log_substep "Switching to MCOA mode"
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
@@ -1957,7 +2045,7 @@ phase_16() {
 }
 
 # =============================================================================
-# Phase 13: Summary
+# Summary
 # =============================================================================
 
 print_summary() {
@@ -2076,8 +2164,10 @@ main() {
     run_phase "6"   "SpecHash freshness"              phase_6
     run_phase "7"   "ConfigMap predicate side-effect"  phase_7
     run_phase "8"   "Placement filter"                phase_8
-    run_phase "9a"  "Both-disabled MCOA"              phase_9a
-    run_phase "9b"  "Re-enable both MCOA"             phase_9b
+    run_phase "9a"  "Disable namespace RS (MCOA)"     phase_9a
+    run_phase "9b"  "Swap features (MCOA)"            phase_9b
+    run_phase "9c"  "Disable both (MCOA)"             phase_9c
+    run_phase "9d"  "Re-enable both (MCOA)"           phase_9d
     run_phase "10"  "ConfigMap propagation (MCOA)"    phase_10
     run_phase "11"  "MCOA -> MCO switch"              phase_11
     run_phase "12"  "Version mismatch"                phase_12

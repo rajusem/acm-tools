@@ -438,13 +438,18 @@ EOF
     if [[ $elapsed -ge $MCH_WAIT_TIMEOUT ]]; then
         log_warn "MCH not Running within timeout. It may still be initializing."
         log_info "Check: $KUBE_CLI get mch multiclusterhub -n $ACM_NAMESPACE"
+        log_info "Run 'bin/install-custom-acm status' to check later"
+        echo ""
+        print_separator
+        log_warn "ACM install launched but MCH not yet Running"
+        print_separator
+    else
+        echo ""
+        print_separator
+        log_success "ACM installation complete"
+        do_status
+        print_separator
     fi
-
-    echo ""
-    print_separator
-    log_success "ACM installation complete"
-    do_status
-    print_separator
 }
 
 do_uninstall() {

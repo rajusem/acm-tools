@@ -71,11 +71,13 @@ RESULT_IDS=()
 RESULT_NAMES=()
 RESULT_STATUSES=()
 RESULT_NOTES=()
+RESULT_DURATIONS=()
 TOTAL_PASS=0
 TOTAL_FAIL=0
 TOTAL_SKIP=0
 PHASE_FAIL_REASON=""
 PHASE_SKIP_REASON=""
+E2E_START_TIME=0
 
 # =============================================================================
 # CLI
@@ -144,16 +146,28 @@ parse_args() {
 # Result Tracking
 # =============================================================================
 
+format_duration() {
+    local secs="$1"
+    if [[ $secs -ge 60 ]]; then
+        printf "%dm%02ds" $((secs / 60)) $((secs % 60))
+    else
+        printf "%ds" "$secs"
+    fi
+}
+
 record_result() {
-    local id="$1" name="$2" status="$3" notes="${4:-}"
+    local id="$1" name="$2" status="$3" notes="${4:-}" duration="${5:-0}"
     RESULT_IDS+=("$id")
     RESULT_NAMES+=("$name")
     RESULT_STATUSES+=("$status")
     RESULT_NOTES+=("$notes")
+    RESULT_DURATIONS+=("$duration")
 
+    local dur_str
+    dur_str=$(format_duration "$duration")
     case "$status" in
-        PASS) ((TOTAL_PASS++)) || true; log_success "Phase $id: PASS" ;;
-        FAIL) ((TOTAL_FAIL++)) || true; log_error "Phase $id: FAIL — $notes" ;;
+        PASS) ((TOTAL_PASS++)) || true; log_success "Phase $id: PASS ($dur_str)" ;;
+        FAIL) ((TOTAL_FAIL++)) || true; log_error "Phase $id: FAIL ($dur_str) — $notes" ;;
         SKIP) ((TOTAL_SKIP++)) || true; log_warn "Phase $id: SKIP — $notes" ;;
     esac
 }
@@ -190,7 +204,7 @@ run_phase() {
     local id="$1" name="$2" fn="$3"
 
     if ! phase_selected "$id"; then
-        record_result "$id" "$name" "SKIP" "not selected"
+        record_result "$id" "$name" "SKIP" "not selected" 0
         return 0
     fi
 
@@ -201,17 +215,19 @@ run_phase() {
     PHASE_FAIL_REASON=""
     PHASE_SKIP_REASON=""
 
+    local phase_start=$SECONDS
     set +e
     "$fn"
     local rc=$?
     set -e
+    local phase_duration=$((SECONDS - phase_start))
 
     if [[ $rc -eq 0 ]]; then
-        record_result "$id" "$name" "PASS" ""
+        record_result "$id" "$name" "PASS" "" "$phase_duration"
     elif [[ $rc -eq 2 ]]; then
-        record_result "$id" "$name" "SKIP" "${PHASE_SKIP_REASON:-skipped}"
+        record_result "$id" "$name" "SKIP" "${PHASE_SKIP_REASON:-skipped}" "$phase_duration"
     else
-        record_result "$id" "$name" "FAIL" "${PHASE_FAIL_REASON:-unknown}"
+        record_result "$id" "$name" "FAIL" "${PHASE_FAIL_REASON:-unknown}" "$phase_duration"
     fi
 }
 
@@ -2065,21 +2081,32 @@ print_summary() {
         -o jsonpath='{.status.currentVersion}' 2>/dev/null || echo "unknown")
     local current_mode
     current_mode=$(get_current_mode 2>/dev/null || echo "unknown")
+    local mco_image
+    mco_image=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
+        -l name=multicluster-observability-operator \
+        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
+    local mcoa_image
+    mcoa_image=$($KUBE_CLI get pod -n "$OBS_NAMESPACE" \
+        -l app=multicluster-observability-addon-manager \
+        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
 
     echo -e "  Cluster:          $cluster_url"
     echo -e "  ACM Version:      $acm_version"
     echo -e "  Mode:             $current_mode"
     echo -e "  Managed Clusters: $mc_count ($mc_names)"
+    echo -e "  MCO Image:        $mco_image"
+    echo -e "  MCOA Image:       $mcoa_image"
     echo ""
 
-    printf "  ${BOLD}%-6s %-42s %-8s %s${NC}\n" "ID" "Test" "Result" "Notes"
-    printf "  %-6s %-42s %-8s %s\n" "----" "----" "------" "-----"
+    printf "  ${BOLD}%-6s %-42s %-8s %-8s %s${NC}\n" "ID" "Test" "Result" "Time" "Notes"
+    printf "  %-6s %-42s %-8s %-8s %s\n" "----" "----" "------" "----" "-----"
 
     for i in "${!RESULT_IDS[@]}"; do
         local id="${RESULT_IDS[$i]}"
         local name="${RESULT_NAMES[$i]}"
         local status="${RESULT_STATUSES[$i]}"
         local notes="${RESULT_NOTES[$i]}"
+        local duration="${RESULT_DURATIONS[$i]}"
 
         local color="$NC"
         case "$status" in
@@ -2088,13 +2115,22 @@ print_summary() {
             SKIP) color="$YELLOW" ;;
         esac
 
-        printf "  %-6s %-42s ${color}%-8s${NC} %s\n" \
-            "$id" "$name" "$status" "$notes"
+        local dur_str=""
+        if [[ "$status" != "SKIP" || "$duration" -gt 0 ]]; then
+            dur_str=$(format_duration "$duration")
+        fi
+
+        printf "  %-6s %-42s ${color}%-8s${NC} %-8s %s\n" \
+            "$id" "$name" "$status" "$dur_str" "$notes"
     done
+
+    local total_duration=$((SECONDS - E2E_START_TIME))
+    local total_dur_str
+    total_dur_str=$(format_duration "$total_duration")
 
     echo ""
     print_separator
-    echo -e "  ${GREEN}PASS: $TOTAL_PASS${NC}  ${RED}FAIL: $TOTAL_FAIL${NC}  ${YELLOW}SKIP: $TOTAL_SKIP${NC}"
+    echo -e "  ${GREEN}PASS: $TOTAL_PASS${NC}  ${RED}FAIL: $TOTAL_FAIL${NC}  ${YELLOW}SKIP: $TOTAL_SKIP${NC}  Total: $total_dur_str"
     print_separator
 
     if [[ $TOTAL_FAIL -gt 0 ]]; then
@@ -2125,6 +2161,8 @@ print_summary() {
 
 main() {
     parse_args "$@"
+
+    E2E_START_TIME=$SECONDS
 
     init_acm_tools
     init_hub_context

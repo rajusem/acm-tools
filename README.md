@@ -189,7 +189,7 @@ bin/rs-status --watch                        # Refresh every 10s
 bin/rs-status --json                         # JSON output for scripting
 ```
 
-Shows: mode (MCO/MCOA), MCO CR state, ADC state, ConfigMaps, mode-specific resources (Policies or Placements/ManifestWorks), spoke PrometheusRules, operator pods, and images.
+Shows: mode (MCO/MCOA), MCO CR state, ADC state, ConfigMaps, mode-specific resources (Policies or Placements/ManifestWorks), spoke PrometheusRules, operator pods, images, and COO/Perses dashboard status (MCOA mode — checks all 4 RS dashboards: `acm-rs-namespace-overview`, `acm-rightsizing-openshift-virtualization`, `acm-rightsizing-vm-overestimation`, `acm-rightsizing-vm-underestimation`).
 
 ### rs-e2e
 
@@ -203,6 +203,7 @@ bin/rs-e2e --phases 0-3,5,9a                 # Run specific phases (ranges OK)
 bin/rs-e2e --build mco                       # Build MCO image, then run tests
 bin/rs-e2e --build both                      # Build MCO + MCOA images, then run tests
 bin/rs-e2e --image-override                  # Apply image-override.json, then run tests
+bin/rs-e2e --skip-perses-check               # Skip COO/Perses dashboard verification
 bin/rs-e2e --mode-switch                     # All phases (prompts for destructive)
 bin/rs-e2e --mode-switch --yes               # All phases, auto-confirm destructive
 bin/rs-e2e mcoa                              # Force testing in MCOA mode
@@ -227,14 +228,14 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 
 | Phase | Test | What it validates |
 |-------|------|-------------------|
-| 5 | MCO → MCOA switch | Sets `right-sizing-capable` annotation, restarts addon manager. Verifies Policies deleted, ManifestWorks with PrometheusRules created, ADC shows enabled state, specHash populated. |
+| 5 | MCO → MCOA switch | Sets `right-sizing-capable` annotation, restarts addon manager. Verifies Policies deleted, ManifestWorks with PrometheusRules created, ADC shows enabled state, specHash populated, Perses dashboards created (4 total: 1 namespace + 3 virtualization). |
 | 6 | SpecHash freshness | Disables virt RS to trigger ADC change, polls for specHash change (up to 60s). Re-enables and verifies hash restores. Tests that ADC spec changes propagate to ManifestWork specHash. |
 | 7 | ConfigMap predicate | Edits ConfigMap data without MCO spec change. Verifies no Policy side-effects in MCOA mode (ConfigMap predicate should not trigger Policy creation). |
 | 8 | Placement filter | Applies `placementConfiguration` with label selector to restrict cluster selection. Verifies PlacementDecisions filter to matching clusters only, then restores defaults. Uses yaml.v2 lowercased field names. |
-| 9a | Disable namespace RS (MCOA) | Same as 2a but in MCOA mode — verifies MCOA handles partial feature disable correctly. |
-| 9b | Swap features (MCOA) | Same as 2b but in MCOA mode — verifies MCOA handles feature swap correctly. |
-| 9c | Disable both (MCOA) | Same as 2c but in MCOA mode — verifies MCOA cleans up all RS resources. Placements may persist due to addon framework InstallStrategy (logged as warning, not failure). |
-| 9d | Re-enable both (MCOA) | Same as 2d but in MCOA mode — verifies MCOA restores all RS resources including ManifestWorks. |
+| 9a | Disable namespace RS (MCOA) | Same as 2a but in MCOA mode — verifies MCOA handles partial feature disable. Also verifies namespace Perses dashboard (`acm-rs-namespace-overview`) removed while 3 virt dashboards retained. |
+| 9b | Swap features (MCOA) | Same as 2b but in MCOA mode — verifies MCOA handles feature swap. Also verifies namespace dashboard present and 3 virt dashboards removed. |
+| 9c | Disable both (MCOA) | Same as 2c but in MCOA mode — verifies MCOA cleans up all RS resources and all 4 Perses dashboards are absent. Placements may persist due to addon framework InstallStrategy (logged as warning, not failure). |
+| 9d | Re-enable both (MCOA) | Same as 2d but in MCOA mode — verifies MCOA restores all RS resources including ManifestWorks and all 4 Perses dashboards. |
 | 10 | ConfigMap propagation (MCOA) | Same as phase 4 but in MCOA mode — modifies ConfigMap, verifies ManifestWork PrometheusRules update with new value. Tests MCOA's ConfigMap→ManifestWork pipeline. |
 
 **Group 3: Mode round-trip tests** (`--mode-switch` required)
@@ -249,9 +250,9 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | Phase | Test | What it validates |
 |-------|------|-------------------|
 | 13 | Uninstall cleanup (MCO) | Deletes MCO CR via `setup-observability uninstall`. Verifies all RS resources cleaned up: Placements, ConfigMaps, Policies, PlacementBindings deleted. |
-| 14 | Uninstall cleanup (MCOA) | Reinstalls MCO, enables RS, switches to MCOA mode, then deletes MCO. Verifies MCOA-specific cleanup: ManifestWork PrometheusRules removed, ClusterManagementAddon deleted. |
+| 14 | Uninstall cleanup (MCOA) | Reinstalls MCO, enables RS, switches to MCOA mode, then deletes MCO. Verifies MCOA-specific cleanup: ManifestWork PrometheusRules removed, ClusterManagementAddon deleted, all 4 Perses dashboards absent. |
 | 15 | MCOA uninstall + reinstall | Deletes MCO in MCOA mode, reinstalls, verifies RS auto-defaults re-populate. Checks for stale IsMCOTerminating flag (operator caches terminating state in memory — requires pod restart). |
-| 16 | Mode switch after reinstall | After fresh MCO install, performs full MCO→MCOA→MCO round-trip. Verifies ManifestWorks created in MCOA mode and Policies restored after switching back to MCO. |
+| 16 | Mode switch after reinstall | After fresh MCO install, performs full MCO→MCOA→MCO round-trip. Verifies ManifestWorks and Perses dashboards created in MCOA mode, Policies restored after switching back to MCO. |
 
 Phases 5-12, 15-16 require `--mode-switch` (or explicit `--phases` selection). Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.
 
@@ -259,6 +260,7 @@ Phases 5-12, 15-16 require `--mode-switch` (or explicit `--phases` selection). D
 
 - `TIMEOUT_E2E_RECONCILE` — Seconds to wait after MCO spec patches (default: 90)
 - `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
+- `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 60)
 
 The `--build` flag reads repo paths from `config.sh` (`MCO_REPO_DIR`, `MCOA_REPO_DIR`), auto-increments the tag in `image-override.json`, builds with `$CONTAINER_ENGINE`, pushes to `$ACM_TOOLS_REGISTRY`, and applies the override before running tests.
 

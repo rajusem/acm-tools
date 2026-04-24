@@ -9,6 +9,7 @@ Run end-to-end validation of right-sizing resource lifecycle on the current clus
 - `--build mco|mcoa|both` — Build, push, and apply custom image(s) before running tests
 - `--image-override` — Apply existing `image-override.json` without building
 - `--phases 0-3,5,9a` — Run specific phases (comma-separated, ranges OK)
+- `--skip-perses-check` — Skip COO/Perses dashboard verification
 - `--yes` — Auto-confirm destructive phases (13, 14, 15)
 - `mco` or `mcoa` — Force testing a specific mode (default: auto-detect)
 
@@ -49,18 +50,18 @@ The script prints phase-by-phase results with PASS/FAIL status and a summary tab
 | 2a-2d | Feature toggle MCO (disable/swap/both/re-enable) | — |
 | 3 | Spoke PrometheusRule validation | — |
 | 4 | ConfigMap propagation (MCO) | — |
-| 5 | MCO → MCOA switch | `--mode-switch` |
+| 5 | MCO → MCOA switch + Perses dashboards | `--mode-switch` |
 | 6 | SpecHash freshness after ADC change | `--mode-switch` |
 | 7 | ConfigMap predicate side-effect | `--mode-switch` |
 | 8 | Placement filter (cluster selection) | `--mode-switch` |
-| 9a-9d | Feature toggle MCOA (disable/swap/both/re-enable) | `--mode-switch` |
+| 9a-9d | Feature toggle MCOA + Perses dashboards | `--mode-switch` |
 | 10 | ConfigMap propagation (MCOA) | `--mode-switch` |
 | 11 | MCOA → MCO switch | `--mode-switch` |
 | 12 | Version mismatch (any annotation value) | `--mode-switch` |
 | 13 | Uninstall cleanup — MCO mode | Destructive (prompts) |
-| 14 | Uninstall cleanup — MCOA mode | Destructive (prompts) |
+| 14 | Uninstall cleanup — MCOA mode + Perses | Destructive (prompts) |
 | 15 | MCOA uninstall + reinstall | `--mode-switch`, destructive |
-| 16 | Mode switch after reinstall | `--mode-switch` |
+| 16 | Mode switch after reinstall + Perses | `--mode-switch` |
 
 ## Troubleshooting failures
 
@@ -85,10 +86,11 @@ If the script fails or a phase reports FAIL:
 
 - `TIMEOUT_E2E_RECONCILE` — Seconds to wait after MCO spec patches (default: 90)
 - `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
+- `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 60)
 
 ## Important notes
 
 - `--build` requires `podman`/`docker` and registry access. Always builds with `--platform linux/amd64` and `--no-cache`.
-- Destructive phases (4a, 4b, 12a) prompt for confirmation unless `--yes` is passed.
+- Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed.
 - If any phase fails, the script continues with remaining phases and reports all results in the summary.
 - The script saves and restores kubeconfig context on exit.

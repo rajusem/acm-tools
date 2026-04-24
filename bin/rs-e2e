@@ -66,6 +66,7 @@ BUILD_TARGET=""
 IMAGE_OVERRIDE_ONLY=false
 SELECTED_PHASES=""
 AUTO_CONFIRM=false
+SKIP_PERSES_CHECK=false
 
 RESULT_IDS=()
 RESULT_NAMES=()
@@ -93,6 +94,7 @@ Options:
   --build mco|mcoa|both  Build, push, and apply custom images before tests
   --image-override       Apply existing image-override.json (no build)
   --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a)
+  --skip-perses-check    Skip COO/Perses dashboard verification
   --yes                  Auto-confirm destructive phases (no prompts)
   -h, --help             Show this help
 
@@ -118,6 +120,7 @@ parse_args() {
                 [[ -z "$BUILD_TARGET" ]] && { log_error "--build requires mco|mcoa|both"; exit 1; }
                 shift 2 ;;
             --image-override) IMAGE_OVERRIDE_ONLY=true; shift ;;
+            --skip-perses-check) SKIP_PERSES_CHECK=true; shift ;;
             --yes|-y)         AUTO_CONFIRM=true; shift ;;
             --phases)
                 SELECTED_PHASES="${2:-}"
@@ -304,6 +307,114 @@ adc_managed_by_mco() {
     actual=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" -n "$OBS_NAMESPACE" \
         -o jsonpath='{.spec.customizedVariables[?(@.name=="platformNamespaceRightSizing")].value}' 2>/dev/null || echo "")
     [[ "$actual" == "managed-by-mco" ]]
+}
+
+# --- Perses Dashboard Constants ---
+RS_NS_DASHBOARD="acm-rs-namespace-overview"
+RS_VM_DASHBOARDS=("acm-rightsizing-openshift-virtualization" "acm-rightsizing-vm-overestimation" "acm-rightsizing-vm-underestimation")
+TIMEOUT_PERSES_DASHBOARD="${TIMEOUT_PERSES_DASHBOARD:-60}"
+
+perses_dashboard_exists() {
+    $KUBE_CLI get persesdashboard "$1" -n "$ANALYTICS_NAMESPACE" &>/dev/null
+}
+
+verify_perses_dashboards() {
+    local ns_enabled="$1" virt_enabled="$2"
+    local errors=0
+
+    if [[ "$SKIP_PERSES_CHECK" == "true" ]]; then
+        log_info "  Perses dashboard check skipped (--skip-perses-check)"
+        return 0
+    fi
+
+    if [[ "$CURRENT_MODE" != "mcoa" ]]; then
+        return 0
+    fi
+
+    log_substep "Checking COO installation"
+    if ! check_coo_installed; then
+        log_warn "  COO not installed — skipping Perses dashboard checks"
+        return 0
+    fi
+    log_success "  COO installed"
+
+    log_substep "Waiting for Perses dashboards to converge"
+    if [[ "$ns_enabled" == "true" ]]; then
+        wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "namespace RS dashboard" \
+            perses_dashboard_exists "$RS_NS_DASHBOARD" || true
+    elif [[ "$virt_enabled" == "true" ]]; then
+        wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "virt RS dashboard" \
+            perses_dashboard_exists "${RS_VM_DASHBOARDS[0]}" || true
+    fi
+
+    if [[ "$ns_enabled" == "true" ]]; then
+        if perses_dashboard_exists "$RS_NS_DASHBOARD"; then
+            log_success "  persesdashboard/$RS_NS_DASHBOARD exists"
+        else
+            log_error "  persesdashboard/$RS_NS_DASHBOARD NOT FOUND"
+            ((errors++)) || true
+        fi
+    else
+        if perses_dashboard_exists "$RS_NS_DASHBOARD"; then
+            wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "namespace dashboard deletion" \
+                not_resource_exists persesdashboard "$RS_NS_DASHBOARD" "$ANALYTICS_NAMESPACE" || true
+        fi
+        if perses_dashboard_exists "$RS_NS_DASHBOARD"; then
+            log_error "  persesdashboard/$RS_NS_DASHBOARD still EXISTS (namespace RS disabled)"
+            ((errors++)) || true
+        else
+            log_success "  persesdashboard/$RS_NS_DASHBOARD absent (namespace RS disabled)"
+        fi
+    fi
+
+    for db in "${RS_VM_DASHBOARDS[@]}"; do
+        if [[ "$virt_enabled" == "true" ]]; then
+            if perses_dashboard_exists "$db"; then
+                log_success "  persesdashboard/$db exists"
+            else
+                log_error "  persesdashboard/$db NOT FOUND"
+                ((errors++)) || true
+            fi
+        else
+            if perses_dashboard_exists "$db"; then
+                log_error "  persesdashboard/$db still EXISTS (virt RS disabled)"
+                ((errors++)) || true
+            else
+                log_success "  persesdashboard/$db absent (virt RS disabled)"
+            fi
+        fi
+    done
+
+    return $errors
+}
+
+verify_no_perses_dashboards() {
+    local errors=0
+
+    if [[ "$SKIP_PERSES_CHECK" == "true" ]]; then
+        return 0
+    fi
+    if [[ "$CURRENT_MODE" != "mcoa" && "$1" != "uninstall" ]]; then
+        return 0
+    fi
+
+    log_substep "Checking RS Perses dashboards absent"
+
+    if perses_dashboard_exists "$RS_NS_DASHBOARD"; then
+        wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "dashboard cleanup" \
+            not_resource_exists persesdashboard "$RS_NS_DASHBOARD" "$ANALYTICS_NAMESPACE" || true
+    fi
+
+    for db in "$RS_NS_DASHBOARD" "${RS_VM_DASHBOARDS[@]}"; do
+        if perses_dashboard_exists "$db"; then
+            log_error "  persesdashboard/$db still EXISTS"
+            ((errors++)) || true
+        else
+            log_success "  persesdashboard/$db absent"
+        fi
+    done
+
+    return $errors
 }
 
 mco_placements_ready() {
@@ -1263,6 +1374,8 @@ phase_14() {
         fi
     done
 
+    verify_no_perses_dashboards "uninstall" || ((errors++)) || true
+
     CURRENT_MODE=""
 
     if [[ $errors -gt 0 ]]; then
@@ -1330,6 +1443,9 @@ phase_5() {
 
     log_substep "Checking ADC state"
     verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
+    log_substep "Checking Perses dashboards"
+    verify_perses_dashboards "true" "true" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1723,6 +1839,8 @@ phase_9a() {
     log_substep "Checking ADC state"
     verify_adc_state "disabled" "enabled" || ((errors++)) || true
 
+    verify_perses_dashboards "false" "true" || ((errors++)) || true
+
     CURRENT_MODE="mcoa"
 
     if [[ $errors -gt 0 ]]; then
@@ -1757,6 +1875,8 @@ phase_9b() {
     log_substep "Checking ADC state"
     verify_adc_state "enabled" "disabled" || ((errors++)) || true
 
+    verify_perses_dashboards "true" "false" || ((errors++)) || true
+
     CURRENT_MODE="mcoa"
 
     if [[ $errors -gt 0 ]]; then
@@ -1785,6 +1905,8 @@ phase_9c() {
 
     log_substep "Checking ADC state"
     verify_adc_state "disabled" "disabled" || ((errors++)) || true
+
+    verify_no_perses_dashboards "mcoa" || ((errors++)) || true
 
     CURRENT_MODE="mcoa"
 
@@ -1818,6 +1940,8 @@ phase_9d() {
 
     log_substep "Checking ADC state"
     verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
+    verify_perses_dashboards "true" "true" || ((errors++)) || true
 
     CURRENT_MODE="mcoa"
 
@@ -2036,6 +2160,8 @@ phase_16() {
 
     log_substep "Checking ADC state"
     verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
+    verify_perses_dashboards "true" "true" || ((errors++)) || true
 
     log_substep "Switching back to MCO mode"
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION-" --overwrite 2>/dev/null || true

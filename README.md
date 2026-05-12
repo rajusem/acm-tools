@@ -88,9 +88,16 @@ bin/setup-observability                      # Full setup with Minio
 bin/setup-observability --skip-minio         # Use existing object storage
 bin/setup-observability --enable-rightsizing  # Also enable right-sizing
 bin/setup-observability --mcoa-mode          # Enable right-sizing in MCOA mode
+bin/setup-observability --force-cleanup-mw   # Clean stuck ManifestWorks before install
 bin/setup-observability status               # Show observability status
 bin/setup-observability uninstall            # Remove MCO CR
 ```
+
+The `status` command detects MCOA ManifestWorks stuck in `Deleting` state on `local-cluster` (a self-referential deadlock that blocks COO installation and Perses dashboards). Use `--force-cleanup-mw` during install to remove finalizers and restart MCOA automatically.
+
+**Environment variables:**
+
+- `TIMEOUT_MW_STUCK` — Seconds before a deleting ManifestWork is considered stuck (default: 120)
 
 ### add-managed-cluster
 
@@ -231,7 +238,7 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 5 | MCO → MCOA switch | Sets `right-sizing-capable` annotation, restarts addon manager. Verifies Policies deleted, ManifestWorks with PrometheusRules created, ADC shows enabled state, specHash populated, Perses dashboards created (4 total: 1 namespace + 3 virtualization). |
 | 6 | SpecHash freshness | Disables virt RS to trigger ADC change, polls for specHash change (up to 60s). Re-enables and verifies hash restores. Tests that ADC spec changes propagate to ManifestWork specHash. |
 | 7 | ConfigMap predicate | Edits ConfigMap data without MCO spec change. Verifies no Policy side-effects in MCOA mode (ConfigMap predicate should not trigger Policy creation). |
-| 8 | Placement filter | Applies `placementConfiguration` with label selector to restrict cluster selection. Verifies PlacementDecisions filter to matching clusters only, then restores defaults. Uses yaml.v2 lowercased field names. |
+| 8 | Placement filter | Applies `placementConfiguration` with label selector to restrict cluster selection. Verifies ManifestWork PrometheusRule distribution filters to matching clusters only, then restores defaults. Uses yaml.v2 lowercased field names. |
 | 9a | Disable namespace RS (MCOA) | Same as 2a but in MCOA mode — verifies MCOA handles partial feature disable. Also verifies namespace Perses dashboard (`acm-rs-namespace-overview`) removed while 3 virt dashboards retained. |
 | 9b | Swap features (MCOA) | Same as 2b but in MCOA mode — verifies MCOA handles feature swap. Also verifies namespace dashboard present and 3 virt dashboards removed. |
 | 9c | Disable both (MCOA) | Same as 2c but in MCOA mode — verifies MCOA cleans up all RS resources and all 4 Perses dashboards are absent. Placements may persist due to addon framework InstallStrategy (logged as warning, not failure). |

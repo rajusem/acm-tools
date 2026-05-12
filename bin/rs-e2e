@@ -422,6 +422,24 @@ mco_placements_ready() {
     resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE"
 }
 
+mw_namespace_cluster_count() {
+    local count=0
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            local has_ns_pr
+            has_ns_pr=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null | \
+                jq '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | select(.metadata.name | test("acm-rs-namespace"))] | length' \
+                2>/dev/null || echo 0)
+            if [[ "$has_ns_pr" -gt 0 ]]; then
+                ((count++))
+            fi
+        done
+    done
+    echo "$count"
+}
+
 rs_defaults_populated() {
     local val
     val=$(get_resource_field mco "$MCO_NAME" "" \
@@ -446,24 +464,6 @@ manifestwork_contains() {
         done
     done
     return 1
-}
-
-placement_decision_count_le() {
-    local placement="$1" max="$2"
-    local count
-    count=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
-        -l "cluster.open-cluster-management.io/placement=$placement" \
-        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null | wc -w | tr -d ' ')
-    [[ "$count" -le "$max" ]]
-}
-
-placement_decision_count_ge() {
-    local placement="$1" min="$2"
-    local count
-    count=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
-        -l "cluster.open-cluster-management.io/placement=$placement" \
-        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null | wc -w | tr -d ' ')
-    [[ "$count" -ge "$min" ]]
 }
 
 get_current_mode() {
@@ -635,18 +635,17 @@ verify_all_rs_resources_exist() {
     local mode="$1"
     local errors=0
 
-    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-
-    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
-    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
-
     if [[ "$mode" == "mco" ]]; then
+        assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+        assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     fi
+
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     if [[ "$mode" == "mcoa" ]]; then
         log_substep "Checking ManifestWork PrometheusRules"
@@ -666,23 +665,9 @@ verify_all_rs_resources_deleted() {
     local mode="$1"
     local errors=0
 
-    # In MCOA mode, Placements may persist (addon framework InstallStrategy recreates
-    # them from CMA spec). Only assert Placement absence for MCO mode and uninstall.
     if [[ "$mode" == "mco" || "$mode" == "uninstall" ]]; then
         assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    else
-        # MCOA feature-disable: Placements may persist, just log
-        if resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE"; then
-            log_warn "  placement/rs-placement persists (addon framework InstallStrategy — expected)"
-        else
-            log_success "  placement/rs-placement absent"
-        fi
-        if resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE"; then
-            log_warn "  placement/rs-virt-placement persists (addon framework InstallStrategy — expected)"
-        else
-            log_success "  placement/rs-virt-placement absent"
-        fi
     fi
 
     assert_not_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
@@ -1062,8 +1047,13 @@ phase_1() {
     log_substep "Ensuring both RS features enabled"
     patch_rs_features true true
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resources creation" \
-        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resources creation" \
+            resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    else
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resources creation" \
+            resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+    fi
 
     log_substep "Running rs-status"
     "$SCRIPT_DIR/rs-status" --hub-only 2>/dev/null || true
@@ -1091,26 +1081,29 @@ phase_2a() {
     log_substep "Disabling namespace RS only"
     patch_rs_features false true
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
-        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
+            not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    else
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
+            not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+    fi
 
     log_substep "Verifying namespace resources deleted"
-    assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_not_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
-
     if [[ "$CURRENT_MODE" == "mco" ]]; then
+        assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     fi
+    assert_not_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Verifying virt resources retained"
-    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
-
     if [[ "$CURRENT_MODE" == "mco" ]]; then
+        assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     fi
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Checking ADC state"
     verify_adc_state "disabled" "enabled" || ((errors++)) || true
@@ -1131,28 +1124,33 @@ phase_2b() {
     log_substep "Swapping features: namespace on, virtualization off"
     patch_rs_features true false
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "feature swap reconciliation" \
-        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
-        not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "feature swap reconciliation" \
+            resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
+            not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    else
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "feature swap reconciliation" \
+            resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
+            not_resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
+    fi
 
     log_substep "Verifying namespace resources restored"
-    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
-
     if [[ "$CURRENT_MODE" == "mco" ]]; then
+        assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     fi
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Verifying virt resources deleted"
-    assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
-
     if [[ "$CURRENT_MODE" == "mco" ]]; then
+        assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
         assert_not_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     fi
+    assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Checking ADC state"
     verify_adc_state "enabled" "disabled" || ((errors++)) || true
@@ -1173,8 +1171,13 @@ phase_2c() {
     log_substep "Disabling both RS features"
     patch_rs_features false false
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "full resource cleanup" \
-        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "full resource cleanup" \
+            not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    else
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "full resource cleanup" \
+            not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+    fi
 
     log_substep "Verifying all RS resources deleted"
     verify_all_rs_resources_deleted "$CURRENT_MODE" || ((errors++)) || true
@@ -1198,10 +1201,17 @@ phase_2d() {
     log_substep "Re-enabling both RS features"
     patch_rs_features true true
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resource restoration" \
-        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource restoration" \
-        resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resource restoration" \
+            resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource restoration" \
+            resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    else
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resource restoration" \
+            resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource restoration" \
+            resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
+    fi
 
     log_substep "Verifying all RS resources restored"
     verify_all_rs_resources_exist "$CURRENT_MODE" || ((errors++)) || true
@@ -1358,7 +1368,7 @@ phase_14() {
 
     log_substep "Verifying RS resource cleanup"
     wait_until "$TIMEOUT_RS_CLEANUP" 5 "RS resource cleanup" \
-        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+        not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
 
     verify_all_rs_resources_deleted "uninstall" || ((errors++)) || true
 
@@ -1424,8 +1434,6 @@ phase_5() {
     assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_not_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
 
-    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
     assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
@@ -1522,8 +1530,8 @@ phase_12() {
     log_substep "Verifying delegation occurs regardless of annotation value"
     assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     verify_adc_state "enabled" "enabled" || ((errors++)) || true
 
@@ -1570,8 +1578,13 @@ phase_6() {
 
     log_substep "Disabling virtualization RS to trigger ADC change"
     patch_rs_features true false
-    wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "virt RS disable" \
-        not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "virt RS disable" \
+            not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    else
+        wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "virt RS disable" \
+            not_resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
+    fi
 
     log_substep "Waiting for specHash to change"
     local new_hashes=""
@@ -1599,8 +1612,13 @@ phase_6() {
 
     log_substep "Re-enabling virtualization RS"
     patch_rs_features true true
-    wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "virt RS re-enable" \
-        resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    if [[ "$CURRENT_MODE" == "mco" ]]; then
+        wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "virt RS re-enable" \
+            resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    else
+        wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "virt RS re-enable" \
+            resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
+    fi
 
     log_substep "Waiting for specHash to restore"
     local restored_hashes=""
@@ -1692,22 +1710,20 @@ phase_8() {
         return 2
     fi
 
-    log_substep "Default placement — checking all clusters selected"
-    local default_pd
-    default_pd=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
-        -l cluster.open-cluster-management.io/placement=rs-placement \
-        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
-    local default_count
-    default_count=$(echo "$default_pd" | wc -w | tr -d ' ')
-    log_info "  Default: $default_count cluster(s) selected: $default_pd"
+    # MCOA uses in-memory predicate evaluation — no Placement CRs or PlacementDecisions.
+    # Validate filtering via ManifestWork content: which clusters have namespace RS PRs.
+    log_substep "Default placement — checking ManifestWork cluster count"
+    local default_ns_count
+    default_ns_count=$(mw_namespace_cluster_count)
+    log_info "  Default: $default_ns_count cluster(s) with namespace RS PrometheusRules"
 
-    # Label the spoke cluster so the Placement predicate can select it
+    # Label the spoke cluster so the in-memory predicate can select it
     log_substep "Labeling $spoke_name for placement filter"
     $KUBE_CLI label managedcluster "$spoke_name" rs-e2e-filter=selected --overwrite
 
     log_substep "Applying placement filter to select only $spoke_name"
-    # Update the placementConfiguration YAML key (not placementFilter — that key doesn't exist).
-    # yaml.v2 uses lowercased field names for OCM structs (no yaml tags).
+    # Update the placementConfiguration YAML key in rs-namespace-config.
+    # MCOA reads this during Build() and evaluates predicates in-memory.
     local placement_yaml
     placement_yaml=$(cat <<'PLACEMENTEOF'
 spec:
@@ -1728,46 +1744,46 @@ PLACEMENTEOF
         jq --arg pc "$placement_yaml" '.data.placementConfiguration = $pc' | \
         $KUBE_CLI apply -f -
 
-    wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "placement filter" \
-        placement_decision_count_le rs-placement 1 || true
+    # Wait for MCOA to auto-detect ConfigMap change and regenerate ManifestWorks
+    log_substep "Waiting for MCOA to auto-detect ConfigMap change"
+    local auto_detected=false
+    mw_filter_applied() { [[ "$(mw_namespace_cluster_count)" -le 1 ]]; }
+    if wait_until 60 5 "auto-propagation of placement filter" mw_filter_applied 2>/dev/null; then
+        auto_detected=true
+        log_success "MCOA auto-detected ConfigMap change"
+    else
+        log_warn "MCOA did not auto-detect ConfigMap change (same limitation as phase 10)"
+        log_substep "Restarting MCOA addon manager as fallback"
+        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+        wait_for_reconcile 30 "Waiting for filtered ManifestWork generation"
+    fi
 
     log_substep "Verifying namespace placement restricted"
-    local filtered_pd
-    filtered_pd=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
-        -l cluster.open-cluster-management.io/placement=rs-placement \
-        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
-    local filtered_count
-    filtered_count=$(echo "$filtered_pd" | wc -w | tr -d ' ')
+    local filtered_ns_count
+    filtered_ns_count=$(mw_namespace_cluster_count)
 
-    if [[ "$filtered_count" -le 1 ]]; then
-        if echo "$filtered_pd" | grep "$spoke_name" >/dev/null 2>&1; then
-            log_success "  Namespace placement filtered to $spoke_name"
-        elif [[ "$filtered_count" -eq 0 ]]; then
-            log_warn "  Namespace placement: 0 clusters (filter may not match any label)"
+    if [[ "$filtered_ns_count" -le 1 ]]; then
+        if [[ "$filtered_ns_count" -eq 0 ]]; then
+            log_warn "  Namespace filter: 0 clusters (filter may not match any label)"
         else
-            log_error "  Namespace placement: unexpected cluster: $filtered_pd"
-            ((errors++)) || true
+            log_success "  Namespace filter: $filtered_ns_count cluster(s) (was $default_ns_count)"
         fi
     else
-        log_error "  Namespace placement: expected 1 cluster, got $filtered_count: $filtered_pd"
+        log_error "  Namespace filter: expected <=1 cluster, got $filtered_ns_count (was $default_ns_count)"
         ((errors++)) || true
     fi
 
-    log_substep "Verifying virt placement unaffected"
-    local virt_pd
-    virt_pd=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
-        -l cluster.open-cluster-management.io/placement=rs-virt-placement \
-        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
-    local virt_count
-    virt_count=$(echo "$virt_pd" | wc -w | tr -d ' ')
-    if [[ "$virt_count" -ge "$default_count" ]]; then
-        log_success "  Virt placement unaffected: $virt_count cluster(s)"
+    log_substep "Verifying virt PrometheusRules unaffected"
+    count_mw_prometheusrules
+    if [[ $MW_PR_COUNT -gt 0 ]]; then
+        log_success "  Total RS PrometheusRules: $MW_PR_COUNT (virt unaffected)"
     else
-        log_warn "  Virt placement count changed: $virt_count (was $default_count)"
+        log_warn "  No RS PrometheusRules found"
     fi
 
     log_substep "Resetting placement filter"
-    # Restore default placement: empty predicates + tolerations (selects all clusters)
     local default_placement_yaml
     default_placement_yaml=$(cat <<'DEFAULTEOF'
 spec:
@@ -1787,20 +1803,24 @@ DEFAULTEOF
     # Remove the test label
     $KUBE_CLI label managedcluster "$spoke_name" rs-e2e-filter- --overwrite 2>/dev/null || true
 
-    wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "default placement restoration" \
-        placement_decision_count_ge rs-placement "$default_count" || true
+    # Wait for MCOA to auto-detect reset
+    log_substep "Waiting for MCOA to auto-detect placement reset"
+    mw_filter_restored() { [[ "$(mw_namespace_cluster_count)" -ge "$default_ns_count" ]]; }
+    if ! wait_until 60 5 "auto-propagation of placement reset" mw_filter_restored 2>/dev/null; then
+        log_warn "MCOA did not auto-detect ConfigMap reset — restarting as fallback"
+        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+        wait_for_reconcile 30 "Waiting for default ManifestWork generation"
+    fi
 
     log_substep "Verifying default placement restored"
-    local restored_pd
-    restored_pd=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
-        -l cluster.open-cluster-management.io/placement=rs-placement \
-        -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null || echo "")
-    local restored_count
-    restored_count=$(echo "$restored_pd" | wc -w | tr -d ' ')
-    if [[ "$restored_count" -ge "$default_count" ]]; then
-        log_success "  Default placement restored: $restored_count cluster(s)"
+    local restored_ns_count
+    restored_ns_count=$(mw_namespace_cluster_count)
+    if [[ "$restored_ns_count" -ge "$default_ns_count" ]]; then
+        log_success "  Default placement restored: $restored_ns_count cluster(s)"
     else
-        log_warn "  Placement not fully restored: $restored_count (was $default_count)"
+        log_warn "  Placement not fully restored: $restored_ns_count (was $default_ns_count)"
     fi
 
     CURRENT_MODE="mcoa"
@@ -1825,15 +1845,13 @@ phase_9a() {
     log_substep "Disabling namespace RS only (MCOA mode)"
     patch_rs_features false true
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace placement cleanup" \
-        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
+        not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
 
     log_substep "Verifying namespace resources deleted"
-    assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_not_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Verifying virt resources retained"
-    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Checking ADC state"
@@ -1859,17 +1877,15 @@ phase_9b() {
     log_substep "Swapping features: namespace on, virtualization off (MCOA mode)"
     patch_rs_features true false
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace placement restoration" \
-        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt placement cleanup" \
-        not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource restoration" \
+        resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
+        not_resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
 
     log_substep "Verifying namespace resources restored"
-    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Verifying virt resources deleted"
-    assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Checking ADC state"
@@ -1895,10 +1911,10 @@ phase_9c() {
     log_substep "Disabling both RS features (MCOA mode)"
     patch_rs_features false false
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace placement cleanup" \
-        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt placement cleanup" \
-        not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
+        not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
+        not_resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
 
     log_substep "Verifying all RS resources deleted"
     verify_all_rs_resources_deleted "mcoa" || ((errors++)) || true
@@ -1926,10 +1942,6 @@ phase_9d() {
     log_substep "Re-enabling both RS features (MCOA mode)"
     patch_rs_features true true
 
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA placement restoration" \
-        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA virt placement restoration" \
-        resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA configmap restoration" \
         resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA virt configmap restoration" \
@@ -2007,15 +2019,13 @@ phase_10() {
         jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")' | \
         $KUBE_CLI apply -f -
 
-    # ConfigMap changes alone don't trigger ManifestWork regeneration — Build() reads
-    # ConfigMap data at generation time, which requires an addon framework trigger.
-    # Restart MCOA to force re-evaluation of all ManifestWorks.
-    log_substep "Restarting MCOA addon manager to trigger ManifestWork regeneration"
-    $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
-    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
-
-    wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "ManifestWork update" \
+    # MCOA should detect ConfigMap data change and automatically trigger ManifestWork
+    # regeneration via addonManager.Trigger(). Known gap: MCOA's Watcher controller
+    # only tracks ConfigMaps referenced in ManifestWork manifests (via original-resource
+    # annotation), but RS ConfigMaps are hub-side resources read during Build() —
+    # not deployed to spokes. Until MCOA's ResourceCreator calls addonManager.Trigger()
+    # on RS ConfigMap changes, this propagation won't happen automatically.
+    wait_until 120 5 "ManifestWork update" \
         manifestwork_contains "120" || true
 
     log_substep "Checking ManifestWork contains updated percentage"
@@ -2044,7 +2054,7 @@ phase_10() {
     CURRENT_MODE="mcoa"
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="ConfigMap change not propagated to ManifestWork"
+        PHASE_FAIL_REASON="ConfigMap change not propagated to ManifestWork (MCOA bug: ResourceCreator does not call addonManager.Trigger on RS ConfigMap changes)"
         return 1
     fi
     return 0
@@ -2068,14 +2078,14 @@ phase_15() {
     log_substep "Enabling both RS features"
     patch_rs_features true true
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resource creation" \
-        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+        resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
 
     log_substep "Deleting MCO (MCOA mode)"
     echo "y" | "$SCRIPT_DIR/setup-observability" uninstall
 
     log_substep "Verifying RS cleanup"
     wait_until "$TIMEOUT_RS_CLEANUP" 5 "RS resource cleanup" \
-        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+        not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
     verify_all_rs_resources_deleted "uninstall" || log_warn "  Some resources remain"
 
     log_substep "Reinstalling MCO"
@@ -2144,7 +2154,7 @@ phase_16() {
 
     log_substep "Verifying MCOA mode active"
     assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Checking specHash populated"
     verify_spec_hashes_populated || ((errors++)) || true

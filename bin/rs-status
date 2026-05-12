@@ -126,18 +126,8 @@ show_status() {
         # MCOA mode
         echo -e "${BOLD}  MCOA Resources:${NC}"
 
-        # Placements
-        for p in rs-placement rs-virt-placement; do
-            if resource_exists placement "$p" "$GLOBAL_SET_NAMESPACE"; then
-                local decision_count
-                decision_count=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
-                    -l "cluster.open-cluster-management.io/placement=$p" \
-                    -o json 2>/dev/null | jq '[.items[]?.status.decisions[]?] | length' 2>/dev/null || echo 0)
-                echo -e "    ${GREEN}$p: exists ($decision_count clusters)${NC}"
-            else
-                echo -e "    ${RED}$p: not found${NC}"
-            fi
-        done
+        # MCOA uses in-memory predicate evaluation (no Placement CRs)
+        echo -e "    ${GREEN}Cluster selection: in-memory predicate evaluation${NC}"
 
         # MCA specHash (required for MCOA addon framework to create ManifestWorks)
         echo ""

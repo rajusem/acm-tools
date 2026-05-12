@@ -35,6 +35,7 @@ usage() {
     echo "  --skip-minio            Don't install Minio (use existing object storage)"
     echo "  --enable-rightsizing    Enable right-sizing after setup"
     echo "  --mcoa-mode             Also set MCOA right-sizing annotation"
+    echo "  --force-cleanup-mw      Remove finalizers from stuck MCOA ManifestWorks (local-cluster)"
     echo "  --wait-timeout N        Wait timeout in seconds (default: 300)"
     echo ""
     echo "Note: Minio uses dev-only credentials (minio/minio123). Do not use on shared clusters."
@@ -158,10 +159,78 @@ EOF
     fi
 }
 
+# detect_stuck_manifestworks outputs "cluster/mw-name|deletionTimestamp|age_seconds"
+# lines for MCOA ManifestWorks stuck in Deleting beyond TIMEOUT_MW_STUCK.
+# Scoped to local-cluster only (self-referential deadlock is local-cluster-specific).
+detect_stuck_manifestworks() {
+    local threshold="${TIMEOUT_MW_STUCK}"
+    local now
+    now=$(date +%s)
+    local results=()
+
+    local mw_list
+    mw_list=$($KUBE_CLI get manifestwork -n local-cluster \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' \
+        2>/dev/null || echo "")
+
+    while IFS=$'\t' read -r name deletion_ts; do
+        [[ -z "$name" || -z "$deletion_ts" ]] && continue
+        [[ "$name" != *"$MCOA_MW_PATTERN"* ]] && continue
+
+        local del_epoch
+        del_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$deletion_ts" +%s 2>/dev/null \
+            || date -d "$deletion_ts" +%s 2>/dev/null || echo "0")
+        local age=$(( now - del_epoch ))
+
+        if [[ $age -ge $threshold ]]; then
+            results+=("local-cluster/$name|$deletion_ts|$age")
+        fi
+    done <<< "$mw_list"
+
+    if [[ ${#results[@]} -gt 0 ]]; then
+        printf '%s\n' "${results[@]}"
+    fi
+}
+
+# cleanup_stuck_manifestworks removes finalizers from stuck MCOA ManifestWorks,
+# then restarts MCOA to trigger re-creation. Idempotent — no-op if none found.
+cleanup_stuck_manifestworks() {
+    local stuck
+    stuck=$(detect_stuck_manifestworks)
+    [[ -z "$stuck" ]] && { log_info "No stuck ManifestWorks found"; return 0; }
+
+    log_substep "Cleaning up stuck ManifestWorks"
+    while IFS='|' read -r entry deletion_ts age; do
+        local cluster="${entry%%/*}"
+        local mw_name="${entry##*/}"
+        log_warn "  Removing finalizers from $mw_name in $cluster (stuck ${age}s)"
+        $KUBE_CLI patch manifestwork "$mw_name" -n "$cluster" \
+            --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+    done <<< "$stuck"
+
+    sleep 5
+
+    local remaining
+    remaining=$(detect_stuck_manifestworks)
+    if [[ -n "$remaining" ]]; then
+        log_warn "Some ManifestWorks still stuck after cleanup"
+    else
+        log_success "Stuck ManifestWorks cleaned up"
+    fi
+
+    if $KUBE_CLI get deployment "$MCOA_DEPLOY" -n "$ACM_NAMESPACE" &>/dev/null; then
+        log_substep "Restarting MCOA addon manager to trigger reconciliation"
+        $KUBE_CLI rollout restart deployment/"$MCOA_DEPLOY" -n "$ACM_NAMESPACE"
+        $KUBE_CLI rollout status deployment/"$MCOA_DEPLOY" -n "$ACM_NAMESPACE" \
+            --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+    fi
+}
+
 do_install() {
     local skip_minio=false
     local enable_rs=false
     local mcoa_mode=false
+    local force_cleanup=false
     local wait_timeout=$TIMEOUT_MCO_READY
 
     while [[ $# -gt 0 ]]; do
@@ -169,6 +238,7 @@ do_install() {
             --skip-minio)         skip_minio=true; shift ;;
             --enable-rightsizing)  enable_rs=true; shift ;;
             --mcoa-mode)          mcoa_mode=true; enable_rs=true; shift ;;
+            --force-cleanup-mw)   force_cleanup=true; shift ;;
             --wait-timeout)       wait_timeout="$2"; shift 2 ;;
             *) log_error "Unknown option: $1"; usage; exit 1 ;;
         esac
@@ -220,6 +290,25 @@ EOF
     # 4. Thanos object storage secret
     log_substep "Creating Thanos object storage secret"
     $KUBE_CLI apply -f "$MANIFESTS_DIR/thanos-object-storage-secret.yaml"
+
+    # 4.5 Check for stuck ManifestWorks
+    local stuck_mws
+    stuck_mws=$(detect_stuck_manifestworks)
+    if [[ -n "$stuck_mws" ]]; then
+        if [[ "$force_cleanup" == "true" ]]; then
+            log_substep "Cleaning up stuck ManifestWorks (--force-cleanup-mw)"
+            cleanup_stuck_manifestworks
+        else
+            echo ""
+            log_warn "Stuck ManifestWork(s) detected — MCOA cannot reconcile until cleared:"
+            while IFS='|' read -r entry deletion_ts age; do
+                local cluster="${entry%%/*}"
+                local mw_name="${entry##*/}"
+                log_warn "  $mw_name in $cluster (${age}s)"
+            done <<< "$stuck_mws"
+            log_info "  Re-run with --force-cleanup-mw to remove finalizers"
+        fi
+    fi
 
     # 5. MCO CR
     log_substep "Creating MultiClusterObservability CR"
@@ -300,12 +389,16 @@ verify_rs_cleanup() {
     while [[ $elapsed -lt $max_wait ]]; do
         local remaining=()
 
-        # Placements in global-set (both modes)
-        for name in rs-placement rs-virt-placement; do
-            if $KUBE_CLI get placement "$name" -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
-                remaining+=("placement/$name ($GLOBAL_SET_NAMESPACE)")
-            fi
-        done
+        # Placements in global-set (MCO mode only)
+        if [[ "$mode" == "mco" ]]; then
+            for name in rs-placement rs-virt-placement; do
+                if $KUBE_CLI get placement "$name" -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+                    remaining+=("placement/$name ($GLOBAL_SET_NAMESPACE)")
+                fi
+            done
+        fi
+
+        # MCOA uses in-memory predicate evaluation (no Placement CRs to clean up)
 
         # Policies and PlacementBindings (MCO mode only)
         if [[ "$mode" == "mco" ]]; then
@@ -364,14 +457,33 @@ do_status() {
         log_warn "MCO CR: not found"
     fi
 
+    # Stuck ManifestWorks
+    local stuck_mws
+    stuck_mws=$(detect_stuck_manifestworks)
+    if [[ -n "$stuck_mws" ]]; then
+        echo ""
+        log_warn "Stuck ManifestWorks (blocking MCOA reconciliation):"
+        while IFS='|' read -r entry deletion_ts age; do
+            local cluster="${entry%%/*}"
+            local mw_name="${entry##*/}"
+            log_warn "  $mw_name in $cluster (since $deletion_ts, ${age}s ago)"
+        done <<< "$stuck_mws"
+        log_info "  Fix: bin/setup-observability install --force-cleanup-mw"
+    fi
+
     # Key pods
     echo ""
     log_info "Key Pods:"
-    for dep in observability-observatorium-api observability-thanos-query observability-thanos-compact observability-thanos-receive-default observability-thanos-rule; do
+    for dep in observability-rbac-query-proxy observability-grafana observability-observatorium-api observability-thanos-query observability-thanos-compact observability-thanos-receive-default observability-thanos-rule; do
         if resource_exists deployment "$dep" "$OBS_NAMESPACE"; then
-            local ready_replicas
+            local ready_replicas desired_replicas
             ready_replicas=$(get_resource_field deployment "$dep" "$OBS_NAMESPACE" '{.status.readyReplicas}')
-            log_success "  $dep: ${ready_replicas:-0} ready"
+            desired_replicas=$(get_resource_field deployment "$dep" "$OBS_NAMESPACE" '{.spec.replicas}')
+            if [[ "${ready_replicas:-0}" -ge "${desired_replicas:-1}" ]]; then
+                log_success "  $dep: ${ready_replicas:-0} ready"
+            else
+                log_warn "  $dep: ${ready_replicas:-0}/${desired_replicas:-?} ready"
+            fi
         fi
     done
 
@@ -407,11 +519,6 @@ do_status() {
     done
 
     echo ""
-    if resource_exists mco "$MCO_NAME"; then
-        "$SCRIPT_DIR/rs-mode-switch" status 2>/dev/null || true
-    else
-        log_info "Right-sizing status skipped (MCO CR not found)"
-    fi
 }
 
 # --- Main ---

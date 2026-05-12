@@ -284,14 +284,14 @@ wait_until() {
     local elapsed=0
     while [[ $elapsed -lt $max_wait ]]; do
         if "$@" 2>/dev/null; then
-            printf "\r%-60s\r" " " >&2
+            printf "\r%-80s\r" " " >&2
             return 0
         fi
         printf "\r  ${BLUE}%s (%ds/%ds)...${NC}  " "$desc" "$elapsed" "$max_wait" >&2
         sleep "$interval"
         elapsed=$((elapsed + interval))
     done
-    printf "\r%-60s\r" " " >&2
+    printf "\r%-80s\r" " " >&2
     return 1
 }
 
@@ -333,8 +333,8 @@ verify_perses_dashboards() {
 
     log_substep "Checking COO installation"
     if ! check_coo_installed; then
-        log_warn "  COO not installed — skipping Perses dashboard checks"
-        return 0
+        log_error "  COO not installed (expected in MCOA mode — use --skip-perses-check to skip)"
+        return 1
     fi
     log_success "  COO installed"
 
@@ -452,6 +452,10 @@ policy_contains() {
     $KUBE_CLI get policy "$name" -n "$namespace" -o json 2>/dev/null | grep "$pattern" >/dev/null 2>&1
 }
 
+mw_has_rs_prometheusrules() {
+    manifestwork_contains "acm-rs"
+}
+
 manifestwork_contains() {
     local pattern="$1"
     local mc_list
@@ -464,6 +468,32 @@ manifestwork_contains() {
         done
     done
     return 1
+}
+
+cleanup_stuck_mcoa_mw() {
+    local cleaned=false
+    local mw_list
+    mw_list=$($KUBE_CLI get manifestwork -n local-cluster \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' \
+        2>/dev/null || echo "")
+
+    while IFS=$'\t' read -r mw_name deletion_ts; do
+        [[ -z "$mw_name" || -z "$deletion_ts" ]] && continue
+        [[ "$mw_name" != *"$MCOA_MW_PATTERN"* ]] && continue
+        log_warn "  Removing finalizers from stuck ManifestWork: $mw_name (deleting since $deletion_ts)"
+        $KUBE_CLI patch manifestwork "$mw_name" -n local-cluster \
+            --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        cleaned=true
+    done <<< "$mw_list"
+
+    if [[ "$cleaned" == "true" ]]; then
+        sleep 5
+        if $KUBE_CLI get manifestwork -n local-cluster -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" >/dev/null 2>&1; then
+            log_warn "  Some MCOA ManifestWorks still present after cleanup"
+        else
+            log_success "  Stuck ManifestWork(s) cleaned up"
+        fi
+    fi
 }
 
 get_current_mode() {
@@ -506,11 +536,15 @@ ensure_mode() {
         $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
         wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "MCOA reconciliation" \
             adc_not_managed_by_mco || true
-        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" 2>/dev/null || true
-        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
-        wait_for_reconcile 30 "Waiting for ManifestWork generation"
+        log_substep "Waiting for MCOA to auto-detect ADC change"
+        if ! wait_until 60 5 "ManifestWork auto-generation" mw_has_rs_prometheusrules; then
+            log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
+            $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
+                -n "$OBS_NAMESPACE" 2>/dev/null || true
+            $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+                -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+            wait_for_reconcile 30 "Waiting for ManifestWork generation"
+        fi
     else
         $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
         wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "MCO reconciliation" \
@@ -542,13 +576,13 @@ ensure_mco_installed() {
             sleep 10
             elapsed=$((elapsed + 10))
         done
-        printf "\r%-60s\r" " " >&2
+        printf "\r%-80s\r" " " >&2
         log_error "MCO not Ready after ${TIMEOUT_MCO_READY}s"
         return 1
     fi
 
     log_substep "MCO not installed, running setup-observability install"
-    "$SCRIPT_DIR/setup-observability" install
+    "$SCRIPT_DIR/setup-observability" install --force-cleanup-mw
 }
 
 # =============================================================================
@@ -570,7 +604,10 @@ verify_adc_state() {
         -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "")
 
     if [[ -z "$adc_json" ]]; then
-        log_warn "  ADC not found"
+        if [[ "$CURRENT_MODE" == "mcoa" ]]; then
+            log_error "  ADC not found (expected in MCOA mode)"
+            return 1
+        fi
         return 0
     fi
 
@@ -601,7 +638,9 @@ verify_adc_state() {
 }
 
 count_mw_prometheusrules() {
+    local expect_zero="${1:-false}"
     MW_PR_COUNT=0
+    MW_PR_ERRORS=0
     local mc_list
     mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
 
@@ -613,7 +652,12 @@ count_mw_prometheusrules() {
             local deleting
             deleting=$(echo "$mw_json" | jq -r '.metadata.deletionTimestamp // empty' 2>/dev/null)
             if [[ -n "$deleting" ]]; then
-                log_warn "    $mc: ManifestWork terminating (deletionTimestamp=$deleting), skipping"
+                if [[ "$expect_zero" == "true" ]]; then
+                    log_info "    $mc: ManifestWork terminating (deletionTimestamp=$deleting)"
+                else
+                    log_error "    $mc: ManifestWork stuck terminating (deletionTimestamp=$deleting)"
+                    ((MW_PR_ERRORS++)) || true
+                fi
                 continue
             fi
             local c
@@ -625,10 +669,14 @@ count_mw_prometheusrules() {
         MW_PR_COUNT=$((MW_PR_COUNT + count))
         if [[ $count -gt 0 ]]; then
             log_success "    $mc: $count RS PrometheusRule(s)"
+        elif [[ "$expect_zero" == "true" ]]; then
+            log_success "    $mc: 0 RS PrometheusRules (clean)"
         else
-            log_warn "    $mc: 0 RS PrometheusRules"
+            log_error "    $mc: 0 RS PrometheusRules"
+            ((MW_PR_ERRORS++)) || true
         fi
     done
+    return $MW_PR_ERRORS
 }
 
 verify_all_rs_resources_exist() {
@@ -649,7 +697,7 @@ verify_all_rs_resources_exist() {
 
     if [[ "$mode" == "mcoa" ]]; then
         log_substep "Checking ManifestWork PrometheusRules"
-        count_mw_prometheusrules
+        count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
         if [[ $MW_PR_COUNT -eq 0 ]]; then
             log_error "  ManifestWorks: 0 RS PrometheusRules (expected > 0)"
             ((errors++)) || true
@@ -682,12 +730,10 @@ verify_all_rs_resources_deleted() {
 
     if [[ "$mode" == "mcoa" || "$mode" == "uninstall" ]]; then
         log_substep "Checking ManifestWork PrometheusRules"
-        count_mw_prometheusrules
+        count_mw_prometheusrules "true"
         if [[ $MW_PR_COUNT -gt 0 ]]; then
             log_error "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s) remain"
             ((errors++)) || true
-        else
-            log_success "  ManifestWorks: 0 RS PrometheusRules (clean)"
         fi
     fi
 
@@ -878,7 +924,9 @@ prephase_image_override() {
         }
         if ! wait_until 120 10 "Waiting for MCO image" \
             mco_pod_has_image "$expected_mco"; then
-            log_warn "MCO pod did not pick up $expected_mco within 120s"
+            log_error "MCO pod did not pick up $expected_mco within 120s"
+            PHASE_FAIL_REASON="MCO image override not applied"
+            return 1
         fi
     fi
 
@@ -923,7 +971,7 @@ phase_0() {
     log_substep "Checking MCO installation"
     if ! resource_exists mco "$MCO_NAME"; then
         log_warn "  MCO not installed — installing via setup-observability"
-        "$SCRIPT_DIR/setup-observability" install
+        "$SCRIPT_DIR/setup-observability" install --force-cleanup-mw
         if ! resource_exists mco "$MCO_NAME"; then
             PHASE_FAIL_REASON="Failed to install MCO"
             return 1
@@ -946,7 +994,7 @@ phase_0() {
             sleep 10
             elapsed=$((elapsed + 10))
         done
-        printf "\r%-60s\r" " " >&2
+        printf "\r%-80s\r" " " >&2
         if [[ "$ready" != "True" ]]; then
             PHASE_FAIL_REASON="MCO not Ready after ${TIMEOUT_MCO_READY}s"
             return 1
@@ -958,7 +1006,8 @@ phase_0() {
     local mc_count
     mc_count=$($KUBE_CLI get managedcluster --no-headers 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$mc_count" -eq 0 ]]; then
-        log_warn "  No managed clusters found — spoke tests will be limited"
+        PHASE_FAIL_REASON="No managed clusters found"
+        return 1
     else
         local mc_names
         mc_names=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
@@ -1006,7 +1055,9 @@ phase_0() {
     if [[ "$lc_available" == "True" ]]; then
         log_success "  local-cluster: Available"
     elif [[ -n "$lc_available" ]]; then
-        log_warn "  local-cluster: Available=$lc_available"
+        log_error "  local-cluster: Available=$lc_available"
+        PHASE_FAIL_REASON="local-cluster not available"
+        return 1
     fi
 
     log_substep "Checking RS auto-defaults"
@@ -1040,7 +1091,7 @@ phase_1() {
 
     if [[ -n "$FORCE_MODE" && "$FORCE_MODE" != "$CURRENT_MODE" ]]; then
         log_substep "Forcing $FORCE_MODE mode"
-        ensure_mode "$FORCE_MODE" || log_warn "Mode switch to $FORCE_MODE may not be complete"
+        ensure_mode "$FORCE_MODE" || { PHASE_FAIL_REASON="Failed to switch to $FORCE_MODE mode"; return 1; }
         CURRENT_MODE="$FORCE_MODE"
     fi
 
@@ -1075,8 +1126,8 @@ phase_1() {
 phase_2a() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     log_substep "Disabling namespace RS only"
     patch_rs_features false true
@@ -1105,8 +1156,10 @@ phase_2a() {
     fi
     assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
-    log_substep "Checking ADC state"
-    verify_adc_state "disabled" "enabled" || ((errors++)) || true
+    if [[ "$CURRENT_MODE" == "mcoa" ]]; then
+        log_substep "Checking ADC state"
+        verify_adc_state "disabled" "enabled" || ((errors++)) || true
+    fi
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1118,8 +1171,8 @@ phase_2a() {
 phase_2b() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     log_substep "Swapping features: namespace on, virtualization off"
     patch_rs_features true false
@@ -1152,8 +1205,10 @@ phase_2b() {
     fi
     assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
-    log_substep "Checking ADC state"
-    verify_adc_state "enabled" "disabled" || ((errors++)) || true
+    if [[ "$CURRENT_MODE" == "mcoa" ]]; then
+        log_substep "Checking ADC state"
+        verify_adc_state "enabled" "disabled" || ((errors++)) || true
+    fi
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1165,8 +1220,8 @@ phase_2b() {
 phase_2c() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     log_substep "Disabling both RS features"
     patch_rs_features false false
@@ -1182,8 +1237,10 @@ phase_2c() {
     log_substep "Verifying all RS resources deleted"
     verify_all_rs_resources_deleted "$CURRENT_MODE" || ((errors++)) || true
 
-    log_substep "Checking ADC state"
-    verify_adc_state "disabled" "disabled" || ((errors++)) || true
+    if [[ "$CURRENT_MODE" == "mcoa" ]]; then
+        log_substep "Checking ADC state"
+        verify_adc_state "disabled" "disabled" || ((errors++)) || true
+    fi
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1195,8 +1252,8 @@ phase_2c() {
 phase_2d() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     log_substep "Re-enabling both RS features"
     patch_rs_features true true
@@ -1216,8 +1273,10 @@ phase_2d() {
     log_substep "Verifying all RS resources restored"
     verify_all_rs_resources_exist "$CURRENT_MODE" || ((errors++)) || true
 
-    log_substep "Checking ADC state"
-    verify_adc_state "enabled" "enabled" || ((errors++)) || true
+    if [[ "$CURRENT_MODE" == "mcoa" ]]; then
+        log_substep "Checking ADC state"
+        verify_adc_state "enabled" "enabled" || ((errors++)) || true
+    fi
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1233,8 +1292,8 @@ phase_2d() {
 phase_3() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     if [[ "$CURRENT_MODE" == "mco" ]]; then
         log_substep "Checking PlacementDecisions"
@@ -1256,12 +1315,13 @@ phase_3() {
         if [[ "$compliance" == "Compliant" ]]; then
             log_success "  Policy rs-prom-rules-policy: Compliant"
         else
-            log_warn "  Policy rs-prom-rules-policy: ${compliance:-unknown} (may need KlusterletAddonConfig)"
+            log_error "  Policy rs-prom-rules-policy: ${compliance:-unknown}"
+            ((errors++)) || true
         fi
 
     else
         log_substep "Checking ManifestWork PrometheusRules (MCOA mode)"
-        count_mw_prometheusrules
+        count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
         if [[ $MW_PR_COUNT -gt 0 ]]; then
             log_success "  $MW_PR_COUNT total RS PrometheusRule(s) in ManifestWorks"
         else
@@ -1273,16 +1333,20 @@ phase_3() {
     log_substep "Checking spoke PrometheusRules directly"
     local spoke_checked=false
     for ctx_name in "$NAMESPACE_SPOKE_CONTEXT" "$VM_SPOKE_CONTEXT"; do
-        if $KUBE_CLI --context="$ctx_name" cluster-info &>/dev/null 2>&1; then
+        log_info "  Checking spoke $ctx_name..." >&2
+        if timeout 10 $KUBE_CLI --context="$ctx_name" cluster-info &>/dev/null 2>&1; then
             local pr_count
             pr_count=$($KUBE_CLI --context="$ctx_name" get prometheusrule -n openshift-monitoring \
                 --no-headers 2>/dev/null | grep -c -i "rs-\|acm-rs" || true)
             if [[ "$pr_count" -gt 0 ]]; then
                 log_success "  Spoke $ctx_name: $pr_count RS PrometheusRule(s)"
             else
-                log_warn "  Spoke $ctx_name: 0 RS PrometheusRules"
+                log_error "  Spoke $ctx_name: 0 RS PrometheusRules"
+                ((errors++)) || true
             fi
             spoke_checked=true
+        else
+            log_info "  Spoke $ctx_name: unreachable (skipped)"
         fi
     done
     if [[ "$spoke_checked" == "false" ]]; then
@@ -1308,8 +1372,8 @@ phase_13() {
 
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     log_substep "Deleting MCO via setup-observability uninstall"
     echo "y" | "$SCRIPT_DIR/setup-observability" uninstall
@@ -1343,8 +1407,8 @@ phase_14() {
     fi
 
     log_substep "Installing MCO"
-    "$SCRIPT_DIR/setup-observability" install
-    ensure_mco_installed || log_warn "MCO reinstall may not be fully ready"
+    "$SCRIPT_DIR/setup-observability" install --force-cleanup-mw
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO reinstall failed"; return 1; }
 
     log_substep "Enabling RS features"
     patch_rs_features true true
@@ -1355,13 +1419,17 @@ phase_14() {
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
     wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "MCOA mode delegation" \
         adc_not_managed_by_mco || true
-    $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
-    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
-    wait_for_reconcile 30 "Waiting for ManifestWork generation"
+    log_substep "Waiting for MCOA to auto-detect ADC change"
+    if ! wait_until 60 5 "ManifestWork auto-generation" mw_has_rs_prometheusrules; then
+        log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
+        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+        wait_for_reconcile 30 "Waiting for ManifestWork generation"
+    fi
 
     log_substep "Verifying MCOA resources before deletion"
-    verify_all_rs_resources_exist "mcoa" || log_warn "  Some MCOA resources missing before deletion"
+    verify_all_rs_resources_exist "mcoa" || ((errors++)) || true
 
     log_substep "Deleting MCO (MCOA mode)"
     echo "y" | "$SCRIPT_DIR/setup-observability" uninstall
@@ -1407,8 +1475,11 @@ phase_5() {
 
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
+
+    log_substep "Cleaning up stuck ManifestWorks (local-cluster)"
+    cleanup_stuck_mcoa_mw
 
     log_substep "Enabling both RS features"
     patch_rs_features true true
@@ -1422,11 +1493,14 @@ phase_5() {
     wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "mode switch reconciliation" \
         not_resource_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || true
 
-    log_substep "Restarting MCOA addon manager"
-    $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
-    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
-    wait_for_reconcile 30 "Waiting for ManifestWork generation"
+    log_substep "Waiting for MCOA to auto-detect ADC change"
+    if ! wait_until 60 5 "ManifestWork auto-generation" mw_has_rs_prometheusrules; then
+        log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
+        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+        wait_for_reconcile 30 "Waiting for ManifestWork generation"
+    fi
 
     log_substep "Verifying MCO -> MCOA transition"
     assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
@@ -1441,7 +1515,7 @@ phase_5() {
     verify_spec_hashes_populated || ((errors++)) || true
 
     log_substep "Checking ManifestWork PrometheusRules"
-    count_mw_prometheusrules
+    count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
     if [[ $MW_PR_COUNT -eq 0 ]]; then
         log_error "  ManifestWorks: 0 RS PrometheusRules"
         ((errors++)) || true
@@ -1465,8 +1539,8 @@ phase_5() {
 phase_11() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Removing MCO CR annotation"
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
@@ -1491,12 +1565,10 @@ phase_11() {
     assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
 
     log_substep "Checking ManifestWork PrometheusRules removed"
-    count_mw_prometheusrules
+    count_mw_prometheusrules "true"
     if [[ $MW_PR_COUNT -gt 0 ]]; then
         log_error "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s) remain"
         ((errors++)) || true
-    else
-        log_success "  ManifestWorks: 0 RS PrometheusRules (clean)"
     fi
 
     CURRENT_MODE="mco"
@@ -1517,8 +1589,8 @@ phase_11() {
 phase_12() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     log_substep "Setting annotation with non-standard value: v99"
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=v99" --overwrite
@@ -1563,8 +1635,8 @@ phase_12() {
 phase_6() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Recording initial specHash values"
     INITIAL_SPEC_HASHES=$(get_all_spec_hashes)
@@ -1639,7 +1711,8 @@ phase_6() {
     if $hash_restored; then
         log_success "  SpecHash restored to original value"
     else
-        log_warn "  SpecHash differs from original after ${hash_timeout}s (may be acceptable if ADC content changed)"
+        log_error "  SpecHash differs from original after ${hash_timeout}s"
+        ((errors++)) || true
     fi
 
     CURRENT_MODE="mcoa"
@@ -1658,12 +1731,13 @@ phase_6() {
 phase_7() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Verifying no Policies exist (MCOA mode baseline)"
     assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || {
-        log_warn "  Policy already exists — test precondition not met"
+        PHASE_FAIL_REASON="Policy already exists — test precondition not met"
+        return 1
     }
 
     log_substep "Modifying RS ConfigMap (adding testKey)"
@@ -1698,8 +1772,8 @@ phase_7() {
 phase_8() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     local spoke_name
     spoke_name=$($KUBE_CLI get managedcluster \
@@ -1748,7 +1822,7 @@ PLACEMENTEOF
     log_substep "Waiting for MCOA to auto-detect ConfigMap change"
     local auto_detected=false
     mw_filter_applied() { [[ "$(mw_namespace_cluster_count)" -le 1 ]]; }
-    if wait_until 60 5 "auto-propagation of placement filter" mw_filter_applied 2>/dev/null; then
+    if wait_until 60 5 "auto-propagation of placement filter" mw_filter_applied; then
         auto_detected=true
         log_success "MCOA auto-detected ConfigMap change"
     else
@@ -1766,7 +1840,8 @@ PLACEMENTEOF
 
     if [[ "$filtered_ns_count" -le 1 ]]; then
         if [[ "$filtered_ns_count" -eq 0 ]]; then
-            log_warn "  Namespace filter: 0 clusters (filter may not match any label)"
+            log_error "  Namespace filter: 0 clusters (filter did not match any label)"
+            ((errors++)) || true
         else
             log_success "  Namespace filter: $filtered_ns_count cluster(s) (was $default_ns_count)"
         fi
@@ -1776,11 +1851,12 @@ PLACEMENTEOF
     fi
 
     log_substep "Verifying virt PrometheusRules unaffected"
-    count_mw_prometheusrules
+    count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
     if [[ $MW_PR_COUNT -gt 0 ]]; then
         log_success "  Total RS PrometheusRules: $MW_PR_COUNT (virt unaffected)"
     else
-        log_warn "  No RS PrometheusRules found"
+        log_error "  No RS PrometheusRules found"
+        ((errors++)) || true
     fi
 
     log_substep "Resetting placement filter"
@@ -1806,7 +1882,7 @@ DEFAULTEOF
     # Wait for MCOA to auto-detect reset
     log_substep "Waiting for MCOA to auto-detect placement reset"
     mw_filter_restored() { [[ "$(mw_namespace_cluster_count)" -ge "$default_ns_count" ]]; }
-    if ! wait_until 60 5 "auto-propagation of placement reset" mw_filter_restored 2>/dev/null; then
+    if ! wait_until 60 5 "auto-propagation of placement reset" mw_filter_restored; then
         log_warn "MCOA did not auto-detect ConfigMap reset — restarting as fallback"
         $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
         $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
@@ -1820,7 +1896,8 @@ DEFAULTEOF
     if [[ "$restored_ns_count" -ge "$default_ns_count" ]]; then
         log_success "  Default placement restored: $restored_ns_count cluster(s)"
     else
-        log_warn "  Placement not fully restored: $restored_ns_count (was $default_ns_count)"
+        log_error "  Placement not fully restored: $restored_ns_count (was $default_ns_count)"
+        ((errors++)) || true
     fi
 
     CURRENT_MODE="mcoa"
@@ -1839,8 +1916,8 @@ DEFAULTEOF
 phase_9a() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Disabling namespace RS only (MCOA mode)"
     patch_rs_features false true
@@ -1871,8 +1948,8 @@ phase_9a() {
 phase_9b() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Swapping features: namespace on, virtualization off (MCOA mode)"
     patch_rs_features true false
@@ -1905,8 +1982,8 @@ phase_9b() {
 phase_9c() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Disabling both RS features (MCOA mode)"
     patch_rs_features false false
@@ -1936,8 +2013,8 @@ phase_9c() {
 phase_9d() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Re-enabling both RS features (MCOA mode)"
     patch_rs_features true true
@@ -1971,31 +2048,33 @@ phase_9d() {
 phase_4() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
-    # ConfigMap data keys are YAML strings (not JSON): prometheusRuleConfig, placementConfiguration
+    # MCO stores prometheusRuleConfig as YAML; MCOA stores it as JSON.
+    # Handle both: try JSON parse first, fall back to YAML gsub.
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")' | \
+        jq '.data.prometheusRuleConfig |= (. as $v | try ($v | fromjson | .recommendationPercentage = 120 | tojson) catch ($v | gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")))' | \
         $KUBE_CLI apply -f -
 
+    # MCO renders the percentage in PrometheusRule expr as "(120/100)".
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "Policy update" \
-        policy_contains rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" "120" || true
+        policy_contains rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" "120/100" || true
 
-    log_substep "Checking Policy contains updated percentage"
+    log_substep "Checking PrometheusRule in Policy contains updated percentage"
     local policy_json
     policy_json=$($KUBE_CLI get policy rs-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" -o json 2>/dev/null || echo "{}")
-    if echo "$policy_json" | grep "120" >/dev/null 2>&1; then
-        log_success "  Policy updated with percentage 120"
+    if echo "$policy_json" | jq -e '.. | objects | select(.kind=="PrometheusRule") | .spec.groups[]?.rules[]?.expr | select(test("120/100"))' >/dev/null 2>&1; then
+        log_success "  Policy PrometheusRule expr contains (120/100)"
     else
-        log_error "  Policy does not contain percentage 120"
+        log_error "  Policy PrometheusRule does not contain (120/100) in expr"
         ((errors++)) || true
     fi
 
     log_substep "Reverting: recommendationPercentage 120 -> 110"
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 120"; "recommendationPercentage: 110")' | \
+        jq '.data.prometheusRuleConfig |= (. as $v | try ($v | fromjson | .recommendationPercentage = 110 | tojson) catch ($v | gsub("recommendationPercentage: 120"; "recommendationPercentage: 110")))' | \
         $KUBE_CLI apply -f -
 
     CURRENT_MODE="mco"
@@ -2010,51 +2089,49 @@ phase_4() {
 phase_10() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
-    # ConfigMap data keys are YAML strings (not JSON): prometheusRuleConfig, placementConfiguration
+    # MCO stores prometheusRuleConfig as YAML; MCOA stores it as JSON.
+    # Handle both: try JSON parse first, fall back to YAML gsub.
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")' | \
+        jq '.data.prometheusRuleConfig |= (. as $v | try ($v | fromjson | .recommendationPercentage = 120 | tojson) catch ($v | gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")))' | \
         $KUBE_CLI apply -f -
 
-    # MCOA should detect ConfigMap data change and automatically trigger ManifestWork
-    # regeneration via addonManager.Trigger(). Known gap: MCOA's Watcher controller
-    # only tracks ConfigMaps referenced in ManifestWork manifests (via original-resource
-    # annotation), but RS ConfigMaps are hub-side resources read during Build() —
-    # not deployed to spokes. Until MCOA's ResourceCreator calls addonManager.Trigger()
-    # on RS ConfigMap changes, this propagation won't happen automatically.
+    # MCOA Watcher watches RS ConfigMaps and calls addonManager.Trigger() for all clusters.
+    # The percentage appears in PrometheusRule expr as "(120/100)".
     wait_until 120 5 "ManifestWork update" \
-        manifestwork_contains "120" || true
+        manifestwork_contains "120/100" || true
 
-    log_substep "Checking ManifestWork contains updated percentage"
+    log_substep "Checking PrometheusRule in ManifestWork contains updated percentage"
     local found_120=false
     local mc_list
     mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     for mc in $mc_list; do
         for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
-            if $KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null | grep "120" >/dev/null 2>&1; then
+            if $KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null | \
+                jq -e '[.spec.workload.manifests[]? | select(.kind=="PrometheusRule") | .spec.groups[]?.rules[]?.expr | select(test("120/100"))] | length > 0' >/dev/null 2>&1; then
                 found_120=true
-                log_success "  ManifestWork in $mc updated with percentage 120"
+                log_success "  $mc: PrometheusRule expr contains (120/100)"
                 break 2
             fi
         done
     done
     if [[ "$found_120" == "false" ]]; then
-        log_error "  No ManifestWork contains percentage 120"
+        log_error "  No PrometheusRule in ManifestWorks contains (120/100)"
         ((errors++)) || true
     fi
 
     log_substep "Reverting: recommendationPercentage 120 -> 110"
     $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.prometheusRuleConfig |= gsub("recommendationPercentage: 120"; "recommendationPercentage: 110")' | \
+        jq '.data.prometheusRuleConfig |= (. as $v | try ($v | fromjson | .recommendationPercentage = 110 | tojson) catch ($v | gsub("recommendationPercentage: 120"; "recommendationPercentage: 110")))' | \
         $KUBE_CLI apply -f -
 
     CURRENT_MODE="mcoa"
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="ConfigMap change not propagated to ManifestWork (MCOA bug: ResourceCreator does not call addonManager.Trigger on RS ConfigMap changes)"
+        PHASE_FAIL_REASON="ConfigMap change not propagated to ManifestWork"
         return 1
     fi
     return 0
@@ -2072,8 +2149,8 @@ phase_15() {
 
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mcoa || log_warn "Mode switch to MCOA may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
     log_substep "Enabling both RS features"
     patch_rs_features true true
@@ -2086,11 +2163,11 @@ phase_15() {
     log_substep "Verifying RS cleanup"
     wait_until "$TIMEOUT_RS_CLEANUP" 5 "RS resource cleanup" \
         not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
-    verify_all_rs_resources_deleted "uninstall" || log_warn "  Some resources remain"
+    verify_all_rs_resources_deleted "uninstall" || ((errors++)) || true
 
     log_substep "Reinstalling MCO"
-    "$SCRIPT_DIR/setup-observability" install
-    ensure_mco_installed || log_warn "MCO reinstall may not be fully ready"
+    "$SCRIPT_DIR/setup-observability" install --force-cleanup-mw
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO reinstall failed"; return 1; }
 
     CURRENT_MODE=$(get_current_mode)
     log_info "  Post-reinstall mode: $CURRENT_MODE"
@@ -2111,7 +2188,8 @@ phase_15() {
     if [[ "$ns_enabled" == "true" ]]; then
         log_success "  RS features auto-enabled"
     else
-        log_warn "  RS features not auto-enabled, enabling manually"
+        log_error "  RS features not auto-enabled after reinstall"
+        ((errors++)) || true
         patch_rs_features true true
         wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS resource creation" \
             resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
@@ -2139,18 +2217,22 @@ phase_15() {
 phase_16() {
     local errors=0
 
-    ensure_mco_installed || log_warn "MCO install may not be fully ready"
-    ensure_mode mco || log_warn "Mode switch to MCO may not be complete"
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     log_substep "Switching to MCOA mode"
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
     CURRENT_MODE="mcoa"
     wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "MCOA mode" \
         adc_not_managed_by_mco || true
-    $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
-    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
-    wait_for_reconcile 30 "Waiting for ManifestWork generation"
+    log_substep "Waiting for MCOA to auto-detect ADC change"
+    if ! wait_until 60 5 "ManifestWork auto-generation" mw_has_rs_prometheusrules; then
+        log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
+        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+        wait_for_reconcile 30 "Waiting for ManifestWork generation"
+    fi
 
     log_substep "Verifying MCOA mode active"
     assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
@@ -2160,7 +2242,7 @@ phase_16() {
     verify_spec_hashes_populated || ((errors++)) || true
 
     log_substep "Checking ManifestWork PrometheusRules"
-    count_mw_prometheusrules
+    count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
     if [[ $MW_PR_COUNT -eq 0 ]]; then
         log_error "  ManifestWorks: 0 RS PrometheusRules"
         ((errors++)) || true

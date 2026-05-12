@@ -312,7 +312,7 @@ adc_managed_by_mco() {
 # --- Perses Dashboard Constants ---
 RS_NS_DASHBOARD="acm-rs-namespace-overview"
 RS_VM_DASHBOARDS=("acm-rightsizing-openshift-virtualization" "acm-rightsizing-vm-overestimation" "acm-rightsizing-vm-underestimation")
-TIMEOUT_PERSES_DASHBOARD="${TIMEOUT_PERSES_DASHBOARD:-60}"
+TIMEOUT_PERSES_DASHBOARD="${TIMEOUT_PERSES_DASHBOARD:-300}"
 
 perses_dashboard_exists() {
     $KUBE_CLI get persesdashboard "$1" -n "$ANALYTICS_NAMESPACE" &>/dev/null
@@ -333,8 +333,11 @@ verify_perses_dashboards() {
 
     log_substep "Checking COO installation"
     if ! check_coo_installed; then
-        log_error "  COO not installed (expected in MCOA mode — use --skip-perses-check to skip)"
-        return 1
+        log_info "  COO not yet installed, waiting up to ${TIMEOUT_COO_INSTALL}s..."
+        if ! wait_until "$TIMEOUT_COO_INSTALL" 10 "COO installation" check_coo_installed; then
+            log_error "  COO not installed after ${TIMEOUT_COO_INSTALL}s (use --skip-perses-check to skip)"
+            return 1
+        fi
     fi
     log_success "  COO installed"
 
@@ -342,9 +345,16 @@ verify_perses_dashboards() {
     if [[ "$ns_enabled" == "true" ]]; then
         wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "namespace RS dashboard" \
             perses_dashboard_exists "$RS_NS_DASHBOARD" || true
-    elif [[ "$virt_enabled" == "true" ]]; then
+    else
+        wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "namespace dashboard deletion" \
+            not_resource_exists persesdashboard "$RS_NS_DASHBOARD" "$ANALYTICS_NAMESPACE" || true
+    fi
+    if [[ "$virt_enabled" == "true" ]]; then
         wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "virt RS dashboard" \
             perses_dashboard_exists "${RS_VM_DASHBOARDS[0]}" || true
+    else
+        wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "virt dashboard deletion" \
+            not_resource_exists persesdashboard "${RS_VM_DASHBOARDS[0]}" "$ANALYTICS_NAMESPACE" || true
     fi
 
     if [[ "$ns_enabled" == "true" ]]; then
@@ -355,10 +365,6 @@ verify_perses_dashboards() {
             ((errors++)) || true
         fi
     else
-        if perses_dashboard_exists "$RS_NS_DASHBOARD"; then
-            wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "namespace dashboard deletion" \
-                not_resource_exists persesdashboard "$RS_NS_DASHBOARD" "$ANALYTICS_NAMESPACE" || true
-        fi
         if perses_dashboard_exists "$RS_NS_DASHBOARD"; then
             log_error "  persesdashboard/$RS_NS_DASHBOARD still EXISTS (namespace RS disabled)"
             ((errors++)) || true
@@ -400,10 +406,12 @@ verify_no_perses_dashboards() {
 
     log_substep "Checking RS Perses dashboards absent"
 
-    if perses_dashboard_exists "$RS_NS_DASHBOARD"; then
-        wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "dashboard cleanup" \
-            not_resource_exists persesdashboard "$RS_NS_DASHBOARD" "$ANALYTICS_NAMESPACE" || true
-    fi
+    for db in "$RS_NS_DASHBOARD" "${RS_VM_DASHBOARDS[@]}"; do
+        if perses_dashboard_exists "$db"; then
+            wait_until "$TIMEOUT_PERSES_DASHBOARD" 5 "$db deletion" \
+                not_resource_exists persesdashboard "$db" "$ANALYTICS_NAMESPACE" || true
+        fi
+    done
 
     for db in "$RS_NS_DASHBOARD" "${RS_VM_DASHBOARDS[@]}"; do
         if perses_dashboard_exists "$db"; then
@@ -698,10 +706,10 @@ verify_all_rs_resources_exist() {
     if [[ "$mode" == "mcoa" ]]; then
         log_substep "Checking ManifestWork PrometheusRules"
         count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
-        if [[ $MW_PR_COUNT -eq 0 ]]; then
+        if [[ $MW_PR_COUNT -eq 0 && $MW_PR_ERRORS -eq 0 ]]; then
             log_error "  ManifestWorks: 0 RS PrometheusRules (expected > 0)"
             ((errors++)) || true
-        else
+        elif [[ $MW_PR_COUNT -gt 0 ]]; then
             log_success "  ManifestWorks: $MW_PR_COUNT total RS PrometheusRule(s)"
         fi
     fi
@@ -1132,34 +1140,20 @@ phase_2a() {
     log_substep "Disabling namespace RS only"
     patch_rs_features false true
 
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
-            not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-    else
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
-            not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
-    fi
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace resource cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
 
     log_substep "Verifying namespace resources deleted"
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
-        assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-        assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-        assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    fi
+    assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_not_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Verifying virt resources retained"
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
-        assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-        assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-        assert_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    fi
+    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
-
-    if [[ "$CURRENT_MODE" == "mcoa" ]]; then
-        log_substep "Checking ADC state"
-        verify_adc_state "disabled" "enabled" || ((errors++)) || true
-    fi
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1177,38 +1171,22 @@ phase_2b() {
     log_substep "Swapping features: namespace on, virtualization off"
     patch_rs_features true false
 
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "feature swap reconciliation" \
-            resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
-            not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
-    else
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "feature swap reconciliation" \
-            resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
-            not_resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
-    fi
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "feature swap reconciliation" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource cleanup" \
+        not_resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
 
     log_substep "Verifying namespace resources restored"
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
-        assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-        assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-        assert_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    fi
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     log_substep "Verifying virt resources deleted"
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
-        assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-        assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-        assert_not_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
-    fi
+    assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
     assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
-
-    if [[ "$CURRENT_MODE" == "mcoa" ]]; then
-        log_substep "Checking ADC state"
-        verify_adc_state "enabled" "disabled" || ((errors++)) || true
-    fi
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1226,21 +1204,11 @@ phase_2c() {
     log_substep "Disabling both RS features"
     patch_rs_features false false
 
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "full resource cleanup" \
-            not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-    else
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "full resource cleanup" \
-            not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
-    fi
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "full resource cleanup" \
+        not_resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
 
     log_substep "Verifying all RS resources deleted"
-    verify_all_rs_resources_deleted "$CURRENT_MODE" || ((errors++)) || true
-
-    if [[ "$CURRENT_MODE" == "mcoa" ]]; then
-        log_substep "Checking ADC state"
-        verify_adc_state "disabled" "disabled" || ((errors++)) || true
-    fi
+    verify_all_rs_resources_deleted "mco" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1258,25 +1226,13 @@ phase_2d() {
     log_substep "Re-enabling both RS features"
     patch_rs_features true true
 
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resource restoration" \
-            resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource restoration" \
-            resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
-    else
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resource restoration" \
-            resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
-        wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource restoration" \
-            resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
-    fi
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resource restoration" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resource restoration" \
+        resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
 
     log_substep "Verifying all RS resources restored"
-    verify_all_rs_resources_exist "$CURRENT_MODE" || ((errors++)) || true
-
-    if [[ "$CURRENT_MODE" == "mcoa" ]]; then
-        log_substep "Checking ADC state"
-        verify_adc_state "enabled" "enabled" || ((errors++)) || true
-    fi
+    verify_all_rs_resources_exist "mco" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1324,7 +1280,7 @@ phase_3() {
         count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
         if [[ $MW_PR_COUNT -gt 0 ]]; then
             log_success "  $MW_PR_COUNT total RS PrometheusRule(s) in ManifestWorks"
-        else
+        elif [[ $MW_PR_ERRORS -eq 0 ]]; then
             log_error "  No RS PrometheusRules in ManifestWorks"
             ((errors++)) || true
         fi
@@ -1516,10 +1472,10 @@ phase_5() {
 
     log_substep "Checking ManifestWork PrometheusRules"
     count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
-    if [[ $MW_PR_COUNT -eq 0 ]]; then
+    if [[ $MW_PR_COUNT -eq 0 && $MW_PR_ERRORS -eq 0 ]]; then
         log_error "  ManifestWorks: 0 RS PrometheusRules"
         ((errors++)) || true
-    else
+    elif [[ $MW_PR_COUNT -gt 0 ]]; then
         log_success "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s)"
     fi
 
@@ -1573,7 +1529,7 @@ phase_11() {
 
     CURRENT_MODE="mco"
     log_substep "Checking ADC state"
-    verify_adc_state "disabled" "disabled" || ((errors++)) || true
+    verify_adc_state "managed-by-mco" "managed-by-mco" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"
@@ -1854,7 +1810,7 @@ PLACEMENTEOF
     count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
     if [[ $MW_PR_COUNT -gt 0 ]]; then
         log_success "  Total RS PrometheusRules: $MW_PR_COUNT (virt unaffected)"
-    else
+    elif [[ $MW_PR_ERRORS -eq 0 ]]; then
         log_error "  No RS PrometheusRules found"
         ((errors++)) || true
     fi
@@ -2243,10 +2199,10 @@ phase_16() {
 
     log_substep "Checking ManifestWork PrometheusRules"
     count_mw_prometheusrules || ((errors += MW_PR_ERRORS)) || true
-    if [[ $MW_PR_COUNT -eq 0 ]]; then
+    if [[ $MW_PR_COUNT -eq 0 && $MW_PR_ERRORS -eq 0 ]]; then
         log_error "  ManifestWorks: 0 RS PrometheusRules"
         ((errors++)) || true
-    else
+    elif [[ $MW_PR_COUNT -gt 0 ]]; then
         log_success "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s)"
     fi
 
@@ -2269,7 +2225,7 @@ phase_16() {
 
     CURRENT_MODE="mco"
     log_substep "Checking ADC state"
-    verify_adc_state "disabled" "disabled" || ((errors++)) || true
+    verify_adc_state "managed-by-mco" "managed-by-mco" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed"

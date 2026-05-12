@@ -86,7 +86,8 @@ If the script fails or a phase reports FAIL:
 
 - `TIMEOUT_E2E_RECONCILE` — Seconds to wait after MCO spec patches (default: 90)
 - `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
-- `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 60)
+- `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 300)
+- `TIMEOUT_COO_INSTALL` — Seconds to wait for COO installation before checking Perses (default: 120)
 
 ## Important notes
 

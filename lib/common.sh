@@ -85,7 +85,7 @@ wait_with_message() {
         printf "\r  ${BLUE}%s (%ds remaining)...${NC}  " "$message" "$i" >&2
         sleep 1
     done
-    printf "\r%-60s\r" " " >&2
+    printf "\r%-80s\r" " " >&2
 }
 
 # Check if a resource exists

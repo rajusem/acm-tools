@@ -388,9 +388,11 @@ do_status() {
         fi
     fi
 
-    # Hub resources (not-found is expected when right-sizing is disabled)
-    local not_found_log="log_error"
-    [[ "$rs_active" == "false" ]] && not_found_log="log_info"
+    # Hub resources (not-found is only an error when that specific feature is enabled)
+    local ns_not_found_log="log_info"
+    local virt_not_found_log="log_info"
+    [[ "$ns_state" == "true" ]] && ns_not_found_log="log_error"
+    [[ "$virt_state" == "true" ]] && virt_not_found_log="log_error"
 
     echo ""
     log_info "Hub Resources:"
@@ -399,12 +401,12 @@ do_status() {
         if resource_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE"; then
             log_success "  Policy (namespace): exists"
         else
-            $not_found_log "  Policy (namespace): not found"
+            $ns_not_found_log "  Policy (namespace): not found"
         fi
         if resource_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE"; then
             log_success "  Policy (virtualization): exists"
         else
-            $not_found_log "  Policy (virtualization): not found"
+            $virt_not_found_log "  Policy (virtualization): not found"
         fi
     else
         # MCOA uses in-memory predicate evaluation (no Placement CRs)
@@ -434,10 +436,10 @@ do_status() {
                     log_info "      - $name"
                 done
             else
-                if [[ "$rs_active" == "true" ]]; then
+                if [[ "$ns_state" == "true" || "$virt_state" == "true" ]]; then
                     log_error "    $spoke_name: 0 PrometheusRules"
                 else
-                    $not_found_log "    $spoke_name: 0 PrometheusRules"
+                    log_info "    $spoke_name: 0 PrometheusRules"
                 fi
             fi
         done
@@ -452,12 +454,12 @@ do_status() {
     if resource_exists configmap rs-namespace-config "$OBS_NAMESPACE"; then
         log_success "  rs-namespace-config: exists"
     else
-        $not_found_log "  rs-namespace-config: not found"
+        $ns_not_found_log "  rs-namespace-config: not found"
     fi
     if resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
         log_success "  rs-virt-config: exists"
     else
-        $not_found_log "  rs-virt-config: not found"
+        $virt_not_found_log "  rs-virt-config: not found"
     fi
 
     # COO + Perses (only relevant in MCOA mode with RS active)

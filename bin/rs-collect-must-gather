@@ -240,32 +240,8 @@ do_analyze() {
     fi
 
     if [[ "$mode" == "mcoa" && "$rs_active" == "true" ]]; then
-        # MCOA mode — should have Placements and ManifestWorks
-        local placements_file="$dir/hub/resources/placements.yaml"
-        if [[ -f "$placements_file" ]]; then
-            local ns_placement virt_placement
-            ns_placement=$(grep "name: rs-placement" "$placements_file" 2>/dev/null | head -1 || true)
-            virt_placement=$(grep "name: rs-virt-placement" "$placements_file" 2>/dev/null || true)
-            if [[ -n "$ns_placement" ]]; then
-                log_success "Placement rs-placement: exists"
-            elif [[ "$ns_enabled" == "true" ]]; then
-                log_error "Placement rs-placement: missing (namespace RS is enabled)"
-                ((findings++))
-            fi
-            if [[ -n "$virt_placement" ]]; then
-                log_success "Placement rs-virt-placement: exists"
-            elif [[ "$virt_enabled" == "true" ]]; then
-                log_error "Placement rs-virt-placement: missing (virtualization RS is enabled)"
-                ((findings++))
-            fi
-        fi
-
-        # Check PlacementDecision — NoManagedClusterSetBindings
-        if [[ -f "$placements_file" ]] && grep -q "NoManagedClusterSetBindings" "$placements_file" 2>/dev/null; then
-            log_error "Placement has NoManagedClusterSetBindings — clusters cannot be selected"
-            log_info "  Placements must be in a namespace with a ManagedClusterSetBinding"
-            ((findings++))
-        fi
+        # MCOA mode — uses in-memory predicate evaluation (no Placement CRs)
+        log_info "MCOA mode: cluster selection uses in-memory predicate evaluation"
 
         # Check ManifestWork PrometheusRules
         local mw_with_rs=0

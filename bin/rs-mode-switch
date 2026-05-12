@@ -174,24 +174,11 @@ do_switch_mco() {
 
     if [[ "$no_wait" == "false" ]]; then
         # Wait for MCOA to detect ADC change and clean up its resources
-        wait_with_message 30 "Waiting for MCOA to clean up Placements and ConfigMaps"
+        wait_with_message 30 "Waiting for MCOA to process ADC change"
 
-        # Verify MCOA Placements are cleaned up
+        # MCOA uses in-memory predicates — no Placement CRs to clean up
         log_substep "Verifying MCOA resource cleanup"
-        local mcoa_cleanup_ok=true
-        if $KUBE_CLI get placement rs-placement -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
-            log_warn "MCOA Placement rs-placement still exists — deleting"
-            $KUBE_CLI delete placement rs-placement -n "$GLOBAL_SET_NAMESPACE" --ignore-not-found 2>/dev/null || true
-            mcoa_cleanup_ok=false
-        fi
-        if $KUBE_CLI get placement rs-virt-placement -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
-            log_warn "MCOA Placement rs-virt-placement still exists — deleting"
-            $KUBE_CLI delete placement rs-virt-placement -n "$GLOBAL_SET_NAMESPACE" --ignore-not-found 2>/dev/null || true
-            mcoa_cleanup_ok=false
-        fi
-        if [[ "$mcoa_cleanup_ok" == "true" ]]; then
-            log_success "MCOA Placements cleaned up"
-        fi
+        log_success "MCOA mode uses in-memory predicates (no Placements to clean up)"
 
         # Trigger ConfigMap change to accelerate Policy creation.
         # MCO v77+ has freshEnable detection that creates resources on first reconcile,
@@ -367,17 +354,8 @@ do_status() {
             $not_found_log "  Policy (virtualization): not found"
         fi
     else
-        # MCOA placements
-        if resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE"; then
-            log_success "  Placement (namespace): exists"
-        else
-            $not_found_log "  Placement (namespace): not found"
-        fi
-        if resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE"; then
-            log_success "  Placement (virtualization): exists"
-        else
-            $not_found_log "  Placement (virtualization): not found"
-        fi
+        # MCOA uses in-memory predicate evaluation (no Placement CRs)
+        log_info "  Cluster selection: in-memory predicate evaluation (no Placement CRs)"
 
         # ManifestWork PrometheusRules per spoke
         local total_pr=0

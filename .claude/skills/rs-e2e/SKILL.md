@@ -74,7 +74,7 @@ If the script fails or a phase reports FAIL:
    - Patching MCO deployment directly if image doesn't match
    - Waiting 120s for MCO pod to run the expected image
 
-3. **Phase 9 (placement filter)**: Uses `placementConfiguration` key (not `placementFilter`) with YAML content. OCM types use yaml.v2 lowercased field names (`requiredclusterselector`, `labelselector`, `matchlabels`).
+3. **Phase 8 (placement filter)**: Uses `placementConfiguration` key (not `placementFilter`) with YAML content. OCM types use yaml.v2 lowercased field names (`requiredclusterselector`, `labelselector`, `matchlabels`). Validates filtering via ManifestWork PrometheusRule distribution, not PlacementDecisions.
 
 4. **Phase 11 (ConfigMap propagation)**: ConfigMap data keys are YAML strings, not JSON. The script uses `jq gsub` on `.data.prometheusRuleConfig` to do string replacement.
 

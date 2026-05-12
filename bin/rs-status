@@ -90,24 +90,28 @@ show_status() {
     echo -e "    ${ns_icon}Namespace:       $ns_enabled${NC}"
     echo -e "    ${virt_icon}Virtualization:  $virt_enabled${NC}"
 
-    # ── ADC ──
+    # ── ADC (MCOA mode only) ──
     echo ""
-    echo -e "${BOLD}  AddOnDeploymentConfig:${NC}"
-    local adc_json
-    adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" \
-        -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "{}")
+    if [[ -n "$annotation" ]]; then
+        echo -e "${BOLD}  AddOnDeploymentConfig:${NC}"
+        local adc_json
+        adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" \
+            -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "{}")
 
-    local ns_adc virt_adc
-    ns_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformNamespaceRightSizing") | .value' 2>/dev/null)
-    virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null)
+        local ns_adc virt_adc
+        ns_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformNamespaceRightSizing") | .value' 2>/dev/null)
+        virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null)
 
-    local ns_adc_icon="$YELLOW" virt_adc_icon="$YELLOW"
-    [[ "$ns_adc" == "enabled" ]] && ns_adc_icon="$GREEN"
-    [[ "$ns_adc" == "disabled" ]] && ns_adc_icon="$RED"
-    [[ "$virt_adc" == "enabled" ]] && virt_adc_icon="$GREEN"
-    [[ "$virt_adc" == "disabled" ]] && virt_adc_icon="$RED"
-    echo -e "    ${ns_adc_icon}platformNamespaceRightSizing:      ${ns_adc:-not set (auto-enables)}${NC}"
-    echo -e "    ${virt_adc_icon}platformVirtualizationRightSizing: ${virt_adc:-not set (auto-enables)}${NC}"
+        local ns_adc_icon="$YELLOW" virt_adc_icon="$YELLOW"
+        [[ "$ns_adc" == "enabled" ]] && ns_adc_icon="$GREEN"
+        [[ "$ns_adc" == "disabled" ]] && ns_adc_icon="$RED"
+        [[ "$virt_adc" == "enabled" ]] && virt_adc_icon="$GREEN"
+        [[ "$virt_adc" == "disabled" ]] && virt_adc_icon="$RED"
+        echo -e "    ${ns_adc_icon}platformNamespaceRightSizing:      ${ns_adc:-not set (auto-enables)}${NC}"
+        echo -e "    ${virt_adc_icon}platformVirtualizationRightSizing: ${virt_adc:-not set (auto-enables)}${NC}"
+    else
+        echo -e "${BOLD}  AddOnDeploymentConfig:${NC} ${BLUE}N/A (MCO mode)${NC}"
+    fi
 
     # ── ConfigMaps ──
     echo ""

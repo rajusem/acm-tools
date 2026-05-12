@@ -218,10 +218,10 @@ cleanup_stuck_manifestworks() {
         log_success "Stuck ManifestWorks cleaned up"
     fi
 
-    if $KUBE_CLI get deployment "$MCOA_DEPLOY" -n "$ACM_NAMESPACE" &>/dev/null; then
+    if $KUBE_CLI get deployment "$MCOA_DEPLOY" -n "$OBS_NAMESPACE" &>/dev/null; then
         log_substep "Restarting MCOA addon manager to trigger reconciliation"
-        $KUBE_CLI rollout restart deployment/"$MCOA_DEPLOY" -n "$ACM_NAMESPACE"
-        $KUBE_CLI rollout status deployment/"$MCOA_DEPLOY" -n "$ACM_NAMESPACE" \
+        $KUBE_CLI rollout restart deployment/"$MCOA_DEPLOY" -n "$OBS_NAMESPACE"
+        $KUBE_CLI rollout status deployment/"$MCOA_DEPLOY" -n "$OBS_NAMESPACE" \
             --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
     fi
 }

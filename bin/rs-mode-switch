@@ -78,16 +78,29 @@ do_switch_mcoa() {
 
     if [[ "$no_wait" == "false" ]]; then
         # Wait for MCO to detect annotation, sync ADC, and clean up Policies
-        wait_with_message "$TIMEOUT_MODE_SWITCH" "Waiting for MCO to sync ADC and clean up Policies"
+        log_substep "Waiting for MCO to sync ADC and clean up Policies"
+        local elapsed=0
+        local policy_timeout=60
+        while [[ $elapsed -lt $policy_timeout ]]; do
+            if ! $KUBE_CLI get policy.policy.open-cluster-management.io rs-prom-rules-policy \
+                -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+                break
+            fi
+            printf "\r  ${BLUE}Waiting for Policy cleanup (%ds/%ds)...${NC}  " "$elapsed" "$policy_timeout" >&2
+            sleep 5
+            elapsed=$((elapsed + 5))
+        done
+        printf "\r%-80s\r" " " >&2
 
-        # Verify MCO Policy resources are cleaned up
         log_substep "Verifying MCO Policy resource cleanup"
         local mco_cleanup_ok=true
-        if $KUBE_CLI get policy rs-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+        if $KUBE_CLI get policy.policy.open-cluster-management.io rs-prom-rules-policy \
+            -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
             log_warn "MCO Policy rs-prom-rules-policy still exists — may need more time"
             mco_cleanup_ok=false
         fi
-        if $KUBE_CLI get policy rs-virt-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+        if $KUBE_CLI get policy.policy.open-cluster-management.io rs-virt-prom-rules-policy \
+            -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
             log_warn "MCO Policy rs-virt-prom-rules-policy still exists — may need more time"
             mco_cleanup_ok=false
         fi
@@ -95,14 +108,41 @@ do_switch_mcoa() {
             log_success "MCO Policy resources cleaned up"
         fi
 
-        # Restart addon manager to pick up new ADC state
-        log_substep "Restarting MCOA addon manager"
-        $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" 2>/dev/null
-        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null
+        # Wait for MCOA to auto-detect ADC change and create ManifestWorks
+        log_substep "Waiting for MCOA to auto-detect ADC change"
+        local mw_timeout=60
+        local mw_auto=false
+        elapsed=0
+        while [[ $elapsed -lt $mw_timeout ]]; do
+            local mc_list
+            mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+            for mc in $mc_list; do
+                if $KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" >/dev/null 2>&1; then
+                    local mw_name
+                    mw_name=$($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" | head -1)
+                    if $KUBE_CLI get "$mw_name" -n "$mc" -o json 2>/dev/null | \
+                        grep "acm-rs" >/dev/null 2>&1; then
+                        mw_auto=true
+                        break 2
+                    fi
+                fi
+            done
+            printf "\r  ${BLUE}Waiting for ManifestWork generation (%ds/%ds)...${NC}  " "$elapsed" "$mw_timeout" >&2
+            sleep 5
+            elapsed=$((elapsed + 5))
+        done
+        printf "\r%-80s\r" " " >&2
 
-        wait_with_message "$TIMEOUT_MODE_SWITCH" "Waiting for ManifestWork reconciliation"
+        if [[ "$mw_auto" == "true" ]]; then
+            log_success "MCOA auto-detected ADC change"
+        else
+            log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
+            $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
+                -n "$OBS_NAMESPACE" 2>/dev/null || true
+            $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+                -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+            wait_with_message "$TIMEOUT_MODE_SWITCH" "Waiting for ManifestWork reconciliation"
+        fi
 
         # Wait for COO to be auto-installed by MCOA
         log_substep "Waiting for COO auto-installation by MCOA"
@@ -113,10 +153,10 @@ do_switch_mcoa() {
                 coo_installed=true
                 break
             fi
-            printf "\r  ${BLUE}Waiting for COO to be installed (%ds/%ds)...${NC}  " "$i" "$coo_timeout"
+            printf "\r  ${BLUE}Waiting for COO to be installed (%ds/%ds)...${NC}  " "$i" "$coo_timeout" >&2
             sleep 10
         done
-        printf "\r%-60s\r" " "
+        printf "\r%-80s\r" " " >&2
 
         if [[ "$coo_installed" == "true" ]]; then
             log_success "COO auto-installed by MCOA"
@@ -133,10 +173,10 @@ do_switch_mcoa() {
                     perses_ready=true
                     break
                 fi
-                printf "\r  ${BLUE}Waiting for Perses pod (%ds/%ds)...${NC}  " "$i" "$perses_timeout"
+                printf "\r  ${BLUE}Waiting for Perses pod (%ds/%ds)...${NC}  " "$i" "$perses_timeout" >&2
                 sleep 10
             done
-            printf "\r%-60s\r" " "
+            printf "\r%-80s\r" " " >&2
 
             if [[ "$perses_ready" == "true" ]]; then
                 log_success "Perses pod running"
@@ -173,28 +213,41 @@ do_switch_mco() {
         "$RS_ANNOTATION-" --overwrite 2>/dev/null || true
 
     if [[ "$no_wait" == "false" ]]; then
-        # Wait for MCOA to detect ADC change and clean up its resources
-        wait_with_message 30 "Waiting for MCOA to process ADC change"
-
         # MCOA uses in-memory predicates — no Placement CRs to clean up
         log_substep "Verifying MCOA resource cleanup"
         log_success "MCOA mode uses in-memory predicates (no Placements to clean up)"
 
-        # Trigger ConfigMap change to accelerate Policy creation.
-        # MCO v77+ has freshEnable detection that creates resources on first reconcile,
-        # but the ConfigMap patch fires the predicate sooner for faster convergence.
-        # Note: MCOA may have deleted ConfigMaps — MCO will recreate them via EnsureRSConfigMapExists.
-        log_substep "Triggering ConfigMap change to force Policy creation"
-        $KUBE_CLI patch configmap rs-namespace-config \
-            -n "$OBS_NAMESPACE" \
-            --type=merge \
-            -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
-        $KUBE_CLI patch configmap rs-virt-config \
-            -n "$OBS_NAMESPACE" \
-            --type=merge \
-            -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+        # MCO should auto-detect annotation removal, update ADC, and create Policies
+        log_substep "Waiting for MCO to auto-create Policies"
+        local policies_created=false
+        local elapsed=0
+        local timeout=60
+        while [[ $elapsed -lt $timeout ]]; do
+            if $KUBE_CLI get policy.policy.open-cluster-management.io rs-prom-rules-policy \
+                -n "$GLOBAL_SET_NAMESPACE" &>/dev/null; then
+                policies_created=true
+                break
+            fi
+            printf "\r  ${BLUE}Waiting for Policy creation (%ds/%ds)...${NC}  " "$elapsed" "$timeout" >&2
+            sleep 5
+            elapsed=$((elapsed + 5))
+        done
+        printf "\r%-80s\r" " " >&2
 
-        wait_with_message 45 "Waiting for Policy creation and propagation"
+        if [[ "$policies_created" == "true" ]]; then
+            log_success "MCO auto-created Policies"
+        else
+            log_warn "MCO did not auto-create Policies — triggering ConfigMap change as fallback"
+            $KUBE_CLI patch configmap rs-namespace-config \
+                -n "$OBS_NAMESPACE" \
+                --type=merge \
+                -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+            $KUBE_CLI patch configmap rs-virt-config \
+                -n "$OBS_NAMESPACE" \
+                --type=merge \
+                -p "{\"data\":{\"mcoTrigger\":\"$(date +%s)\"}}" 2>/dev/null || true
+            wait_with_message 30 "Waiting for Policy creation after ConfigMap trigger"
+        fi
     fi
 
     echo ""
@@ -431,14 +484,22 @@ do_status() {
             log_warn "  Perses pod: not found"
         fi
 
-        # Perses dashboards
+        # Perses dashboards — validate against enabled features
+        local expected_dashboards=0
+        [[ "$ns_state" == "true" ]] && ((expected_dashboards += 1))
+        [[ "$virt_state" == "true" ]] && ((expected_dashboards += 3))
+
         local dashboard_count
-        dashboard_count=$($KUBE_CLI get persesdashboard -n "$ANALYTICS_NAMESPACE" --no-headers 2>/dev/null | grep -c "acm-rs" || true)
-        if [[ "$dashboard_count" -gt 0 ]]; then
-            log_success "  Perses dashboards: $dashboard_count"
-            $KUBE_CLI get persesdashboard -n "$ANALYTICS_NAMESPACE" --no-headers 2>/dev/null | grep "acm-rs" | awk '{print "    - " $1}'
+        dashboard_count=$($KUBE_CLI get persesdashboard -n "$ANALYTICS_NAMESPACE" --no-headers 2>/dev/null | grep -c "acm-rs\|acm-rightsizing" || true)
+        if [[ "$dashboard_count" -ge "$expected_dashboards" && "$expected_dashboards" -gt 0 ]]; then
+            log_success "  Perses dashboards: $dashboard_count (expected $expected_dashboards)"
+        elif [[ "$expected_dashboards" -eq 0 ]]; then
+            log_info "  Perses dashboards: $dashboard_count (no RS features enabled)"
         else
-            log_warn "  Perses dashboards: 0"
+            log_error "  Perses dashboards: $dashboard_count (expected $expected_dashboards)"
+        fi
+        if [[ "$dashboard_count" -gt 0 ]]; then
+            $KUBE_CLI get persesdashboard -n "$ANALYTICS_NAMESPACE" --no-headers 2>/dev/null | grep "acm-rs\|acm-rightsizing" | awk '{print "    - " $1}'
         fi
 
         # UIPlugin

@@ -79,7 +79,7 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  install-custom-acm --version 2.16"
-    echo "  install-custom-acm --version 2.16 --mce-channel stable-2.11"
+    echo "  install-custom-acm --version 2.17 --mce-channel stable-2.17"
     echo "  install-custom-acm --pull-secret --catalog-source --version 2.16"
     echo "  install-custom-acm --catalog-source --catalog-tag 2.16-SNAPSHOT-2026-03-15"
     echo "  install-custom-acm --source acm-custom-registry --source-ns openshift-marketplace"
@@ -191,18 +191,27 @@ do_install() {
     fi
 
     # Auto-derive MCE channel from ACM version if not provided
-    # ACM 2.x maps to MCE 2.(x-5), e.g. ACM 2.16 -> MCE 2.11
+    # ACM <=2.16: MCE 2.(x-5), e.g. ACM 2.16 -> MCE 2.11
+    # ACM >=2.17: MCE matches ACM, e.g. ACM 2.17 -> MCE 2.17
+    local mce_channel_source
     if [[ -z "$MCE_CHANNEL" ]]; then
         local acm_minor mce_minor
         acm_minor=$(echo "$ACM_VERSION" | cut -d. -f2)
-        mce_minor=$((acm_minor - 5))
+        if [[ $acm_minor -ge 17 ]]; then
+            mce_minor=$acm_minor
+        else
+            mce_minor=$((acm_minor - 5))
+        fi
         MCE_CHANNEL="stable-2.${mce_minor}"
+        mce_channel_source="auto-derived from ACM $ACM_VERSION"
+    else
+        mce_channel_source="user-provided"
     fi
 
     log_step "Installing ACM"
     log_info "ACM Version:  $ACM_VERSION"
     log_info "ACM Channel:  $ACM_CHANNEL"
-    log_info "MCE Channel:  $MCE_CHANNEL (auto-derived from ACM $ACM_VERSION)"
+    log_info "MCE Channel:  $MCE_CHANNEL ($mce_channel_source)"
     log_info "Source:        $ACM_SOURCE ($ACM_SOURCE_NS)"
     if [[ "$apply_catalog" == "true" ]]; then
         log_info "Catalog Tag:   $CATALOG_TAG"

@@ -1290,7 +1290,7 @@ phase_3() {
     local spoke_checked=false
     for ctx_name in "$NAMESPACE_SPOKE_CONTEXT" "$VM_SPOKE_CONTEXT"; do
         log_info "  Checking spoke $ctx_name..." >&2
-        if timeout 10 $KUBE_CLI --context="$ctx_name" cluster-info &>/dev/null 2>&1; then
+        if $KUBE_CLI --context="$ctx_name" cluster-info --request-timeout=10s &>/dev/null 2>&1; then
             local pr_count
             pr_count=$($KUBE_CLI --context="$ctx_name" get prometheusrule -n openshift-monitoring \
                 --no-headers 2>/dev/null | grep -c -i "rs-\|acm-rs" || true)

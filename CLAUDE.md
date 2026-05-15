@@ -41,6 +41,7 @@ All scripts in `bin/` source `lib/common.sh`. Read it to understand available he
 - Use `|| true` not `|| echo 0` after `grep -c` (grep -c outputs its count to stdout even on no-match; `|| echo 0` doubles it)
 - Use `subscription.operators.coreos.com` for OLM subscriptions (ACM registers its own `Subscription` CRD under `apps.open-cluster-management.io`, causing API group collision)
 - Send log messages to stderr (`>&2`) inside functions whose stdout is captured by command substitution
+- Use `$KUBE_CLI --request-timeout=10s` instead of `timeout 10 $KUBE_CLI` (macOS lacks GNU `timeout`; exit 127 silently breaks conditionals)
 
 ## Image Overrides
 

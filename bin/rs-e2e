@@ -295,18 +295,18 @@ wait_until() {
     return 1
 }
 
-adc_not_managed_by_mco() {
+adc_not_mco_mode() {
     local actual
     actual=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" -n "$OBS_NAMESPACE" \
         -o jsonpath='{.spec.customizedVariables[?(@.name=="platformNamespaceRightSizing")].value}' 2>/dev/null || echo "")
-    [[ -n "$actual" && "$actual" != "managed-by-mco" ]]
+    [[ -n "$actual" && "$actual" != "disabled" ]]
 }
 
-adc_managed_by_mco() {
+adc_mco_mode() {
     local actual
     actual=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" -n "$OBS_NAMESPACE" \
         -o jsonpath='{.spec.customizedVariables[?(@.name=="platformNamespaceRightSizing")].value}' 2>/dev/null || echo "")
-    [[ "$actual" == "managed-by-mco" ]]
+    [[ "$actual" == "disabled" ]]
 }
 
 # --- Perses Dashboard Constants ---
@@ -543,7 +543,7 @@ ensure_mode() {
     if [[ "$target" == "mcoa" ]]; then
         $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
         wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "MCOA reconciliation" \
-            adc_not_managed_by_mco || true
+            adc_not_mco_mode || true
         log_substep "Waiting for MCOA to auto-detect ADC change"
         if ! wait_until 60 5 "ManifestWork auto-generation" mw_has_rs_prometheusrules; then
             log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
@@ -601,10 +601,10 @@ verify_adc_state() {
     local expected_ns="$1" expected_virt="$2"
     local errors=0
 
-    # In MCO mode, ADC always shows "managed-by-mco" regardless of individual feature state
+    # In MCO mode, MCO syncs "disabled" to ADC so MCOA does not deploy RS via ManifestWork
     if [[ "$CURRENT_MODE" == "mco" ]]; then
-        expected_ns="managed-by-mco"
-        expected_virt="managed-by-mco"
+        expected_ns="disabled"
+        expected_virt="disabled"
     fi
 
     local adc_json
@@ -1121,7 +1121,7 @@ phase_1() {
     verify_all_rs_resources_exist "$CURRENT_MODE" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors resource(s) missing"
+        PHASE_FAIL_REASON="ConfigMap(s) not found (MCOA deletes MCO-created ConfigMaps)"
         return 1
     fi
     return 0
@@ -1156,7 +1156,7 @@ phase_2a() {
     assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        PHASE_FAIL_REASON="Retained virt ConfigMap missing (MCOA create-delete loop)"
         return 1
     fi
     return 0
@@ -1189,7 +1189,7 @@ phase_2b() {
     assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        PHASE_FAIL_REASON="Restored namespace ConfigMap missing (MCOA create-delete loop)"
         return 1
     fi
     return 0
@@ -1235,7 +1235,7 @@ phase_2d() {
     verify_all_rs_resources_exist "mco" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        PHASE_FAIL_REASON="ConfigMap(s) not found after re-enable (MCOA create-delete loop)"
         return 1
     fi
     return 0
@@ -1374,7 +1374,7 @@ phase_14() {
     log_substep "Switching to MCOA mode"
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
     wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "MCOA mode delegation" \
-        adc_not_managed_by_mco || true
+        adc_not_mco_mode || true
     log_substep "Waiting for MCOA to auto-detect ADC change"
     if ! wait_until 60 5 "ManifestWork auto-generation" mw_has_rs_prometheusrules; then
         log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
@@ -1529,10 +1529,10 @@ phase_11() {
 
     CURRENT_MODE="mco"
     log_substep "Checking ADC state"
-    verify_adc_state "managed-by-mco" "managed-by-mco" || ((errors++)) || true
+    verify_adc_state "disabled" "disabled" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        PHASE_FAIL_REASON="ADC not synced to disabled after MCOA->MCO switch"
         return 1
     fi
     return 0
@@ -1553,7 +1553,7 @@ phase_12() {
     CURRENT_MODE="mcoa"
 
     wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "delegation with v99 annotation" \
-        adc_not_managed_by_mco || true
+        adc_not_mco_mode || true
 
     log_substep "Verifying delegation occurs regardless of annotation value"
     assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
@@ -2180,7 +2180,7 @@ phase_16() {
     $KUBE_CLI annotate mco "$MCO_NAME" "$RS_ANNOTATION=true" --overwrite
     CURRENT_MODE="mcoa"
     wait_until "$TIMEOUT_E2E_MODE_SWITCH" 5 "MCOA mode" \
-        adc_not_managed_by_mco || true
+        adc_not_mco_mode || true
     log_substep "Waiting for MCOA to auto-detect ADC change"
     if ! wait_until 60 5 "ManifestWork auto-generation" mw_has_rs_prometheusrules; then
         log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
@@ -2225,10 +2225,10 @@ phase_16() {
 
     CURRENT_MODE="mco"
     log_substep "Checking ADC state"
-    verify_adc_state "managed-by-mco" "managed-by-mco" || ((errors++)) || true
+    verify_adc_state "disabled" "disabled" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors assertion(s) failed"
+        PHASE_FAIL_REASON="ADC not synced to disabled after mode switch"
         return 1
     fi
     return 0

@@ -898,7 +898,7 @@ prephase_image_override() {
     if [[ -n "$expected_mcoa" ]]; then
         local manifest_cm
         manifest_cm=$($KUBE_CLI get configmap -n "$ACM_NAMESPACE" --no-headers 2>/dev/null | \
-            awk '/^mch-image-manifest/{print $1}' | head -1)
+            awk '/^mch-image-manifest/{print $1}' | tail -1)
         if [[ -n "$manifest_cm" ]]; then
             log_substep "Patching $manifest_cm with MCOA image"
             $KUBE_CLI patch configmap "$manifest_cm" -n "$ACM_NAMESPACE" --type merge \
@@ -2259,10 +2259,23 @@ print_summary() {
     mco_image=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
         -l name=multicluster-observability-operator \
         -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
-    local mcoa_image
-    mcoa_image=$($KUBE_CLI get pod -n "$OBS_NAMESPACE" \
-        -l app=multicluster-observability-addon-manager \
-        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
+    local mcoa_image=""
+    # Priority 1: local image-override.json (active custom override)
+    local override_json="$SCRIPT_DIR/../image-override.json"
+    if [[ -f "$override_json" ]]; then
+        mcoa_image=$(jq -r '.[] | select(.["image-key"]=="multicluster_observability_addon") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' "$override_json" 2>/dev/null || echo "")
+    fi
+    # Priority 2: mch-image-manifest ConfigMap (ACM source of truth)
+    if [[ -z "$mcoa_image" ]]; then
+        local manifest_cm
+        manifest_cm=$($KUBE_CLI get configmap -n "$ACM_NAMESPACE" --no-headers 2>/dev/null | \
+            awk '/^mch-image-manifest/{print $1}' | tail -1)
+        if [[ -n "$manifest_cm" ]]; then
+            mcoa_image=$($KUBE_CLI get configmap "$manifest_cm" -n "$ACM_NAMESPACE" \
+                -o jsonpath='{.data.multicluster_observability_addon}' 2>/dev/null || echo "")
+        fi
+    fi
+    mcoa_image="${mcoa_image:-unknown}"
 
     echo -e "  Cluster:          $cluster_url"
     echo -e "  ACM Version:      $acm_version"

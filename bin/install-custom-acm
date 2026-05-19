@@ -345,10 +345,20 @@ EOF
     available_channels=$($KUBE_CLI get packagemanifest advanced-cluster-management \
         -n openshift-marketplace -o jsonpath='{.status.channels[*].name}' 2>/dev/null || echo "")
     if [[ -n "$available_channels" ]] && ! echo "$available_channels" | tr ' ' '\n' | grep "^${ACM_CHANNEL}$" >/dev/null; then
-        log_error "Channel '$ACM_CHANNEL' not found in $ACM_SOURCE catalog"
-        log_info "Available channels: $available_channels"
-        log_info "Use --catalog-source for pre-release builds, or choose an available version"
-        return 1
+        if [[ "$apply_catalog" == "true" ]]; then
+            # Dev catalogs may not have the release-X.Y channel yet; use the highest available
+            local highest_channel
+            highest_channel=$(echo "$available_channels" | tr ' ' '\n' | sort -t. -k2 -n | tail -1)
+            log_warn "Channel '$ACM_CHANNEL' not found in $ACM_SOURCE catalog — using '$highest_channel' (highest available)"
+            log_info "Available channels: $available_channels"
+            log_info "Override with --channel if needed"
+            ACM_CHANNEL="$highest_channel"
+        else
+            log_error "Channel '$ACM_CHANNEL' not found in $ACM_SOURCE catalog"
+            log_info "Available channels: $available_channels"
+            log_info "Use --channel to specify, or --catalog-source for pre-release builds"
+            return 1
+        fi
     fi
 
     # 5. Create ACM Subscription

@@ -21,6 +21,7 @@
 #   2d   Re-enable both features
 #   3    Spoke PrometheusRule validation
 #   4    ConfigMap propagation (MCO)
+#   4a   ConfigMap coexistence (MCO+MCOA)
 #
 #   Group 2: MCOA-mode tests (1 mode switch)
 #   5    MCO -> MCOA switch            (--mode-switch)
@@ -134,9 +135,9 @@ parse_args() {
 
     if [[ -z "$SELECTED_PHASES" ]]; then
         if [[ "$SKIP_UNINSTALL" == "true" ]]; then
-            SELECTED_PHASES="0,1,2a,2b,2c,2d,3"
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,3,4a"
         elif [[ "$MODE_SWITCH" == "false" ]]; then
-            SELECTED_PHASES="0,1,2a,2b,2c,2d,3,4,13,14"
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,3,4,4a,13,14"
         fi
     fi
 
@@ -643,6 +644,21 @@ verify_adc_state() {
     fi
 
     return $errors
+}
+
+verify_adc_delegation() {
+    local expected="$1"
+    local actual
+    actual=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" \
+        -n "$OBS_NAMESPACE" \
+        -o jsonpath='{.spec.customizedVariables[?(@.name=="rightSizingDelegated")].value}' \
+        2>/dev/null || echo "")
+    if [[ "$actual" != "$expected" ]]; then
+        log_error "  ADC rightSizingDelegated: '$actual' (expected '$expected')"
+        return 1
+    fi
+    log_success "  ADC rightSizingDelegated: $actual"
+    return 0
 }
 
 count_mw_prometheusrules() {
@@ -2094,6 +2110,84 @@ phase_10() {
 }
 
 # =============================================================================
+# Phase 4a: ConfigMap Coexistence (MCO+MCOA)
+# =============================================================================
+
+phase_4a() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to ensure MCO mode"; return 1; }
+
+    log_substep "Verifying RS ConfigMaps exist (baseline)"
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || { PHASE_FAIL_REASON="Baseline RS ConfigMaps missing"; return 1; }
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || { PHASE_FAIL_REASON="Baseline RS ConfigMaps missing"; return 1; }
+
+    log_substep "Enabling incident detection to trigger MCOA deployment"
+    $KUBE_CLI patch mco "$MCO_NAME" --type=merge -p '{
+        "spec":{"capabilities":{"platform":{"analytics":{"incidentDetection":{"enabled":true}}}}}
+    }'
+
+    log_substep "Waiting for MCOA deployment"
+    wait_until 120 10 "MCOA deployment" \
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" --timeout=5s || true
+
+    if ! $KUBE_CLI get deployment "$MCOA_DEPLOY" -n "$OBS_NAMESPACE" &>/dev/null; then
+        PHASE_FAIL_REASON="MCOA deployment not created after enabling incident detection"
+        $KUBE_CLI patch mco "$MCO_NAME" --type=merge -p '{
+            "spec":{"capabilities":{"platform":{"analytics":{"incidentDetection":{"enabled":false}}}}}
+        }'
+        return 1
+    fi
+    log_success "  MCOA deployment ready"
+
+    log_substep "Checking ADC delegation signal"
+    wait_until 30 5 "ADC delegation sync" \
+        verify_adc_delegation "false" || true
+    verify_adc_delegation "false" || ((errors++)) || true
+
+    log_substep "Verifying RS ConfigMaps survived MCOA deployment"
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Waiting 30s and re-checking ConfigMaps (catch delayed deletion)"
+    sleep 30
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Verifying no RS ManifestWork PrometheusRules (MCO uses Policy)"
+    count_mw_prometheusrules "true"
+    if [[ $MW_PR_COUNT -gt 0 ]]; then
+        log_error "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s) — should be 0 in MCO mode"
+        ((errors++)) || true
+    else
+        log_success "  ManifestWorks: 0 RS PrometheusRules (correct for MCO mode)"
+    fi
+
+    log_substep "Verifying no RS Perses dashboards (MCO mode)"
+    for db in "$RS_NS_DASHBOARD" "${RS_VM_DASHBOARDS[@]}"; do
+        if perses_dashboard_exists "$db"; then
+            log_error "  persesdashboard/$db EXISTS — should not be created in MCO mode"
+            ((errors++)) || true
+        else
+            log_success "  persesdashboard/$db absent (correct for MCO mode)"
+        fi
+    done
+
+    log_substep "Reverting: disabling incident detection"
+    $KUBE_CLI patch mco "$MCO_NAME" --type=merge -p '{
+        "spec":{"capabilities":{"platform":{"analytics":{"incidentDetection":{"enabled":false}}}}}
+    }'
+    wait_for_reconcile 30 "Waiting for MCO reconciliation after revert"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="MCOA leaked RS resources in MCO mode — delegation signal not working"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 # Phase 15-16: MCO Reinstall After MCOA
 # =============================================================================
 
@@ -2385,6 +2479,7 @@ main() {
     run_phase "2d"  "Re-enable both features"         phase_2d
     run_phase "3"   "Spoke validation"                phase_3
     run_phase "4"   "ConfigMap propagation (MCO)"     phase_4
+    run_phase "4a"  "ConfigMap coexistence (MCO+MCOA)" phase_4a
     run_phase "5"   "MCO -> MCOA switch"              phase_5
     run_phase "6"   "SpecHash freshness"              phase_6
     run_phase "7"   "ConfigMap predicate side-effect"  phase_7

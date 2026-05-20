@@ -288,6 +288,59 @@ Collects MCO/MCOA operator logs, resource states (MCO CR, CMA, ADC, ConfigMaps, 
 
 The `analyze` subcommand examines collected data offline (no cluster connection needed) and checks for: pod health, ADC state consistency, resource mismatches, ManifestWork generation lag, log errors/panics, and missing ConfigMaps.
 
+## Claude Code Skills
+
+Interactive workflows available as `/skill-name` slash commands in Claude Code. These automate multi-step processes that combine CLI tools with external services.
+
+### /plan-feature-epics
+
+Generate and create a set of Jira Epics for an ACM feature based on proven patterns from past releases. Supports Dev Preview, Tech Preview, and GA phases.
+
+```
+/plan-feature-epics Rightsizing with MCOA as GA with ACM 5.0
+```
+
+- Creates 9 core epics + phase-specific extras (TP: +2, GA: +3)
+- ACM tracking epic with full structured description template
+- OBSINTA epics for Design, Dev, QE, Doc, Blog, CEE, Enhancements
+- Default T-shirt sizing (XS/S/M/L/XL) per epic type
+- Parent ticket linking from any Jira board (OBSDA, ACM, etc.)
+- Dry-run mode (default) for review before Jira creation
+- Requires: [Atlassian Rovo MCP Server](https://support.atlassian.com/atlassian-rovo-mcp-server/docs/getting-started-with-the-atlassian-remote-mcp-server/) configured in `.mcp.json`
+
+Configuration: `.claude/skills/plan-feature-epics/config.env`
+
+### /rs-e2e
+
+Run end-to-end validation of right-sizing resource lifecycle on the current cluster.
+
+```
+/rs-e2e                           # Core tests (phases 0-4, 13-14)
+/rs-e2e --mode-switch             # Full suite including MCOA tests
+/rs-e2e --build mco --phases 0-3  # Build image then run specific phases
+```
+
+**`/rs-e2e` (skill) vs `bin/rs-e2e` (script):**
+
+| | `bin/rs-e2e` | `/rs-e2e` |
+|---|---|---|
+| **What** | Standalone bash script | Claude Code skill wrapping the script |
+| **Input** | CLI flags (`--mode-switch`, `--phases 0-3`) | Natural language ("run a quick validation") |
+| **On failure** | Prints PASS/FAIL summary | Interactive troubleshooting with diagnosis tables, debugging commands, and root-cause guidance |
+| **Requires** | Terminal + cluster access | Claude Code + cluster access |
+
+Use `bin/rs-e2e` directly when you know the flags. Use `/rs-e2e` when you want Claude to pick the right flags or help diagnose failures.
+
+### /cluster-debug
+
+Diagnose issues with ACM/MCO/MCE on the hub cluster. Systematically checks all layers (operators, CRDs, pods, logs) before proposing fixes.
+
+```
+/cluster-debug    # Start interactive diagnosis
+```
+
+Runs diagnostic steps sequentially: cluster overview, operator health, CRD status, pod logs, and resource state analysis.
+
 ## Deployment Architecture
 
 Both MCO and MCOA are deployed via MCH image overrides:
@@ -313,6 +366,11 @@ acm-tools/
     pull-secret.json       # Your quay.io pull secret (gitignored)
     pull-secret.json.example
   manifests/               # Generated YAML manifests (by setup-observability)
+  docs/                    # Documentation (MCP setup guides, etc.)
+  .claude/skills/          # Claude Code skill definitions
+    plan-feature-epics/    # Jira epic planning workflow
+    rs-e2e/                # Right-sizing E2E test runner
+    cluster-debug/         # Cluster diagnostics
 ```
 
 ## Shared Library

@@ -203,15 +203,14 @@ Shows: mode (MCO/MCOA), MCO CR state, ADC state, ConfigMaps, mode-specific resou
 End-to-end validation of right-sizing resource lifecycle across MCO and MCOA modes.
 
 ```bash
-bin/rs-e2e                                   # Phases 0-4, 13-14 (core tests)
+bin/rs-e2e                                   # Phases 0-4a, 13-14 (core tests)
 bin/rs-e2e --mode-switch                     # All phases 0-16 (includes MCOA mode switching)
-bin/rs-e2e --skip-uninstall                  # Phases 0-3 only (no MCO deletion)
+bin/rs-e2e --skip-uninstall                  # Phases 0-4a only (no MCO deletion)
 bin/rs-e2e --phases 0-3,5,9a                 # Run specific phases (ranges OK)
 bin/rs-e2e --build mco                       # Build MCO image, then run tests
 bin/rs-e2e --build both                      # Build MCO + MCOA images, then run tests
 bin/rs-e2e --image-override                  # Apply image-override.json, then run tests
 bin/rs-e2e --skip-perses-check               # Skip COO/Perses dashboard verification
-bin/rs-e2e --mode-switch                     # All phases (prompts for destructive)
 bin/rs-e2e --mode-switch --yes               # All phases, auto-confirm destructive
 bin/rs-e2e mcoa                              # Force testing in MCOA mode
 ```
@@ -230,6 +229,7 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 2d | Re-enable both | Re-enables both features — verifies full resource restoration. |
 | 3 | Spoke validation | Checks PlacementDecisions select managed clusters, verifies PrometheusRules exist on spokes (hub-side ManifestWork check + direct spoke `--context` check). |
 | 4 | ConfigMap propagation (MCO) | Modifies `rs-namespace-config` ConfigMap (recommendationPercentage 110→120), verifies Policy updates with new value, then reverts. Tests MCO's ConfigMap→Policy pipeline. |
+| 4a | ConfigMap coexistence (MCO+MCOA) | Enables incident detection to trigger MCOA deployment while RS stays in MCO mode. Verifies RS ConfigMaps survive, no ManifestWork PrometheusRules or Perses dashboards created, and ADC `rightSizingDelegated=false`. Tests delegation signal. |
 
 **Group 2: MCOA-mode tests** (`--mode-switch` required)
 
@@ -315,7 +315,7 @@ Configuration: `.claude/skills/plan-feature-epics/config.env`
 Run end-to-end validation of right-sizing resource lifecycle on the current cluster.
 
 ```
-/rs-e2e                           # Core tests (phases 0-4, 13-14)
+/rs-e2e                           # Core tests (phases 0-4a, 13-14)
 /rs-e2e --mode-switch             # Full suite including MCOA tests
 /rs-e2e --build mco --phases 0-3  # Build image then run specific phases
 ```
@@ -358,6 +358,10 @@ MCO creates the MCOA addon manager deployment when MCOA capabilities are active 
 
 ```
 acm-tools/
+  AGENTS.md                # Agent instructions (tool-agnostic, for Claude/Cursor/Copilot)
+  CLAUDE.md                # Claude Code include (@AGENTS.md)
+  docs/                    # Documentation
+    TROUBLESHOOTING.md     # Right-sizing migration troubleshooting learnings
   config.sh                # Shared configuration (contexts, container engine)
   image-override.json      # Image override entries (edit to add/remove images)
   lib/common.sh            # Shared library (logging, helpers, constants)
@@ -366,7 +370,6 @@ acm-tools/
     pull-secret.json       # Your quay.io pull secret (gitignored)
     pull-secret.json.example
   manifests/               # Generated YAML manifests (by setup-observability)
-  docs/                    # Documentation (MCP setup guides, etc.)
   .claude/skills/          # Claude Code skill definitions
     plan-feature-epics/    # Jira epic planning workflow
     rs-e2e/                # Right-sizing E2E test runner

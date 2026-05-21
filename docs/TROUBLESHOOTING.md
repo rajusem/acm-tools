@@ -13,7 +13,7 @@ MCOA no longer creates Placement or PlacementDecision CRs. Instead, it uses **in
 
 ## ManifestWork PrometheusRules: 0
 
-**Symptom**: `rs-mode-switch status` shows ManifestWork PrometheusRules: 0 even though MCOA mode is active and ADC has RS "enabled".
+**Symptom**: `rs-status` shows ManifestWork PrometheusRules: 0 even though MCOA mode is active and ADC has RS "enabled".
 
 **Root cause**: The `rs-namespace-config` / `rs-virt-config` ConfigMaps may have restrictive `placementConfiguration` predicates that don't match any clusters, or MCOA may not have reconciled after an ADC change.
 
@@ -24,7 +24,7 @@ kubectl get configmap rs-namespace-config rs-virt-config \
   -n open-cluster-management-observability -o yaml
 
 # Restart MCOA addon manager to force ManifestWork regeneration
-kubectl rollout restart deployment/multicluster-observability-addon \
+kubectl rollout restart deployment/multicluster-observability-addon-manager \
   -n open-cluster-management-observability
 ```
 
@@ -88,7 +88,7 @@ bin/setup-observability install --force-cleanup-mw
 kubectl patch manifestwork <name> -n local-cluster \
   --type=merge -p '{"metadata":{"finalizers":[]}}'
 kubectl rollout restart deployment/multicluster-observability-addon-manager \
-  -n open-cluster-management
+  -n open-cluster-management-observability
 ```
 
 The `--force-cleanup-mw` flag removes all finalizers from stuck MCOA ManifestWorks on `local-cluster`, waits for deletion, then restarts the MCOA addon manager to trigger ManifestWork re-creation.
@@ -560,7 +560,7 @@ kubectl get manifestwork addon-multicluster-observability-addon-deploy-0 \
        {kind, name: .metadata.name, namespace: .metadata.namespace}]'
 
 # Check if COO subscription exists
-kubectl get subscription -n openshift-cluster-observability-operator
+kubectl get subscription.operators.coreos.com -n openshift-cluster-observability-operator
 
 # Check COO operator pod + Perses pod
 kubectl get pods -n openshift-cluster-observability-operator
@@ -657,14 +657,14 @@ kubectl rollout restart deployment/multicluster-observability-operator \
 
 ```bash
 # Full status dashboard
-bin/rs-mode-switch status
+bin/rs-status
 
 # Check all managed cluster health
 kubectl get managedcluster
 
 # Check MCOA pod logs
 kubectl logs -n open-cluster-management-observability \
-  -l app=multicluster-observability-addon --tail=50
+  -l app=multicluster-observability-addon-manager --tail=50
 
 # Check MCO operator logs for right-sizing
 kubectl logs -n open-cluster-management \
@@ -740,17 +740,18 @@ oc get mco observability 2>&1  # should be NotFound
 
 ## Architecture Reference
 
-| Mode | Deployment Mechanism | Placement Namespace | RS Signal |
-|------|---------------------|---------------------|-----------|
-| MCO (Policy) | Policy + PlacementBinding | `open-cluster-management-global-set` | MCO CR capabilities |
-| MCOA (ManifestWork) | ManifestWork via addon framework | `open-cluster-management-global-set` | MCO CR annotation `right-sizing-capable` present |
+| Mode | Deployment Mechanism | Cluster Selection | RS Signal |
+|------|---------------------|-------------------|-----------|
+| MCO (Policy) | Policy + PlacementBinding | Placement CRs in `open-cluster-management-global-set` | MCO CR capabilities |
+| MCOA (ManifestWork) | ManifestWork via addon framework | In-memory predicate evaluation (predicates stored in ConfigMaps) | MCO CR annotation `right-sizing-capable` present |
 
 | Component | Hub Namespace | Created By |
 |-----------|--------------|------------|
 | MCO Operator | `open-cluster-management` | MCH |
 | MCOA Addon Manager | `open-cluster-management-observability` | MCO |
-| RS Placements | `open-cluster-management-global-set` | MCO (Policy mode) / MCOA (ManifestWork mode) |
-| RS ConfigMaps | `open-cluster-management-observability` | MCO (Policy mode) / MCOA (ManifestWork mode). Contains user-customizable config — never deleted during mode switch |
+| RS Placements | `open-cluster-management-global-set` | MCO (Policy mode only) |
+| RS ConfigMaps | `open-cluster-management-observability` | MCO or MCOA (shared, never deleted during mode switch) |
 | RS Policies | `open-cluster-management-global-set` | MCO (Policy mode only) |
+| RS ManifestWorks | per managed cluster namespace | MCOA (ManifestWork mode only) |
 | CMA | cluster-scoped | MCO |
 | ADC | `open-cluster-management-observability` | MCO |

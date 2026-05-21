@@ -41,6 +41,20 @@ bin/rs-e2e [flags]
 
 The script prints phase-by-phase results with PASS/FAIL status and a summary table at the end.
 
+### Retry policy
+
+If phases fail, diagnose using the troubleshooting tables below and attempt a fix. Then re-run only the failed phases with `--phases`.
+
+- **Maximum 2 retry attempts** per failed phase (3 total runs including the original)
+- After 2 retries, **stop** and report: which phases failed, the `PHASE_FAIL_REASON`, what was tried, and the likely root cause
+- **Fix infrastructure issues** before retrying — these fixes count toward the retry limit:
+  - Spoke `Available: Unknown` → `add-managed-cluster add <spoke> --force-import --sync-pull-secret`
+  - MCO not installed → `setup-observability install`
+  - Stuck ManifestWorks on local-cluster → `setup-observability install --force-cleanup-mw`
+  - Stale operator state → restart the relevant operator pod
+- **Stop immediately** on unrecoverable failures: cluster API unreachable (powered off/wrong kubeconfig context), no credentials, no `oc`/`kubectl` in PATH
+- Do NOT retry the same fix twice — if the first fix didn't work, try a different approach or stop
+
 ### Phases reference
 
 | Phase | Test | Requires |

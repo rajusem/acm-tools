@@ -50,7 +50,9 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 
 `config.sh` defines all defaults — override via environment variables:
 
+- **Registry/images**: `ACM_TOOLS_REGISTRY`, `MCO_IMAGE_NAME`, `MCOA_IMAGE_NAME`
 - **Cluster contexts**: `HUB_CONTEXT` (default: `hub`), `NAMESPACE_SPOKE_CONTEXT` (default: `namespace-spoke`), `VM_SPOKE_CONTEXT` (default: `vm-spoke`)
+- **Source repos**: `MCO_REPO_DIR` (default: `../multicluster-observability-operator`), `MCOA_REPO_DIR` (default: `../multicluster-observability-addon`)
 - **Timeouts**: `TIMEOUT_ROLLOUT`, `TIMEOUT_MCO_READY`, `TIMEOUT_MCH_READY`, `TIMEOUT_COO_INSTALL`, etc.
 
 ## Bash Scripting Conventions

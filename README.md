@@ -269,6 +269,8 @@ Phases 5-12, 15-16 require `--mode-switch` (or explicit `--phases` selection). D
 - `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
 - `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 60)
 
+The `--build` flag reads repo paths from `config.sh` (`MCO_REPO_DIR`, `MCOA_REPO_DIR`), auto-increments the tag in `image-override.json`, builds with `$CONTAINER_ENGINE`, pushes to `$ACM_TOOLS_REGISTRY`, and applies the override before running tests.
+
 ### rs-collect-must-gather
 
 Gather and analyze a diagnostic bundle for right-sizing troubleshooting.

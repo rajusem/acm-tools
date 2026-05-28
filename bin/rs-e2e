@@ -60,6 +60,7 @@ CURRENT_MODE=""
 FORCE_MODE=""
 INITIAL_SPEC_HASHES=""
 MW_PR_COUNT=0
+RS_BINDING_TEST_NS="rs-binding-test"
 
 SKIP_UNINSTALL=false
 MODE_SWITCH=false
@@ -525,6 +526,22 @@ patch_rs_features() {
                     \"analytics\": {
                         \"namespaceRightSizingRecommendation\": {\"enabled\": $ns_enabled},
                         \"virtualizationRightSizingRecommendation\": {\"enabled\": $virt_enabled}
+                    }
+                }
+            }
+        }
+    }"
+}
+
+patch_rs_namespace_binding() {
+    local ns_binding="$1" virt_binding="$2"
+    $KUBE_CLI patch mco "$MCO_NAME" --type=merge -p "{
+        \"spec\": {
+            \"capabilities\": {
+                \"platform\": {
+                    \"analytics\": {
+                        \"namespaceRightSizingRecommendation\": {\"namespaceBinding\": \"$ns_binding\"},
+                        \"virtualizationRightSizingRecommendation\": {\"namespaceBinding\": \"$virt_binding\"}
                     }
                 }
             }
@@ -1258,6 +1275,81 @@ phase_2d() {
 }
 
 # =============================================================================
+# Phase 2e: NamespaceBinding change (MCO mode)
+# =============================================================================
+
+phase_2e() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
+
+    log_substep "Ensuring both RS features enabled"
+    patch_rs_features true true
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "baseline resource creation" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Creating test namespace $RS_BINDING_TEST_NS"
+    $KUBE_CLI create namespace "$RS_BINDING_TEST_NS" 2>/dev/null || true
+
+    log_substep "Patching namespaceBinding to $RS_BINDING_TEST_NS"
+    patch_rs_namespace_binding "$RS_BINDING_TEST_NS" "$RS_BINDING_TEST_NS"
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resources in new namespace" \
+        resource_exists placement rs-placement "$RS_BINDING_TEST_NS" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resources in new namespace" \
+        resource_exists placement rs-virt-placement "$RS_BINDING_TEST_NS" || true
+
+    log_substep "Verifying resources exist in $RS_BINDING_TEST_NS"
+    assert_exists placement rs-placement "$RS_BINDING_TEST_NS" || ((errors++)) || true
+    assert_exists placement rs-virt-placement "$RS_BINDING_TEST_NS" || ((errors++)) || true
+    assert_exists policy rs-prom-rules-policy "$RS_BINDING_TEST_NS" || ((errors++)) || true
+    assert_exists policy rs-virt-prom-rules-policy "$RS_BINDING_TEST_NS" || ((errors++)) || true
+    assert_exists placementbinding rs-policyset-binding "$RS_BINDING_TEST_NS" || ((errors++)) || true
+    assert_exists placementbinding rs-virt-policyset-binding "$RS_BINDING_TEST_NS" || ((errors++)) || true
+
+    log_substep "Verifying resources cleaned up from $GLOBAL_SET_NAMESPACE"
+    assert_not_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placementbinding rs-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists placementbinding rs-virt-policyset-binding "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Verifying ConfigMaps unchanged in $OBS_NAMESPACE"
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Resetting namespaceBinding to default"
+    patch_rs_namespace_binding "" ""
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "resources restored in default namespace" \
+        resource_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virt resources restored in default namespace" \
+        resource_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || true
+
+    log_substep "Verifying resources restored in $GLOBAL_SET_NAMESPACE"
+    assert_exists placement rs-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists placement rs-virt-placement "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Verifying resources absent from $RS_BINDING_TEST_NS"
+    assert_not_exists placement rs-placement "$RS_BINDING_TEST_NS" || ((errors++)) || true
+    assert_not_exists placement rs-virt-placement "$RS_BINDING_TEST_NS" || ((errors++)) || true
+
+    log_substep "Cleaning up test namespace"
+    $KUBE_CLI delete namespace "$RS_BINDING_TEST_NS" --ignore-not-found 2>/dev/null || true
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed during namespaceBinding change"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 # Phase 3: Spoke Validation
 # =============================================================================
 
@@ -1268,6 +1360,19 @@ phase_3() {
     ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
     if [[ "$CURRENT_MODE" == "mco" ]]; then
+        log_substep "Waiting for Policy compliance (may need time after prior phases)"
+        local compliant=false
+        for i in $(seq 1 24); do
+            local compliance
+            compliance=$($KUBE_CLI get policy rs-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" \
+                -o jsonpath='{.status.compliant}' 2>/dev/null || echo "")
+            if [[ "$compliance" == "Compliant" ]]; then
+                compliant=true
+                break
+            fi
+            sleep 5
+        done
+
         log_substep "Checking PlacementDecisions"
         local pd_clusters
         pd_clusters=$($KUBE_CLI get placementdecision -n "$GLOBAL_SET_NAMESPACE" \
@@ -1281,12 +1386,12 @@ phase_3() {
         fi
 
         log_substep "Checking Policy compliance"
-        local compliance
-        compliance=$($KUBE_CLI get policy rs-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" \
-            -o jsonpath='{.status.compliant}' 2>/dev/null || echo "")
-        if [[ "$compliance" == "Compliant" ]]; then
+        if [[ "$compliant" == "true" ]]; then
             log_success "  Policy rs-prom-rules-policy: Compliant"
         else
+            local compliance
+            compliance=$($KUBE_CLI get policy rs-prom-rules-policy -n "$GLOBAL_SET_NAMESPACE" \
+                -o jsonpath='{.status.compliant}' 2>/dev/null || echo "")
             log_error "  Policy rs-prom-rules-policy: ${compliance:-unknown}"
             ((errors++)) || true
         fi
@@ -2014,6 +2119,65 @@ phase_9d() {
 }
 
 # =============================================================================
+# Phase 9e: NamespaceBinding change (MCOA mode)
+# =============================================================================
+
+phase_9e() {
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
+
+    log_substep "Ensuring both RS features enabled"
+    patch_rs_features true true
+
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "MCOA configmap creation" \
+        resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+
+    log_substep "Creating test namespace $RS_BINDING_TEST_NS"
+    $KUBE_CLI create namespace "$RS_BINDING_TEST_NS" 2>/dev/null || true
+
+    log_substep "Patching namespaceBinding to $RS_BINDING_TEST_NS"
+    patch_rs_namespace_binding "$RS_BINDING_TEST_NS" "$RS_BINDING_TEST_NS"
+
+    wait_for_reconcile 30 "MCO reconcile after binding change"
+
+    log_substep "Verifying no Policies in $RS_BINDING_TEST_NS (MCOA mode)"
+    assert_not_exists policy rs-prom-rules-policy "$RS_BINDING_TEST_NS" || ((errors++)) || true
+    assert_not_exists policy rs-virt-prom-rules-policy "$RS_BINDING_TEST_NS" || ((errors++)) || true
+
+    log_substep "Verifying no Policies in $GLOBAL_SET_NAMESPACE (MCOA mode)"
+    assert_not_exists policy rs-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+    assert_not_exists policy rs-virt-prom-rules-policy "$GLOBAL_SET_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Verifying ManifestWork PrometheusRules unaffected"
+    count_mw_prometheusrules || true
+    if [[ $MW_PR_COUNT -gt 0 ]]; then
+        log_success "  ManifestWorks: $MW_PR_COUNT RS PrometheusRule(s) (unaffected)"
+    else
+        log_warn "  ManifestWorks: 0 RS PrometheusRules (MCOA may not have generated them — not a binding issue)"
+    fi
+
+    log_substep "Verifying ConfigMaps unchanged in $OBS_NAMESPACE"
+    assert_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
+
+    log_substep "Resetting namespaceBinding to default"
+    patch_rs_namespace_binding "" ""
+
+    log_substep "Cleaning up test namespace"
+    $KUBE_CLI delete namespace "$RS_BINDING_TEST_NS" --ignore-not-found 2>/dev/null || true
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed during MCOA namespaceBinding change"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 # Phase 4 & 10: ConfigMap Propagation
 # =============================================================================
 
@@ -2477,6 +2641,7 @@ main() {
     run_phase "2b"  "Swap features (ns on, virt off)" phase_2b
     run_phase "2c"  "Disable both features"           phase_2c
     run_phase "2d"  "Re-enable both features"         phase_2d
+    run_phase "2e"  "NamespaceBinding change (MCO)"   phase_2e
     run_phase "3"   "Spoke validation"                phase_3
     run_phase "4"   "ConfigMap propagation (MCO)"     phase_4
     run_phase "4a"  "ConfigMap coexistence (MCO+MCOA)" phase_4a
@@ -2488,6 +2653,7 @@ main() {
     run_phase "9b"  "Swap features (MCOA)"            phase_9b
     run_phase "9c"  "Disable both (MCOA)"             phase_9c
     run_phase "9d"  "Re-enable both (MCOA)"           phase_9d
+    run_phase "9e"  "NamespaceBinding change (MCOA)"  phase_9e
     run_phase "10"  "ConfigMap propagation (MCOA)"    phase_10
     run_phase "11"  "MCOA -> MCO switch"              phase_11
     run_phase "12"  "Version mismatch"                phase_12

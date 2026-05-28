@@ -227,6 +227,7 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 2b | Swap features | Swaps to namespace on + virt off — verifies namespace resources restored and virt resources deleted. |
 | 2c | Disable both | Disables both RS features — verifies all RS resources cleaned up. |
 | 2d | Re-enable both | Re-enables both features — verifies full resource restoration. |
+| 2e | NamespaceBinding change (MCO) | Patches `namespaceBinding` to a test namespace — verifies all 6 Policy resources (Placements, Policies, PlacementBindings) move to new namespace and are cleaned up from default. Resets binding and verifies resources return. ConfigMaps unaffected (always in observability namespace). |
 | 3 | Spoke validation | Checks PlacementDecisions select managed clusters, verifies PrometheusRules exist on spokes (hub-side ManifestWork check + direct spoke `--context` check). |
 | 4 | ConfigMap propagation (MCO) | Modifies `rs-namespace-config` ConfigMap (recommendationPercentage 110→120), verifies Policy updates with new value, then reverts. Tests MCO's ConfigMap→Policy pipeline. |
 | 4a | ConfigMap coexistence (MCO+MCOA) | Enables incident detection to trigger MCOA deployment while RS stays in MCO mode. Verifies RS ConfigMaps survive, no ManifestWork PrometheusRules or Perses dashboards created, and ADC `rightSizingDelegated=false`. Tests delegation signal. |
@@ -243,6 +244,7 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 9b | Swap features (MCOA) | Same as 2b but in MCOA mode — verifies MCOA handles feature swap. Also verifies namespace dashboard present and 3 virt dashboards removed. |
 | 9c | Disable both (MCOA) | Same as 2c but in MCOA mode — verifies MCOA cleans up all RS resources and all 4 Perses dashboards are absent. Placements may persist due to addon framework InstallStrategy (logged as warning, not failure). |
 | 9d | Re-enable both (MCOA) | Same as 2d but in MCOA mode — verifies MCOA restores all RS resources including ManifestWorks and all 4 Perses dashboards. |
+| 9e | NamespaceBinding change (MCOA) | Patches `namespaceBinding` in MCOA mode — verifies no Policies created in either namespace (MCOA uses ManifestWorks, not Policies). Verifies ManifestWorks and ConfigMaps unaffected. |
 | 10 | ConfigMap propagation (MCOA) | Same as phase 4 but in MCOA mode — modifies ConfigMap, verifies ManifestWork PrometheusRules update with new value. Tests MCOA's ConfigMap→ManifestWork pipeline. |
 
 **Group 3: Mode round-trip tests** (`--mode-switch` required)

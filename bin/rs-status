@@ -90,6 +90,14 @@ show_status() {
     echo -e "    ${ns_icon}Namespace:       $ns_enabled${NC}"
     echo -e "    ${virt_icon}Virtualization:  $virt_enabled${NC}"
 
+    local ns_binding virt_binding
+    ns_binding=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath='{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.namespaceBinding}' 2>/dev/null || echo "")
+    virt_binding=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath='{.spec.capabilities.platform.analytics.virtualizationRightSizingRecommendation.namespaceBinding}' 2>/dev/null || echo "")
+    echo -e "    NS Binding:      ${ns_binding:-(default: $GLOBAL_SET_NAMESPACE)}"
+    echo -e "    Virt Binding:    ${virt_binding:-(default: $GLOBAL_SET_NAMESPACE)}"
+
     # ── ADC (MCOA mode only) ──
     echo ""
     if [[ -n "$annotation" ]]; then

@@ -128,6 +128,16 @@ merge_pull_secret() {
     log_info "Cluster nodes will restart to pick up the new pull secret"
 }
 
+log_target_cluster() {
+    local api_url
+    api_url=$($KUBE_CLI cluster-info 2>/dev/null | grep -o 'https://[^ ]*' | head -1 || echo "unknown")
+    local context
+    context=$($KUBE_CLI config current-context 2>/dev/null || echo "unknown")
+    echo -e "${BOLD}Target Cluster:${NC} $api_url"
+    echo -e "${BOLD}Context:${NC}        $context"
+    echo ""
+}
+
 copy_pull_secret_to_namespace() {
     local target_ns="$1"
     log_substep "Copying pull secret to namespace: $target_ns"
@@ -208,6 +218,7 @@ do_install() {
         mce_channel_source="user-provided"
     fi
 
+    log_target_cluster
     log_step "Installing ACM"
     log_info "ACM Version:  $ACM_VERSION"
     log_info "ACM Channel:  $ACM_CHANNEL"
@@ -342,8 +353,9 @@ EOF
     # 4. Verify channel exists in catalog before creating Subscription
     log_substep "Verifying channel '$ACM_CHANNEL' exists in $ACM_SOURCE"
     local available_channels
-    available_channels=$($KUBE_CLI get packagemanifest advanced-cluster-management \
-        -n openshift-marketplace -o jsonpath='{.status.channels[*].name}' 2>/dev/null || echo "")
+    available_channels=$($KUBE_CLI get packagemanifest -n openshift-marketplace \
+        -l "catalog=$ACM_SOURCE,catalog-namespace=$ACM_SOURCE_NS" \
+        -o jsonpath='{.items[?(@.metadata.name=="advanced-cluster-management")].status.channels[*].name}' 2>/dev/null || echo "")
     if [[ -n "$available_channels" ]] && ! echo "$available_channels" | tr ' ' '\n' | grep "^${ACM_CHANNEL}$" >/dev/null; then
         if [[ "$apply_catalog" == "true" ]]; then
             # Dev catalogs may not have the release-X.Y channel yet; use the highest available
@@ -481,6 +493,7 @@ do_uninstall() {
         esac
     done
 
+    log_target_cluster
     log_step "Uninstalling ACM"
 
     # Remove managed clusters if --force-remove (MCH webhook blocks deletion if ManagedClusters exist)
@@ -551,6 +564,7 @@ do_uninstall() {
 }
 
 do_status() {
+    log_target_cluster
     log_step "ACM Installation Status"
     echo ""
 

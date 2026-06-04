@@ -1154,7 +1154,7 @@ phase_1() {
     verify_all_rs_resources_exist "$CURRENT_MODE" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="ConfigMap(s) not found (MCOA deletes MCO-created ConfigMaps)"
+        PHASE_FAIL_REASON="RS resource verification failed — see errors above"
         return 1
     fi
     return 0
@@ -1189,7 +1189,7 @@ phase_2a() {
     assert_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="Retained virt ConfigMap missing (MCOA create-delete loop)"
+        PHASE_FAIL_REASON="Feature toggle verification failed — see errors above"
         return 1
     fi
     return 0
@@ -1222,7 +1222,7 @@ phase_2b() {
     assert_not_exists configmap rs-virt-config "$OBS_NAMESPACE" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="Restored namespace ConfigMap missing (MCOA create-delete loop)"
+        PHASE_FAIL_REASON="Feature toggle verification failed — see errors above"
         return 1
     fi
     return 0
@@ -1268,7 +1268,7 @@ phase_2d() {
     verify_all_rs_resources_exist "mco" || ((errors++)) || true
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="ConfigMap(s) not found after re-enable (MCOA create-delete loop)"
+        PHASE_FAIL_REASON="RS resource verification failed — see errors above"
         return 1
     fi
     return 0
@@ -1409,7 +1409,20 @@ phase_3() {
 
     log_substep "Checking spoke PrometheusRules directly"
     local spoke_checked=false
+    local -a spoke_contexts=()
+    local managed_clusters
+    managed_clusters=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     for ctx_name in "$NAMESPACE_SPOKE_CONTEXT" "$VM_SPOKE_CONTEXT"; do
+        local cluster_name="$ctx_name"
+        if [[ -n "$managed_clusters" ]] && ! echo "$managed_clusters" | tr ' ' '\n' | grep -x "$cluster_name" >/dev/null 2>&1; then
+            continue
+        fi
+        spoke_contexts+=("$ctx_name")
+    done
+    if [[ ${#spoke_contexts[@]} -eq 0 ]]; then
+        log_info "  No matching spoke contexts found among managed clusters: $managed_clusters"
+    fi
+    for ctx_name in "${spoke_contexts[@]}"; do
         log_info "  Checking spoke $ctx_name..." >&2
         if $KUBE_CLI --context="$ctx_name" cluster-info --request-timeout=10s &>/dev/null 2>&1; then
             local pr_count

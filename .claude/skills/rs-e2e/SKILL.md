@@ -51,6 +51,7 @@ If phases fail, diagnose using the troubleshooting tables below and attempt a fi
   - Spoke `Available: Unknown` → `add-managed-cluster add <spoke> --force-import --sync-pull-secret`
   - MCO not installed → `setup-observability install`
   - Stuck ManifestWorks on local-cluster → `setup-observability install --force-cleanup-mw`
+  - MCO operator at 0 replicas → `oc scale deploy multicluster-observability-operator -n open-cluster-management --replicas=1`
   - Stale operator state → restart the relevant operator pod
 - **Stop immediately** on unrecoverable failures: cluster API unreachable (powered off/wrong kubeconfig context), no credentials, no `oc`/`kubectl` in PATH
 - Do NOT retry the same fix twice — if the first fix didn't work, try a different approach or stop
@@ -132,6 +133,7 @@ When a phase fails, use the `PHASE_FAIL_REASON` in the output to guide diagnosis
 | `Cluster unreachable` | Kubeconfig context wrong or cluster down | `oc --context=hub cluster-info` |
 | `ACM not installed` | No MCH on the cluster | `bin/install-custom-acm` |
 | `MCO not Ready after Xs` | MCO stuck installing — check conditions | `oc get mco observability -o jsonpath='{.status.conditions}'` |
+| `MCO not Ready after Xs` | MCO operator not running (0 replicas) | `oc get deploy multicluster-observability-operator -n open-cluster-management` — scale back to 1 if needed |
 | `local-cluster not available` | Registration agent stale after hub change | `bin/add-managed-cluster add hub --force-import` |
 | `No managed clusters found` | ManagedCluster resources missing | `oc get managedcluster` |
 | `MCO image override not applied` | MCH in Pending state blocks reconciliation | Check `bin/image-override apply`, patch deployment directly |
@@ -140,8 +142,9 @@ When a phase fails, use the `PHASE_FAIL_REASON` in the output to guide diagnosis
 
 | Fail reason | Root cause | Diagnosis |
 |-------------|-----------|-----------|
-| `ConfigMap(s) not found (MCOA deletes MCO-created ConfigMaps)` | MCOA create-delete loop — delegation signal broken | Check ADC `rightSizingDelegated` value and MCOA logs |
-| `Retained virt ConfigMap missing (MCOA create-delete loop)` | Same as above — ConfigMaps deleted between feature toggles | `oc get cm rs-namespace-config rs-virt-config -n open-cluster-management-observability` |
+| `RS resource verification failed` | Resources missing — operator may not be running | Check operator replicas: `oc get deploy multicluster-observability-operator -n open-cluster-management`. If 0, scale to 1 and retry |
+| `RS resource verification failed` | MCOA create-delete loop — delegation signal broken | Check ADC `rightSizingDelegated` value and MCOA logs |
+| `Feature toggle verification failed` | Resources missing after feature toggle — operator not reconciling | Check operator pod status and logs. If operator is down or crashlooping, fix it first |
 | `Baseline RS ConfigMaps missing` | MCO hasn't created ConfigMaps yet | Wait for MCO reconciliation or check MCO Ready status |
 
 ### Mode switch issues
@@ -157,7 +160,7 @@ When a phase fails, use the `PHASE_FAIL_REASON` in the output to guide diagnosis
 | Fail reason | Root cause | Diagnosis |
 |-------------|-----------|-----------|
 | `Policy already exists` | Stale Policy from previous test run | Delete Policy manually in `open-cluster-management-global-set` |
-| `ConfigMap change not propagated to Policy` | MCO didn't regenerate Policy after ConfigMap update | Check MCO operator logs, restart if needed |
+| `ConfigMap change not propagated to Policy` | MCO didn't regenerate Policy after ConfigMap update | Read ConfigMap data directly (`oc get cm rs-namespace-config -n open-cluster-management-observability -o yaml`) — if data is corrupted/invalid, fix the ConfigMap first. Otherwise check MCO operator logs, restart if needed |
 | `ConfigMap change not propagated to ManifestWork` | MCOA didn't regenerate ManifestWork | Check MCOA logs and MCA specHash |
 | `MCOA leaked RS resources in MCO mode` | Phase 4a — MCOA created RS resources when `rightSizingDelegated=false` | Code bug — delegation guard not working |
 
@@ -166,6 +169,9 @@ When a phase fails, use the `PHASE_FAIL_REASON` in the output to guide diagnosis
 ```bash
 # Check rs-status for full dashboard
 bin/rs-status
+
+# Check MCO operator deployment status (first thing to check for any failure)
+oc get deploy multicluster-observability-operator -n open-cluster-management
 
 # Check MCO operator logs
 oc logs deploy/multicluster-observability-operator -n open-cluster-management --tail=50

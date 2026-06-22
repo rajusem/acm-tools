@@ -69,6 +69,8 @@ IMAGE_OVERRIDE_ONLY=false
 SELECTED_PHASES=""
 AUTO_CONFIRM=false
 SKIP_PERSES_CHECK=false
+CAPTURED_COO_VERSION=""
+CAPTURED_PERSES_IMAGE=""
 
 RESULT_IDS=()
 RESULT_NAMES=()
@@ -342,6 +344,15 @@ verify_perses_dashboards() {
         fi
     fi
     log_success "  COO installed"
+
+    if [[ -z "$CAPTURED_COO_VERSION" ]]; then
+        CAPTURED_COO_VERSION=$($KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | \
+            awk '/^cluster-observability-operator/{sub(/cluster-observability-operator\./,"",$1); print $1; exit}')
+        local coo_ns="openshift-cluster-observability-operator"
+        CAPTURED_PERSES_IMAGE=$($KUBE_CLI get pods -n "$coo_ns" --no-headers \
+            -o custom-columns="NAME:.metadata.name,IMAGE:.spec.containers[0].image" 2>/dev/null | \
+            awk '/^perses-/{print $2; exit}')
+    fi
 
     log_substep "Waiting for Perses dashboards to converge"
     if [[ "$ns_enabled" == "true" ]]; then
@@ -2519,23 +2530,24 @@ print_summary() {
     cluster_url=$($KUBE_CLI cluster-info 2>/dev/null | head -1 | awk '{print $NF}' || echo "unknown")
     local mc_count
     mc_count=$($KUBE_CLI get managedcluster --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-    local mc_names
-    mc_names=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "none")
+    local mc_details=""
+    if [[ "$mc_count" -gt 0 ]]; then
+        mc_details=$($KUBE_CLI get managedcluster \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.openshiftVersion}{"\t"}{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}{"\t"}{.spec.managedClusterClientConfigs[0].url}{"\n"}{end}' \
+            2>/dev/null || echo "")
+    fi
     local acm_version
     acm_version=$($KUBE_CLI get mch multiclusterhub -n "$ACM_NAMESPACE" \
         -o jsonpath='{.status.currentVersion}' 2>/dev/null || echo "unknown")
-    local current_mode
-    current_mode=$(get_current_mode 2>/dev/null || echo "unknown")
     local mco_image
     mco_image=$($KUBE_CLI get pod -n "$ACM_NAMESPACE" \
         -l name=multicluster-observability-operator \
         -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "unknown")
     local mcoa_image=""
-    # Priority 1: local image-override.json (active custom override)
-    local override_json="$SCRIPT_DIR/../image-override.json"
-    if [[ -f "$override_json" ]]; then
-        mcoa_image=$(jq -r '.[] | select(.["image-key"]=="multicluster_observability_addon") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' "$override_json" 2>/dev/null || echo "")
-    fi
+    # Priority 1: actual running MCOA addon-manager pod on the cluster
+    mcoa_image=$($KUBE_CLI get pod -n "$OBS_NAMESPACE" \
+        -l app=multicluster-observability-addon-manager \
+        -o jsonpath='{.items[0].spec.containers[0].image}' 2>/dev/null || echo "")
     # Priority 2: mch-image-manifest ConfigMap (ACM source of truth)
     if [[ -z "$mcoa_image" ]]; then
         local manifest_cm
@@ -2548,12 +2560,34 @@ print_summary() {
     fi
     mcoa_image="${mcoa_image:-unknown}"
 
-    echo -e "  Cluster:          $cluster_url"
+    local coo_version="$CAPTURED_COO_VERSION"
+    local perses_image="$CAPTURED_PERSES_IMAGE"
+
+    echo -e "  Hub Cluster:      $cluster_url"
     echo -e "  ACM Version:      $acm_version"
-    echo -e "  Mode:             $current_mode"
-    echo -e "  Managed Clusters: $mc_count ($mc_names)"
+    if [[ -n "$coo_version" ]]; then
+        echo -e "  COO Version:      $coo_version"
+    fi
+    echo -e "  Managed Clusters: $mc_count"
+    if [[ -n "$mc_details" ]]; then
+        while IFS=$'\t' read -r mc_name mc_ocp mc_avail mc_url; do
+            if [[ -z "$mc_name" ]]; then continue; fi
+            local status_str="Available"
+            if [[ "$mc_avail" != "True" ]]; then status_str="Unavailable"; fi
+            local ocp_str=""
+            if [[ -n "$mc_ocp" ]]; then ocp_str="OCP $mc_ocp"; fi
+            if [[ "$mc_name" == "local-cluster" ]]; then
+                printf "    %-20s %-14s %s\n" "$mc_name" "$status_str" "$ocp_str"
+            else
+                printf "    %-20s %-14s %-12s %s\n" "$mc_name" "$status_str" "$ocp_str" "${mc_url:-}"
+            fi
+        done <<< "$mc_details"
+    fi
     echo -e "  MCO Image:        $mco_image"
     echo -e "  MCOA Image:       $mcoa_image"
+    if [[ -n "$perses_image" ]]; then
+        echo -e "  Perses Image:     $perses_image"
+    fi
     echo ""
 
     printf "  ${BOLD}%-6s %-42s %-8s %-8s %s${NC}\n" "ID" "Test" "Result" "Time" "Notes"

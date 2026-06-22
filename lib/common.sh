@@ -88,6 +88,62 @@ wait_with_message() {
     printf "\r%-80s\r" " " >&2
 }
 
+# Retry a command on transient API server errors (connection lost, timeout, etc.)
+# Usage: kube_retry <command...>
+# Stdout passes through unchanged (safe in pipes). Retries up to 3 times with
+# exponential backoff (2s, 4s, 8s) when stderr contains transient error patterns.
+kube_retry() {
+    local max_retries=3 attempt=0 rc=0
+    local stderr_file
+    stderr_file=$(mktemp) || return 1
+    while true; do
+        "$@" 2>"$stderr_file"
+        rc=$?
+        if [[ $rc -eq 0 ]]; then
+            cat "$stderr_file" >&2
+            rm -f "$stderr_file"
+            return 0
+        fi
+        if grep -qE 'connection lost|request canceled|Client\.Timeout|connection refused|TLS handshake timeout|unexpected EOF|server unavailable|transport is closing|connection reset' "$stderr_file" 2>/dev/null; then
+            attempt=$((attempt + 1))
+            if [[ $attempt -le $max_retries ]]; then
+                local delay=$((2 ** attempt))
+                log_warn "Transient API error (attempt $attempt/$max_retries), retrying in ${delay}s..." >&2
+                sleep "$delay"
+                continue
+            fi
+        fi
+        cat "$stderr_file" >&2
+        rm -f "$stderr_file"
+        return $rc
+    done
+}
+
+# Apply JSON content with retry on transient API errors.
+# Pipes content on each attempt so stdin is never exhausted.
+# Usage: kube_apply_json "$json_content"
+kube_apply_json() {
+    local content="$1"
+    local max_retries=3 attempt=0 rc stderr_file
+    stderr_file=$(mktemp) || return 1
+    while true; do
+        echo "$content" | $KUBE_CLI apply -f - 2>"$stderr_file"
+        rc=$?
+        if [[ $rc -eq 0 ]]; then
+            cat "$stderr_file" >&2; rm -f "$stderr_file"; return 0
+        fi
+        if grep -qE 'connection lost|request canceled|Client\.Timeout|connection refused|TLS handshake timeout|unexpected EOF|server unavailable|transport is closing|connection reset' "$stderr_file" 2>/dev/null; then
+            attempt=$((attempt + 1))
+            if [[ $attempt -le $max_retries ]]; then
+                local delay=$((2 ** attempt))
+                log_warn "Transient API error (attempt $attempt/$max_retries), retrying in ${delay}s..." >&2
+                sleep "$delay"; continue
+            fi
+        fi
+        cat "$stderr_file" >&2; rm -f "$stderr_file"; return $rc
+    done
+}
+
 # Check if a resource exists
 resource_exists() {
     local type="$1" name="$2" namespace="${3:-}"

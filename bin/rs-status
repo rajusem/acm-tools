@@ -313,7 +313,7 @@ show_status() {
 
         # Perses pod
         local perses_phase
-        perses_phase=$($KUBE_CLI get pods -n "$coo_ns" --no-headers 2>/dev/null | grep "^perses-" | awk '{print $3}' | head -1)
+        perses_phase=$($KUBE_CLI get pods -n "$coo_ns" --no-headers 2>/dev/null | awk '/^perses-/{print $3; exit}')
         if [[ "$perses_phase" == "Running" ]]; then
             echo -e "    ${GREEN}Perses pod: Running${NC}"
         elif [[ -n "$perses_phase" ]]; then

@@ -180,6 +180,58 @@ do_switch_mcoa() {
 
             if [[ "$perses_ready" == "true" ]]; then
                 log_success "Perses pod running"
+
+                # Wait for Perses dashboards to be created
+                log_substep "Waiting for Perses dashboards"
+                local rs_state
+                rs_state=$(get_rs_state)
+                local ns_on="${rs_state%%:*}"
+                local virt_on="${rs_state##*:}"
+                local expected_dashboards=0
+                [[ "$ns_on" == "true" ]] && ((expected_dashboards += 1))
+                [[ "$virt_on" == "true" ]] && ((expected_dashboards += 3))
+
+                if [[ "$expected_dashboards" -gt 0 ]]; then
+                    local dash_timeout=90
+                    local dash_ready=false
+                    for ((i=0; i<dash_timeout; i+=10)); do
+                        local dash_count
+                        dash_count=$($KUBE_CLI get persesdashboard -n "$ANALYTICS_NAMESPACE" --no-headers 2>/dev/null | grep -c "acm-rs\|acm-rightsizing" || true)
+                        if [[ "$dash_count" -ge "$expected_dashboards" ]]; then
+                            dash_ready=true
+                            break
+                        fi
+                        printf "\r  ${BLUE}Waiting for Perses dashboards (%d/%d, %ds/%ds)...${NC}  " "$dash_count" "$expected_dashboards" "$i" "$dash_timeout" >&2
+                        sleep 10
+                    done
+                    printf "\r%-80s\r" " " >&2
+
+                    if [[ "$dash_ready" == "true" ]]; then
+                        log_success "Perses dashboards ready ($expected_dashboards)"
+                    else
+                        log_warn "Perses dashboards not ready yet — check rs-status later"
+                    fi
+                fi
+
+                # Wait for UIPlugin
+                log_substep "Waiting for UIPlugin"
+                local uip_timeout=60
+                local uip_ready=false
+                for ((i=0; i<uip_timeout; i+=10)); do
+                    if $KUBE_CLI get uiplugin monitoring &>/dev/null; then
+                        uip_ready=true
+                        break
+                    fi
+                    printf "\r  ${BLUE}Waiting for UIPlugin (%ds/%ds)...${NC}  " "$i" "$uip_timeout" >&2
+                    sleep 10
+                done
+                printf "\r%-80s\r" " " >&2
+
+                if [[ "$uip_ready" == "true" ]]; then
+                    log_success "UIPlugin ready"
+                else
+                    log_warn "UIPlugin not found yet — check rs-status later"
+                fi
             else
                 log_warn "Perses pod not ready yet — check rs-status later"
             fi

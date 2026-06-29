@@ -4,8 +4,9 @@ Diagnose issues with ACM/MCO/MCE on the hub cluster. Systematically checks all l
 
 ## Workflow
 
-Run each diagnostic step, analyze output, then decide what to investigate next.
+Work through the diagnostic steps below in order. Analyze each step's output before moving to the next.
 Always check actual state first — never assume resource names or patterns.
+Once you identify a likely root cause, stop further diagnostics and propose the fix immediately — continuing to run steps delays the user. Only investigate further if the fix doesn't resolve it or the user asks for more depth.
 
 ### Step 1: Cluster overview
 
@@ -344,10 +345,8 @@ After gathering all data:
 
 ## Important notes
 
-- Default to `--context=hub` for hub diagnostics.
-- Use the spoke context for commands that explicitly repair or inspect spoke-side klusterlet resources.
+- Default to `--context=hub` for hub diagnostics; use the spoke context only for commands that explicitly repair or inspect spoke-side klusterlet resources.
 - Check actual state BEFORE proposing fixes
 - Never delete finalizers or force-delete without user confirmation
 - Common issues: stale leases, orphaned CRs, stuck MCA finalizers, missing CRDs
-- Use `--request-timeout=10s` instead of `timeout 10` (macOS lacks GNU timeout)
-- Use `grep ... >/dev/null` not `grep -q` in pipes with `set -o pipefail` (grep -q causes SIGPIPE/exit 141)
+- Propose the fix as soon as you find a likely root cause — do not run all steps first

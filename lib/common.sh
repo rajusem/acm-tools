@@ -182,6 +182,44 @@ GLOBAL_SET_NAMESPACE="open-cluster-management-global-set"
 RS_ANNOTATION="observability.open-cluster-management.io/right-sizing-capable"
 ANALYTICS_NAMESPACE="observability-analytics"
 
+# RS_RELEASE: set by --release flag, inherited from parent via export, or auto-detected.
+# The "${RS_RELEASE:-}" form is required for set -euo pipefail — referencing an unset
+# variable would exit immediately; this form preserves any value exported by a parent
+# process (e.g. rs-e2e → setup-observability) while defaulting to empty if unset.
+RS_RELEASE="${RS_RELEASE:-}"
+
+# detect_release — sets RS_RELEASE from MCH status.currentVersion.
+# Short-circuits if RS_RELEASE already set (--release flag or parent export wins).
+# Exports RS_RELEASE so subprocess calls (setup-observability, rs-mode-switch) inherit.
+# Must be called after init_acm_tools() (needs $KUBE_CLI and $ACM_NAMESPACE).
+detect_release() {
+    if [[ -n "$RS_RELEASE" ]]; then
+        [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || {
+            log_error "Inherited RS_RELEASE='$RS_RELEASE' is not a recognized release — set --release or unset RS_RELEASE"
+            exit 1
+        }
+        export RS_RELEASE; return
+    fi
+    local version major minor
+    version=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" \
+        '{.status.currentVersion}' 2>/dev/null || echo "")
+    major=$(echo "$version" | cut -d. -f1)
+    minor=$(echo "$version" | cut -d. -f2)
+    if   [[ "$major" == "5"  ]];                    then RS_RELEASE="5.0"
+    elif [[ "$major" == "2" && "$minor" == "17" ]]; then RS_RELEASE="2.17"
+    elif [[ "$major" == "2" && "$minor" == "16" ]]; then RS_RELEASE="2.16"
+    else
+        log_warn "MCH version '${version:-<not found>}' not recognized — defaulting to 2.17; use --release to override"
+        RS_RELEASE="2.17"
+    fi
+    export RS_RELEASE
+    log_info "Release: $RS_RELEASE (auto-detected from MCH $version)"
+}
+
+release_is_50()  { [[ "$RS_RELEASE" == "5.0"  ]]; }
+release_is_217() { [[ "$RS_RELEASE" == "2.17" ]]; }
+release_is_216() { [[ "$RS_RELEASE" == "2.16" ]]; }
+
 # Load config at source time (safe — no CLI dependency).
 # CLI detection is deferred to init_acm_tools so --help works without oc/kubectl.
 load_config

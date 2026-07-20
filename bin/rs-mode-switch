@@ -38,6 +38,8 @@ usage() {
 }
 
 get_current_mode() {
+    if release_is_50;  then echo "mcoa"; return; fi
+    if release_is_216; then echo "mco";  return; fi
     local annotation
     annotation=$(get_resource_field mco "$MCO_NAME" "" \
         "{.metadata.annotations.${RS_ANNOTATION//./\\.}}" || echo "")
@@ -58,6 +60,9 @@ get_rs_state() {
 }
 
 do_switch_mcoa() {
+    if release_is_50;  then log_info "ACM 5.0: Always MCOA — no switch needed"; return 0; fi
+    if release_is_216; then log_error "ACM 2.16 does not support MCOA mode"; exit 1; fi
+
     local no_wait=false
     [[ "${1:-}" == "--no-wait" ]] && no_wait=true
 
@@ -246,6 +251,9 @@ do_switch_mcoa() {
 }
 
 do_switch_mco() {
+    if release_is_50;  then log_error "ACM 5.0 does not support MCO (Policy-based) mode"; exit 1; fi
+    if release_is_216; then log_info "ACM 2.16: Already MCO — no switch needed"; do_status; return 0; fi
+
     local no_wait=false
     [[ "${1:-}" == "--no-wait" ]] && no_wait=true
 
@@ -566,12 +574,27 @@ do_status() {
 }
 
 # --- Main ---
-case "${1:-}" in
-    -h|--help|"") usage; exit 0 ;;
-esac
+# Parse --release before the command (may appear before or after the subcommand)
+_remaining_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release)
+            [[ -z "${2:-}" ]] && { log_error "--release requires 2.16, 2.17, or 5.0"; exit 1; }
+            RS_RELEASE="${2}"
+            [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || { log_error "--release must be 2.16, 2.17, or 5.0"; exit 1; }
+            shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        "") usage; exit 0 ;;
+        *) _remaining_args+=("$1"); shift ;;
+    esac
+done
+set -- "${_remaining_args[@]+"${_remaining_args[@]}"}"
+
+if [[ $# -eq 0 ]]; then usage; exit 0; fi
 
 init_acm_tools
 init_hub_context
+detect_release
 
 case "$1" in
     mcoa)    shift; do_switch_mcoa "$@" ;;

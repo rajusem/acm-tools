@@ -73,9 +73,15 @@ do_analyze() {
     if [[ -f "$mco_cr" ]]; then
         annotation=$(grep -A10 "annotations:" "$mco_cr" 2>/dev/null | \
             grep "right-sizing-capable" | awk '{print $2}' || true)
-        if [[ -n "$annotation" ]]; then
+
+        local mcoa_active=false
+        if   release_is_50;                               then mcoa_active=true
+        elif release_is_217 && [[ -n "$annotation" ]];    then mcoa_active=true
+        fi
+
+        if [[ "$mcoa_active" == "true" ]]; then
             mode="mcoa"
-        elif ! grep -q "command failed" "$mco_cr" 2>/dev/null; then
+        elif ! grep "command failed" "$mco_cr" >/dev/null 2>&1; then
             mode="mco"
         fi
     else
@@ -475,6 +481,7 @@ do_collect() {
 
     init_acm_tools
     init_hub_context
+    detect_release
 
     mkdir -p "$output_dir"/{hub/{logs,resources,manifests},spoke}
 
@@ -580,7 +587,7 @@ do_collect() {
     # --- ManifestWorks ---
     log_substep "ManifestWorks (all spokes)"
     for spoke_ns in $($KUBE_CLI get managedcluster -o name 2>/dev/null | sed 's|managedcluster.cluster.open-cluster-management.io/||'); do
-        for mw in $($KUBE_CLI get manifestwork -n "$spoke_ns" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN"); do
+        for mw in $($KUBE_CLI get manifestwork -n "$spoke_ns" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
             mw_basename=$(basename "$mw")
             collect "hub/manifests/${spoke_ns}_${mw_basename}.json" \
                 $KUBE_CLI get "$mw" -n "$spoke_ns" -o json
@@ -692,8 +699,12 @@ do_collect() {
 
         # Mode
         annotation=$(grep -A10 "annotations:" "$output_dir/hub/resources/mco-cr.yaml" 2>/dev/null | \
-            grep "right-sizing-capable" | awk '{print $2}' || echo "not found")
-        echo "Right-sizing mode: $(if [[ -n "$annotation" ]]; then echo "MCOA"; else echo "MCO"; fi) (MCO CR annotation: $annotation)"
+            grep "right-sizing-capable" | awk '{print $2}' || echo "")
+        local mcoa_active=false
+        if   release_is_50;                               then mcoa_active=true
+        elif release_is_217 && [[ -n "$annotation" ]];   then mcoa_active=true
+        fi
+        echo "Right-sizing mode: $(if [[ "$mcoa_active" == "true" ]]; then echo "MCOA"; else echo "MCO"; fi) (MCO CR annotation: $annotation)"
 
         # RS state
         echo ""
@@ -730,10 +741,18 @@ case "${1:-}" in
     -h|--help) usage; exit 0 ;;
     analyze)
         shift
+        # Support --release before the directory so offline analysis works without a cluster
+        if [[ "${1:-}" == "--release" ]]; then
+            [[ -z "${2:-}" ]] && { log_error "--release requires 2.16, 2.17, or 5.0"; exit 1; }
+            RS_RELEASE="${2}"
+            [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || { log_error "--release must be 2.16, 2.17, or 5.0"; exit 1; }
+            shift 2
+        fi
         if [[ $# -eq 0 ]]; then
-            log_error "Usage: $(basename "$0") analyze <must-gather-dir>"
+            log_error "Usage: $(basename "$0") analyze [--release 2.16|2.17|5.0] <must-gather-dir>"
             exit 1
         fi
+        [[ -z "$RS_RELEASE" ]] && log_warn "RS_RELEASE not set — use --release 2.16|2.17|5.0 for accurate MCOA analysis; defaulting to MCO classification"
         do_analyze "$1"
         exit 0
         ;;
@@ -757,6 +776,11 @@ while [[ $# -gt 0 ]]; do
         --log-lines)  LOG_LINES="$2"; shift 2 ;;
         --skip-spoke) SKIP_SPOKE=true; shift ;;
         --analyze)    RUN_ANALYZE=true; shift ;;
+        --release)
+            [[ -z "${2:-}" ]] && { log_error "--release requires 2.16, 2.17, or 5.0"; exit 1; }
+            RS_RELEASE="${2}"
+            [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || { log_error "--release must be 2.16, 2.17, or 5.0"; exit 1; }
+            shift 2 ;;
         -h|--help)    usage; exit 0 ;;
         *) log_error "Unknown option: $1"; usage; exit 1 ;;
     esac

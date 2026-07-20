@@ -98,6 +98,7 @@ Options:
   --build mco|mcoa|both  Build, push, and apply custom images before tests
   --image-override       Apply existing image-override.json (no build)
   --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a)
+  --release 2.16|2.17|5.0  ACM release (required when testing 5.0 images on a 2.17 cluster)
   --skip-perses-check    Skip COO/Perses dashboard verification
   --yes                  Auto-confirm destructive phases (no prompts)
   -h, --help             Show this help
@@ -110,8 +111,29 @@ Examples:
   $(basename "$0") --mode-switch
   $(basename "$0") --build mco --skip-uninstall
   $(basename "$0") --phases 0-3,5,13-16
+  $(basename "$0") --release 5.0 --skip-uninstall   # Test 5.0 images on 2.17 cluster
   $(basename "$0") --mode-switch --yes    # Full run, no prompts
 EOF
+}
+
+apply_release_phase_defaults() {
+    [[ -n "$SELECTED_PHASES" ]] && return   # --phases wins
+    if release_is_50; then
+        SELECTED_PHASES="0,0a,1,9a,9b,9c,9d,9e,10"
+    elif release_is_216; then
+        SELECTED_PHASES="$( [[ "$SKIP_UNINSTALL" == "true" ]] && \
+            echo "0,1,2a,2b,2c,2d,2e,3,4" || \
+            echo "0,1,2a,2b,2c,2d,2e,3,4,13" )"
+    else  # 2.17 — existing behavior
+        if [[ "$SKIP_UNINSTALL" == "true" ]]; then
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4a"
+        elif [[ "$MODE_SWITCH" == "false" ]]; then
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4,4a,13,14"
+        fi
+    fi
+    if [[ -n "$SELECTED_PHASES" ]]; then
+        SELECTED_PHASES=$(expand_phase_ranges "$SELECTED_PHASES")
+    fi
 }
 
 parse_args() {
@@ -129,24 +151,18 @@ parse_args() {
             --phases)
                 SELECTED_PHASES="${2:-}"
                 [[ -z "$SELECTED_PHASES" ]] && { log_error "--phases requires comma-separated list"; exit 1; }
+                SELECTED_PHASES=$(expand_phase_ranges "$SELECTED_PHASES")
+                shift 2 ;;
+            --release)
+                RS_RELEASE="${2:-}"
+                [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || {
+                    log_error "--release must be 2.16, 2.17, or 5.0"; exit 1; }
                 shift 2 ;;
             -h|--help) usage; exit 0 ;;
             mco|mcoa)  FORCE_MODE="$1"; shift ;;
             *) log_error "Unknown option: $1"; usage; exit 1 ;;
         esac
     done
-
-    if [[ -z "$SELECTED_PHASES" ]]; then
-        if [[ "$SKIP_UNINSTALL" == "true" ]]; then
-            SELECTED_PHASES="0,1,2a,2b,2c,2d,3,4a"
-        elif [[ "$MODE_SWITCH" == "false" ]]; then
-            SELECTED_PHASES="0,1,2a,2b,2c,2d,3,4,4a,13,14"
-        fi
-    fi
-
-    if [[ -n "$SELECTED_PHASES" ]]; then
-        SELECTED_PHASES=$(expand_phase_ranges "$SELECTED_PHASES")
-    fi
 }
 
 # =============================================================================
@@ -518,14 +534,12 @@ cleanup_stuck_mcoa_mw() {
 }
 
 get_current_mode() {
+    if release_is_50;  then echo "mcoa"; return; fi
+    if release_is_216; then echo "mco";  return; fi
     local annotation
     annotation=$(get_resource_field mco "$MCO_NAME" "" \
         "{.metadata.annotations.${RS_ANNOTATION//./\\.}}" || echo "")
-    if [[ -n "$annotation" ]]; then
-        echo "mcoa"
-    else
-        echo "mco"
-    fi
+    [[ -n "$annotation" ]] && echo "mcoa" || echo "mco"
 }
 
 patch_rs_features() {
@@ -562,6 +576,14 @@ patch_rs_namespace_binding() {
 
 ensure_mode() {
     local target="$1"
+    if release_is_50 && [[ "$target" == "mco" ]]; then
+        log_warn "ACM 5.0 is always MCOA — ignoring MCO switch request"
+        CURRENT_MODE="mcoa"; return 0
+    fi
+    if release_is_216; then
+        [[ "$target" != "mco" ]] && log_warn "ACM 2.16 is always MCO — mode switching not supported"
+        CURRENT_MODE="mco"; return 0
+    fi
     local current
     current=$(get_current_mode)
     if [[ "$current" == "$target" ]]; then
@@ -579,7 +601,8 @@ ensure_mode() {
             kube_retry $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY \
                 -n "$OBS_NAMESPACE" 2>/dev/null || true
             $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-                -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+                -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || \
+                log_warn "MCOA rollout status timed out — continuing"
             wait_for_reconcile 30 "Waiting for ManifestWork generation"
         fi
     else
@@ -629,9 +652,13 @@ ensure_mco_installed() {
 verify_adc_state() {
     local expected_ns="$1" expected_virt="$2"
     local errors=0
+    # Fall back to get_current_mode() so this function works when run in isolation
+    # (CURRENT_MODE is "" if no prior ensure_mode call set it in this process)
+    local effective_mode
+    effective_mode="${CURRENT_MODE:-$(get_current_mode)}"
 
     # In MCO mode, MCO syncs "disabled" to ADC so MCOA does not deploy RS via ManifestWork
-    if [[ "$CURRENT_MODE" == "mco" ]]; then
+    if [[ "$effective_mode" == "mco" ]]; then
         expected_ns="disabled"
         expected_virt="disabled"
     fi
@@ -641,7 +668,13 @@ verify_adc_state() {
         -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "")
 
     if [[ -z "$adc_json" ]]; then
-        if [[ "$CURRENT_MODE" == "mcoa" ]]; then
+        if [[ "$effective_mode" == "mcoa" ]]; then
+            # When both RS features are disabled, MCO tears down all MCOA resources
+            # (condition: !MCOAEnabled && !RightSizingEnabled). ADC deletion is expected.
+            if [[ "$expected_ns" == "disabled" && "$expected_virt" == "disabled" ]]; then
+                log_info "  ADC not found (expected: both RS disabled — MCO cleaned up MCOA resources)"
+                return 0
+            fi
             log_error "  ADC not found (expected in MCOA mode)"
             return 1
         fi
@@ -1132,6 +1165,148 @@ phase_0() {
 }
 
 # =============================================================================
+# Phase 0a: Auto-migration (5.0 only)
+# Simulates a 2.16→5.0 upgrade: pre-creates labeled legacy MCO Policy resources,
+# then triggers MCO analytics reconcile and verifies they are cleaned up.
+# ConfigMaps must survive (MCOA reuses them).
+# =============================================================================
+
+phase_0a() {
+    if ! release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM $RS_RELEASE (auto-migration test is 5.0-only)"
+        return 2
+    fi
+
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+
+    log_substep "Pre-creating labeled legacy MCO Policy resources (upgrade simulation)"
+    local label="observability.open-cluster-management.io/managed-by=analytics-rightsizing"
+    local ns="$GLOBAL_SET_NAMESPACE"
+
+    # policy/rs-prom-rules-policy
+    $KUBE_CLI apply -f - <<YAML || { PHASE_FAIL_REASON="Failed to create legacy policy"; return 1; }
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: rs-prom-rules-policy
+  namespace: $ns
+  labels:
+    observability.open-cluster-management.io/managed-by: analytics-rightsizing
+spec:
+  disabled: false
+  policy-templates: []
+YAML
+
+    # policy/rs-virt-prom-rules-policy
+    $KUBE_CLI apply -f - <<YAML || { PHASE_FAIL_REASON="Failed to create legacy virt policy"; return 1; }
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: rs-virt-prom-rules-policy
+  namespace: $ns
+  labels:
+    observability.open-cluster-management.io/managed-by: analytics-rightsizing
+spec:
+  disabled: false
+  policy-templates: []
+YAML
+
+    # placement/rs-placement and rs-virt-placement
+    for placement_name in rs-placement rs-virt-placement; do
+        $KUBE_CLI apply -f - <<YAML || { PHASE_FAIL_REASON="Failed to create legacy placement $placement_name"; return 1; }
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: $placement_name
+  namespace: $ns
+  labels:
+    observability.open-cluster-management.io/managed-by: analytics-rightsizing
+spec: {}
+YAML
+    done
+
+    # placementbindings: each binding references its own placement and policy
+    # bindingname:placementRef:policySubject
+    for pb_info in \
+        "rs-policyset-binding:rs-placement:rs-prom-rules-policy" \
+        "rs-virt-policyset-binding:rs-virt-placement:rs-virt-prom-rules-policy"; do
+        local pb_name="${pb_info%%:*}"
+        local pb_rest="${pb_info#*:}"
+        local pb_placement="${pb_rest%%:*}"
+        local pb_policy="${pb_rest##*:}"
+        $KUBE_CLI apply -f - <<YAML || { PHASE_FAIL_REASON="Failed to create legacy placementbinding $pb_name"; return 1; }
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: $pb_name
+  namespace: $ns
+  labels:
+    observability.open-cluster-management.io/managed-by: analytics-rightsizing
+placementRef:
+  name: $pb_placement
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+subjects:
+- name: $pb_policy
+  apiGroup: policy.open-cluster-management.io
+  kind: Policy
+YAML
+    done
+
+    # The analytics controller runs the legacy migration only once per process lifetime
+    # (migrationDone bool flag). Restart the operator pod to reset this flag and simulate
+    # an upgraded operator starting fresh against pre-existing legacy resources.
+    log_substep "Restarting MCO operator pod to trigger one-time migration (simulates post-upgrade start)"
+    $KUBE_CLI rollout restart deployment multicluster-observability-operator -n "$ACM_NAMESPACE" 2>/dev/null || true
+    $KUBE_CLI rollout status deployment multicluster-observability-operator -n "$ACM_NAMESPACE" \
+        --timeout="${TIMEOUT_ROLLOUT}s" || log_warn "  MCO rollout status timed out — continuing"
+
+    log_substep "Waiting for legacy Policy/Placement/PlacementBinding objects to be deleted"
+    local migration_ok=true
+    if ! wait_until "$TIMEOUT_E2E_RECONCILE" 5 "legacy policy migration" \
+        not_resource_exists policy rs-prom-rules-policy "$ns"; then
+        log_error "rs-prom-rules-policy still exists after migration timeout"
+        migration_ok=false
+        ((errors++)) || true
+    fi
+
+    for rtype_name in \
+        "policy:rs-virt-prom-rules-policy" \
+        "placement:rs-placement" \
+        "placement:rs-virt-placement" \
+        "placementbinding:rs-policyset-binding" \
+        "placementbinding:rs-virt-policyset-binding"; do
+        local rtype="${rtype_name%%:*}"
+        local rname="${rtype_name##*:}"
+        if ! wait_until 30 5 "$rtype/$rname deletion" not_resource_exists "$rtype" "$rname" "$ns"; then
+            log_error "$rtype $rname still exists after migration timeout"
+            migration_ok=false
+            ((errors++)) || true
+        fi
+    done
+
+    log_substep "Verifying ConfigMaps are NOT deleted (MCOA must reuse them)"
+    if ! wait_until 30 5 "configmap/rs-namespace-config present" \
+            resource_exists configmap rs-namespace-config "$OBS_NAMESPACE"; then
+        log_error "configmap rs-namespace-config was deleted during migration (should be preserved)"
+        ((errors++)) || true
+    fi
+    if ! wait_until 30 5 "configmap/rs-virt-config present" \
+            resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
+        log_error "configmap rs-virt-config was deleted during migration (should be preserved)"
+        ((errors++)) || true
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="Auto-migration verification failed — $errors error(s)"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
 # Phase 1: Baseline
 # =============================================================================
 
@@ -1176,6 +1351,10 @@ phase_1() {
 # =============================================================================
 
 phase_2a() {
+    if release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; equivalent: phase 9a)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1207,6 +1386,10 @@ phase_2a() {
 }
 
 phase_2b() {
+    if release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; equivalent: phase 9b)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1240,6 +1423,10 @@ phase_2b() {
 }
 
 phase_2c() {
+    if release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; equivalent: phase 9c)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1262,6 +1449,10 @@ phase_2c() {
 }
 
 phase_2d() {
+    if release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; equivalent: phase 9d)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1290,6 +1481,10 @@ phase_2d() {
 # =============================================================================
 
 phase_2e() {
+    if release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; equivalent: phase 9e)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1365,6 +1560,10 @@ phase_2e() {
 # =============================================================================
 
 phase_3() {
+    if release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; spoke validation via phase 8)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1466,6 +1665,10 @@ phase_3() {
 # =============================================================================
 
 phase_13() {
+    if release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (always MCOA; use phase 14 for MCOA-mode uninstall)"
+        return 2
+    fi
     if ! e2e_confirm "Phase 13 will DELETE the MCO CR (MCO mode). Continue?"; then
         PHASE_SKIP_REASON="user declined"
         return 2
@@ -1493,6 +1696,10 @@ phase_13() {
 }
 
 phase_14() {
+    if release_is_216 || release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM $RS_RELEASE (annotation-based MCOA uninstall is 2.17-only)"
+        return 2
+    fi
     if ! e2e_confirm "Phase 14 will reinstall MCO, switch to MCOA, then delete again. Continue?"; then
         PHASE_SKIP_REASON="user declined"
         return 2
@@ -1525,7 +1732,8 @@ phase_14() {
         log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
         kube_retry $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
         $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || \
+            log_warn "MCOA rollout status timed out — continuing"
         wait_for_reconcile 30 "Waiting for ManifestWork generation"
     fi
 
@@ -1569,6 +1777,10 @@ phase_14() {
 # =============================================================================
 
 phase_5() {
+    if release_is_50 || release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM $RS_RELEASE (fixed-mode release; no MCO→MCOA switch)"
+        return 2
+    fi
     if ! e2e_confirm "Phase 5 will switch to MCOA mode. Continue?"; then
         PHASE_SKIP_REASON="user declined"
         return 2
@@ -1599,7 +1811,8 @@ phase_5() {
         log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
         kube_retry $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
         $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || \
+            log_warn "MCOA rollout status timed out — continuing"
         wait_for_reconcile 30 "Waiting for ManifestWork generation"
     fi
 
@@ -1638,6 +1851,10 @@ phase_5() {
 }
 
 phase_11() {
+    if release_is_50 || release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM $RS_RELEASE (fixed-mode release; no MCOA→MCO switch)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1688,6 +1905,10 @@ phase_11() {
 # =============================================================================
 
 phase_12() {
+    if release_is_50 || release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM $RS_RELEASE (annotation-based version mismatch test only valid in 2.17)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1734,6 +1955,10 @@ phase_12() {
 # =============================================================================
 
 phase_6() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1830,6 +2055,10 @@ phase_6() {
 # =============================================================================
 
 phase_7() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1872,6 +2101,10 @@ phase_7() {
 # =============================================================================
 
 phase_8() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -1932,7 +2165,8 @@ PLACEMENTEOF
         log_substep "Restarting MCOA addon manager as fallback"
         kube_retry $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
         $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || \
+            log_warn "MCOA rollout status timed out — continuing"
         wait_for_reconcile 30 "Waiting for filtered ManifestWork generation"
     fi
 
@@ -1988,7 +2222,8 @@ DEFAULTEOF
         log_warn "MCOA did not auto-detect ConfigMap reset — restarting as fallback"
         kube_retry $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
         $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || \
+            log_warn "MCOA rollout status timed out — continuing"
         wait_for_reconcile 30 "Waiting for default ManifestWork generation"
     fi
 
@@ -2016,6 +2251,10 @@ DEFAULTEOF
 # =============================================================================
 
 phase_9a() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2048,6 +2287,10 @@ phase_9a() {
 }
 
 phase_9b() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2082,6 +2325,10 @@ phase_9b() {
 }
 
 phase_9c() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2113,6 +2360,10 @@ phase_9c() {
 }
 
 phase_9d() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2148,6 +2399,10 @@ phase_9d() {
 # =============================================================================
 
 phase_9e() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2207,6 +2462,10 @@ phase_9e() {
 # =============================================================================
 
 phase_4() {
+    if release_is_50; then
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; ConfigMap propagation via phase 10)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2249,6 +2508,10 @@ phase_4() {
 }
 
 phase_10() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2305,6 +2568,10 @@ phase_10() {
 # =============================================================================
 
 phase_4a() {
+    if release_is_50 || release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM $RS_RELEASE (MCO+MCOA coexistence only valid in 2.17)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2321,7 +2588,8 @@ phase_4a() {
 
     log_substep "Waiting for MCOA deployment"
     wait_until 120 10 "MCOA deployment" \
-        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" --timeout=5s || true
+        $KUBE_CLI rollout status deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" --timeout=5s \
+        || log_warn "MCOA deployment rollout timed out — continuing"
 
     if ! $KUBE_CLI get deployment "$MCOA_DEPLOY" -n "$OBS_NAMESPACE" &>/dev/null; then
         PHASE_FAIL_REASON="MCOA deployment not created after enabling incident detection"
@@ -2383,6 +2651,10 @@ phase_4a() {
 # =============================================================================
 
 phase_15() {
+    if release_is_50 || release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM $RS_RELEASE (MCOA reinstall test only valid in 2.17)"
+        return 2
+    fi
     if ! e2e_confirm "Phase 15 will delete MCO in MCOA mode and reinstall. Continue?"; then
         PHASE_SKIP_REASON="user declined"
         return 2
@@ -2456,6 +2728,10 @@ phase_15() {
 }
 
 phase_16() {
+    if release_is_50 || release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM $RS_RELEASE (mode switch after reinstall only valid in 2.17)"
+        return 2
+    fi
     local errors=0
 
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
@@ -2471,7 +2747,8 @@ phase_16() {
         log_warn "MCOA did not auto-reconcile after ADC change — restarting as fallback"
         kube_retry $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
         $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
-            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || true
+            -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || \
+            log_warn "MCOA rollout status timed out — continuing"
         wait_for_reconcile 30 "Waiting for ManifestWork generation"
     fi
 
@@ -2661,10 +2938,13 @@ main() {
 
     init_acm_tools
     init_hub_context
+    detect_release
+    apply_release_phase_defaults
 
     echo ""
     log_step "Right-Sizing E2E Validation"
     print_separator
+    log_info "Release: $RS_RELEASE"
     if [[ -n "$SELECTED_PHASES" ]]; then
         log_info "Selected phases: $SELECTED_PHASES"
     else
@@ -2686,6 +2966,7 @@ main() {
     #   Group 3: MCOA->MCO round-trip tests (3 switches)
     #   Group 4: Destructive tests — MCO deletion/reinstall (last)
     run_phase "0"   "Pre-flight checks"              phase_0
+    run_phase "0a"  "Auto-migration (legacy Policy cleanup)" phase_0a
     run_phase "1"   "Baseline resource verification"  phase_1
     run_phase "2a"  "Disable namespace RS only"       phase_2a
     run_phase "2b"  "Swap features (ns on, virt off)" phase_2b

@@ -84,3 +84,4 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 - Test `--help` / `-h` first (no cluster connection needed)
 - Test `status` subcommands before mutating ones
 - After script changes, verify with a real cluster — bash pitfalls often only manifest at runtime
+

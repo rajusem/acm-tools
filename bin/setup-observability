@@ -353,14 +353,20 @@ do_uninstall() {
     log_step "Removing MCO CR"
 
     if resource_exists mco "$MCO_NAME"; then
-        # Detect RS mode BEFORE deletion (MCO CR annotation is gone after delete)
-        local rs_mode="mco"
-        local annotation
-        # Dots in annotation key must be escaped for jsonpath
-        local escaped_annotation="${RS_ANNOTATION//./\\.}"
-        annotation=$(get_resource_field mco "$MCO_NAME" "" \
-            "{.metadata.annotations['${escaped_annotation}']}" 2>/dev/null || true)
-        [[ -n "$annotation" ]] && rs_mode="mcoa"
+        # Read RS mode BEFORE deletion — MCO CR annotation is gone after delete
+        local rs_mode
+        if release_is_50; then
+            rs_mode="mcoa"
+        elif release_is_216; then
+            rs_mode="mco"
+        else
+            local annotation
+            # Dots in annotation key must be escaped for jsonpath
+            local escaped_annotation="${RS_ANNOTATION//./\\.}"
+            annotation=$(get_resource_field mco "$MCO_NAME" "" \
+                "{.metadata.annotations['${escaped_annotation}']}" 2>/dev/null || true)
+            [[ -n "$annotation" ]] && rs_mode="mcoa" || rs_mode="mco"
+        fi
 
         if confirm "Delete MCO CR '$MCO_NAME'?"; then
             $KUBE_CLI delete mco "$MCO_NAME" --wait=true --timeout=120s
@@ -528,6 +534,7 @@ esac
 
 init_acm_tools
 init_hub_context
+detect_release
 
 case "${1:-install}" in
     install)    shift 2>/dev/null || true; do_install "$@" ;;

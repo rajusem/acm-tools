@@ -4,6 +4,7 @@ Run end-to-end validation of right-sizing resource lifecycle on the current clus
 
 ## Arguments (optional)
 
+- `--release 2.16|2.17|5.0` — ACM release (required when testing 5.0 custom images on a 2.17 cluster; auto-detected from MCH otherwise)
 - `--skip-uninstall` — Run phases 0-4a only, don't delete MCO at the end
 - `--mode-switch` — Also test MCO-to-MCOA mode switching (adds phases 5-12, 15-16)
 - `--build mco|mcoa|both` — Build, push, and apply custom image(s) before running tests
@@ -30,6 +31,8 @@ Run `bin/rs-e2e` with the appropriate flags. The script is fully automated and h
 | Deploy existing override then test | `bin/rs-e2e --image-override` |
 | Specific phases | `bin/rs-e2e --phases 0-3,5,9a` |
 | Force MCOA mode | `bin/rs-e2e mcoa` |
+| Test 5.0 images on 2.17 cluster | `bin/rs-e2e --release 5.0 --skip-uninstall` |
+| Test 2.16 behavior | `bin/rs-e2e --release 2.16 --skip-uninstall` |
 
 ### Execution
 
@@ -58,26 +61,35 @@ If phases fail, diagnose using the troubleshooting tables below and attempt a fi
 
 ### Phases reference
 
-| Phase | Test | Requires |
-|-------|------|----------|
-| 0 | Pre-flight (cluster state detection) | — |
-| 1 | Baseline resource verification | — |
-| 2a-2d | Feature toggle MCO (disable/swap/both/re-enable) | — |
-| 3 | Spoke PrometheusRule validation | — |
-| 4 | ConfigMap propagation (MCO) | — |
-| 4a | ConfigMap coexistence (MCO+MCOA) | — |
-| 5 | MCO → MCOA switch + Perses dashboards | `--mode-switch` |
-| 6 | SpecHash freshness after ADC change | `--mode-switch` |
-| 7 | ConfigMap predicate side-effect | `--mode-switch` |
-| 8 | Placement filter (cluster selection) | `--mode-switch` |
-| 9a-9d | Feature toggle MCOA + Perses dashboards | `--mode-switch` |
-| 10 | ConfigMap propagation (MCOA) | `--mode-switch` |
-| 11 | MCOA → MCO switch | `--mode-switch` |
-| 12 | Version mismatch (any annotation value) | `--mode-switch` |
-| 13 | Uninstall cleanup — MCO mode | Destructive (prompts) |
-| 14 | Uninstall cleanup — MCOA mode + Perses | Destructive (prompts) |
-| 15 | MCOA uninstall + reinstall | `--mode-switch`, destructive |
-| 16 | Mode switch after reinstall + Perses | `--mode-switch` |
+| Phase | Test | Requires | Releases |
+|-------|------|----------|----------|
+| 0 | Pre-flight (cluster state detection) | — | 2.16, 2.17, 5.0 |
+| 0a | Auto-migration (legacy Policy cleanup) | — | **5.0 only** |
+| 1 | Baseline resource verification | — | 2.16, 2.17, 5.0 |
+| 2a | Disable namespace RS (MCO) | — | 2.16, 2.17 |
+| 2b | Swap features (ns on, virt off) (MCO) | — | 2.16, 2.17 |
+| 2c | Disable both features (MCO) | — | 2.16, 2.17 |
+| 2d | Re-enable both features (MCO) | — | 2.16, 2.17 |
+| 2e | NamespaceBinding change (MCO) | — | 2.16, 2.17 |
+| 3 | Spoke PrometheusRule validation (MCO) | — | 2.16, 2.17 |
+| 4 | ConfigMap propagation (MCO) | — | 2.16, 2.17 |
+| 4a | ConfigMap coexistence (MCO+MCOA) | — | **2.17 only** |
+| 5 | MCO → MCOA switch + Perses dashboards | `--mode-switch` | **2.17 only** |
+| 6 | SpecHash freshness after ADC change | `--mode-switch` | 2.17, 5.0 |
+| 7 | ConfigMap predicate side-effect | `--mode-switch` | 2.17, 5.0 |
+| 8 | Placement filter (cluster selection) | `--mode-switch` | 2.17, 5.0 |
+| 9a | Disable namespace RS (MCOA) | `--mode-switch` | 2.17, 5.0 |
+| 9b | Swap features (MCOA) | `--mode-switch` | 2.17, 5.0 |
+| 9c | Disable both (MCOA) | `--mode-switch` | 2.17, 5.0 |
+| 9d | Re-enable both (MCOA) | `--mode-switch` | 2.17, 5.0 |
+| 9e | NamespaceBinding change (MCOA) | `--mode-switch` | 2.17, 5.0 |
+| 10 | ConfigMap propagation (MCOA) | `--mode-switch` | 2.17, 5.0 |
+| 11 | MCOA → MCO switch | `--mode-switch` | **2.17 only** |
+| 12 | Version mismatch (any annotation value) | `--mode-switch` | **2.17 only** |
+| 13 | Uninstall cleanup — MCO mode | Destructive (prompts) | 2.16, 2.17 |
+| 14 | Uninstall cleanup — MCOA mode + Perses | Destructive (prompts) | 2.17, 5.0 |
+| 15 | MCOA uninstall + reinstall | `--mode-switch`, destructive | **2.17 only** |
+| 16 | Mode switch after reinstall + Perses | `--mode-switch` | **2.17 only** |
 
 ## Troubleshooting failures
 

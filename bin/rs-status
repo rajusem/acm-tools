@@ -39,6 +39,11 @@ while [[ $# -gt 0 ]]; do
         --spoke)    SPOKE="$2"; SPOKE_FILTER_SET=true; shift 2 ;;
         --watch)    WATCH_MODE=true; shift ;;
         --json)     JSON_MODE=true; shift ;;
+        --release)
+            [[ -z "${2:-}" ]] && { log_error "--release requires 2.16, 2.17, or 5.0"; exit 1; }
+            RS_RELEASE="${2}"
+            [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || { log_error "--release must be 2.16, 2.17, or 5.0"; exit 1; }
+            shift 2 ;;
         -h|--help)  usage; exit 0 ;;
         *) log_error "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -62,18 +67,26 @@ show_status() {
     fi
 
     # ── Mode ──
-    local annotation
+    local annotation=""
     annotation=$($KUBE_CLI get mco "$MCO_NAME" \
         -o jsonpath="{.metadata.annotations.${RS_ANNOTATION//./\\.}}" 2>/dev/null || echo "")
 
-    local mode="MCO (Policy-based)"
-    local mode_color="$BLUE"
-    if [[ -n "$annotation" ]]; then
-        mode="MCOA (ManifestWork-based)"
-        mode_color="$GREEN"
+    local mcoa_active=false
+    if   release_is_50;                               then mcoa_active=true
+    elif release_is_217 && [[ -n "$annotation" ]];    then mcoa_active=true
     fi
-    echo -e "  Mode:  ${mode_color}${BOLD}$mode${NC}"
-    echo -e "  MCO CR: annotation=${annotation:-<not set>}"
+
+    local mode mode_color
+    if [[ "$mcoa_active" == "true" ]]; then
+        mode="MCOA (ManifestWork-based)"; mode_color="$GREEN"
+    else
+        mode="MCO (Policy-based)"; mode_color="$BLUE"
+    fi
+    echo -e "  Mode:    ${mode_color}${BOLD}$mode${NC}"
+    echo -e "  Release: ACM $RS_RELEASE"
+    if release_is_217; then
+        echo -e "  MCO CR:  annotation=${annotation:-<not set>}"
+    fi
 
     # ── MCO CR ──
     echo ""
@@ -100,7 +113,7 @@ show_status() {
 
     # ── ADC (MCOA mode only) ──
     echo ""
-    if [[ -n "$annotation" ]]; then
+    if [[ "$mcoa_active" == "true" ]]; then
         echo -e "${BOLD}  AddOnDeploymentConfig:${NC}"
         local adc_json
         adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" \
@@ -134,7 +147,7 @@ show_status() {
 
     # ── Mode-specific resources ──
     echo ""
-    if [[ -n "$annotation" ]]; then
+    if [[ "$mcoa_active" == "true" ]]; then
         # MCOA mode
         echo -e "${BOLD}  MCOA Resources:${NC}"
 
@@ -240,7 +253,7 @@ show_status() {
         if [[ "$SPOKE_FILTER_SET" == "true" && -z "${checked_contexts// }" ]]; then
             echo -e "    ${YELLOW}No managed cluster mapped to spoke context '$SPOKE'${NC}"
         fi
-        switch_context "$HUB_CONTEXT" &>/dev/null || true
+        switch_context "$HUB_CONTEXT" &>/dev/null || log_warn "Failed to restore hub context — subsequent output may be incorrect"
     fi
 
     # ── Operator Pods ──
@@ -281,7 +294,7 @@ show_status() {
         fi
     done
 
-    if [[ -n "$annotation" ]] || [[ "$mcoa_has_other_caps" == "true" ]]; then
+    if [[ "$mcoa_active" == "true" ]] || [[ "$mcoa_has_other_caps" == "true" ]]; then
         # MCOA should be running
         if [[ -n "$mcoa_pod_status" ]]; then
             echo -e "    ${GREEN}MCOA: $mcoa_pod_status${NC}"
@@ -298,7 +311,7 @@ show_status() {
     fi
 
     # ── COO + Perses ──
-    if [[ -n "$annotation" ]]; then
+    if [[ "$mcoa_active" == "true" ]]; then
         local coo_ns="openshift-cluster-observability-operator"
         echo ""
         echo -e "${BOLD}  Cluster Observability Operator (COO):${NC}"
@@ -354,7 +367,7 @@ show_status() {
 }
 
 show_status_json() {
-    local annotation ns_enabled virt_enabled ns_adc virt_adc
+    local annotation="" ns_enabled virt_enabled ns_adc virt_adc
 
     annotation=$($KUBE_CLI get mco "$MCO_NAME" \
         -o jsonpath="{.metadata.annotations.${RS_ANNOTATION//./\\.}}" 2>/dev/null || echo "")
@@ -363,16 +376,25 @@ show_status_json() {
     virt_enabled=$($KUBE_CLI get mco "$MCO_NAME" \
         -o jsonpath='{.spec.capabilities.platform.analytics.virtualizationRightSizingRecommendation.enabled}' 2>/dev/null || echo "null")
 
-    local adc_json
-    adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "{}")
-    ns_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformNamespaceRightSizing") | .value' 2>/dev/null || echo "null")
-    virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null || echo "null")
+    local mcoa_active=false
+    if   release_is_50;                               then mcoa_active=true
+    elif release_is_217 && [[ -n "$annotation" ]];    then mcoa_active=true
+    fi
 
     local mode="mco"
-    [[ -n "$annotation" ]] && mode="mcoa"
+    [[ "$mcoa_active" == "true" ]] && mode="mcoa"
+
+    ns_adc="null"; virt_adc="null"
+    if [[ "$mcoa_active" == "true" ]]; then
+        local adc_json
+        adc_json=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" -n "$OBS_NAMESPACE" -o json 2>/dev/null || echo "{}")
+        ns_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformNamespaceRightSizing") | .value' 2>/dev/null || echo "null")
+        virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null || echo "null")
+    fi
 
     jq -n \
         --arg mode "$mode" \
+        --arg release "$RS_RELEASE" \
         --arg annotation "$annotation" \
         --arg ns_enabled "$ns_enabled" \
         --arg virt_enabled "$virt_enabled" \
@@ -380,6 +402,7 @@ show_status_json() {
         --arg virt_adc "${virt_adc:-null}" \
         '{
             mode: $mode,
+            release: $release,
             annotation: $annotation,
             mco_cr: {
                 namespace_enabled: ($ns_enabled == "true"),
@@ -400,6 +423,7 @@ fi
 
 init_acm_tools
 init_hub_context
+detect_release
 
 if [[ "$WATCH_MODE" == "true" ]]; then
     while true; do

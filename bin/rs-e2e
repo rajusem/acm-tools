@@ -1299,6 +1299,10 @@ YAML
         ((errors++)) || true
     fi
 
+    log_substep "Verifying ADC reflects MCOA delegation after migration"
+    verify_adc_delegation "true" || ((errors++)) || true
+    verify_adc_state "enabled" "enabled" || ((errors++)) || true
+
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="Auto-migration verification failed — $errors error(s)"
         return 1
@@ -2274,6 +2278,7 @@ phase_9a() {
 
     log_substep "Checking ADC state"
     verify_adc_state "disabled" "enabled" || ((errors++)) || true
+    verify_adc_delegation "true" || ((errors++)) || true
 
     verify_perses_dashboards "false" "true" || ((errors++)) || true
 
@@ -2312,6 +2317,7 @@ phase_9b() {
 
     log_substep "Checking ADC state"
     verify_adc_state "enabled" "disabled" || ((errors++)) || true
+    verify_adc_delegation "true" || ((errors++)) || true
 
     verify_perses_dashboards "true" "false" || ((errors++)) || true
 
@@ -2347,6 +2353,7 @@ phase_9c() {
 
     log_substep "Checking ADC state"
     verify_adc_state "disabled" "disabled" || ((errors++)) || true
+    verify_adc_delegation "true" || ((errors++)) || true
 
     verify_no_perses_dashboards "mcoa" || ((errors++)) || true
 
@@ -2382,6 +2389,7 @@ phase_9d() {
 
     log_substep "Checking ADC state"
     verify_adc_state "enabled" "enabled" || ((errors++)) || true
+    verify_adc_delegation "true" || ((errors++)) || true
 
     verify_perses_dashboards "true" "true" || ((errors++)) || true
 

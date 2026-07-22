@@ -532,27 +532,28 @@ manifestwork_contains() {
 
 cleanup_stuck_mcoa_mw() {
     local cleaned=false
-    local mw_list
-    mw_list=$($KUBE_CLI get manifestwork -n local-cluster \
-        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' \
-        2>/dev/null || echo "")
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
 
-    while IFS=$'\t' read -r mw_name deletion_ts; do
-        [[ -z "$mw_name" || -z "$deletion_ts" ]] && continue
-        [[ "$mw_name" != *"$MCOA_MW_PATTERN"* ]] && continue
-        log_warn "  Removing finalizers from stuck ManifestWork: $mw_name (deleting since $deletion_ts)"
-        kube_retry $KUBE_CLI patch manifestwork "$mw_name" -n local-cluster \
-            --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
-        cleaned=true
-    done <<< "$mw_list"
+    for mc in $mc_list; do
+        local mw_list
+        mw_list=$($KUBE_CLI get manifestwork -n "$mc" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' \
+            2>/dev/null || echo "")
+
+        while IFS=$'\t' read -r mw_name deletion_ts; do
+            [[ -z "$mw_name" || -z "$deletion_ts" ]] && continue
+            [[ "$mw_name" != *"$MCOA_MW_PATTERN"* ]] && continue
+            log_warn "  Removing finalizers from stuck ManifestWork: $mc/$mw_name (deleting since $deletion_ts)"
+            kube_retry $KUBE_CLI patch manifestwork "$mw_name" -n "$mc" \
+                --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+            cleaned=true
+        done <<< "$mw_list"
+    done
 
     if [[ "$cleaned" == "true" ]]; then
         sleep 5
-        if $KUBE_CLI get manifestwork -n local-cluster -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" >/dev/null 2>&1; then
-            log_warn "  Some MCOA ManifestWorks still present after cleanup"
-        else
-            log_success "  Stuck ManifestWork(s) cleaned up"
-        fi
+        log_success "  Stuck ManifestWork(s) cleaned up"
     fi
 }
 
@@ -1972,7 +1973,7 @@ phase_5() {
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
     ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
-    log_substep "Cleaning up stuck ManifestWorks (local-cluster)"
+    log_substep "Cleaning up stuck ManifestWorks (all clusters)"
     cleanup_stuck_mcoa_mw
 
     log_substep "Enabling both RS features"

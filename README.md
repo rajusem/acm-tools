@@ -207,17 +207,19 @@ bin/rs-e2e                                   # Phases 0-4a, 13-14 (core tests)
 bin/rs-e2e --mode-switch                     # All phases 0-16 (includes MCOA mode switching)
 bin/rs-e2e --skip-uninstall                  # Phases 0-4a only (no MCO deletion)
 bin/rs-e2e --skip-uninstall --data-plane     # Control-plane + data-plane validation
+bin/rs-e2e --mode-switch --data-plane --yes  # All phases + data-plane, auto-confirm
+bin/rs-e2e --release 5.0 --data-plane --yes  # Test 5.0 images on 2.17 cluster + data-plane
+bin/rs-e2e --release 5.0 --skip-uninstall    # 5.0 control-plane only (phases 0,0a,1,9a-9e,10)
 bin/rs-e2e --phases 0-3,5,9a                 # Run specific phases (ranges OK)
 bin/rs-e2e --phases 17-22 --skip-vm          # Data-plane only, no VMs
 bin/rs-e2e --build mco                       # Build MCO image, then run tests
 bin/rs-e2e --build both                      # Build MCO + MCOA images, then run tests
 bin/rs-e2e --image-override                  # Apply image-override.json, then run tests
 bin/rs-e2e --skip-perses-check               # Skip COO/Perses dashboard verification
-bin/rs-e2e --mode-switch --yes               # All phases, auto-confirm destructive
 bin/rs-e2e mcoa                              # Force testing in MCOA mode
 ```
 
-Runs automated test phases that validate the full right-sizing resource lifecycle. Phases are grouped to minimize mode switches:
+Runs automated test phases that validate the full right-sizing resource lifecycle. The `--release` flag overrides the auto-detected ACM version (from MCH), allowing you to test 5.0 custom images on a 2.17 cluster — each release selects a different default phase set (2.16: MCO-only, 2.17: MCO+MCOA, 5.0: MCOA-only). Phases are grouped to minimize mode switches:
 
 **Group 1: MCO-mode tests** (default run)
 

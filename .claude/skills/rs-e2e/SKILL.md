@@ -10,6 +10,9 @@ Run end-to-end validation of right-sizing resource lifecycle on the current clus
 - `--build mco|mcoa|both` — Build, push, and apply custom image(s) before running tests
 - `--image-override` — Apply existing `image-override.json` without building
 - `--phases 0-3,5,9a` — Run specific phases (comma-separated, ranges OK)
+- `--data-plane` — Include data-plane validation phases 17-22 (deploy workloads, wait for Thanos metrics, validate)
+- `--skip-vm` — Skip VM workload phases (18, 21)
+- `--no-metrics-wait` — Skip the 20-minute metrics collection wait (phase 19)
 - `--skip-perses-check` — Skip COO/Perses dashboard verification
 - `--yes` — Auto-confirm destructive phases (13, 14, 15)
 - `mco` or `mcoa` — Force testing a specific mode (default: auto-detect)
@@ -32,7 +35,11 @@ Run `bin/rs-e2e` with the appropriate flags. The script is fully automated and h
 | Specific phases | `bin/rs-e2e --phases 0-3,5,9a` |
 | Force MCOA mode | `bin/rs-e2e mcoa` |
 | Test 5.0 images on 2.17 cluster | `bin/rs-e2e --release 5.0 --skip-uninstall` |
+| Test 5.0 with data-plane + VMs | `bin/rs-e2e --release 5.0 --data-plane --yes` |
 | Test 2.16 behavior | `bin/rs-e2e --release 2.16 --skip-uninstall` |
+| Full run + data-plane (no VMs) | `bin/rs-e2e --mode-switch --data-plane --skip-vm --yes` |
+| Data-plane only | `bin/rs-e2e --phases 17-22` |
+| Data-plane, skip metrics wait | `bin/rs-e2e --phases 17,20,22 --no-metrics-wait` |
 
 ### Execution
 

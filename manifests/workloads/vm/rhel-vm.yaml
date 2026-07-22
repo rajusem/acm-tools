@@ -1,0 +1,79 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: rhel-vm1
+  namespace: auto-vm-test
+  labels:
+    app: rhel-vm
+    type: rhel
+    vm-type: test
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: rhel-vm
+        app: rhel-vm
+        type: rhel
+    spec:
+      domain:
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: "2"
+          limits:
+            memory: 4Gi
+            cpu: "2"
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: registry.redhat.io/rhel10/rhel-guest-image:latest
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              # WARNING: Default password is for testing only. Change before production use!
+              user: rhel
+              password: password
+              chpasswd: { expire: False }
+              ssh_pwauth: true
+              ssh_authorized_keys:
+                - "__RS_VM_SSH_PUBLIC_KEY__"
+              packages:
+                - stress-ng
+                - openssh-server
+              runcmd:
+                - mkdir -p /var/run/sshd
+                - ssh-keygen -A || true
+                - nohup /usr/sbin/sshd > /dev/null 2>&1 &
+                - sleep 3
+                - pgrep -f "/usr/sbin/sshd" && echo "sshd started successfully" || echo "sshd may not be running"
+                - echo "VM Ready" > /etc/vm_status
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhel-vm-ssh-service
+  namespace: auto-vm-test
+spec:
+  selector:
+    app: rhel-vm
+  ports:
+    - protocol: TCP
+      port: 2202
+      targetPort: 22
+  type: NodePort

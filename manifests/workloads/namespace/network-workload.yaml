@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: network-workload
+  namespace: offline-workload
+  labels:
+    app: network
+    workload-type: network
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: network
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: network-worker
+            image: busybox:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "64Mi"
+              limits:
+                cpu: "200m"
+                memory: "128Mi"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting network workload at $(date)"
+              # Generate network traffic using localhost connections
+              timeout 900 sh -c 'while true; do
+                # Create TCP connections to localhost
+                nc -l -p 8080 &
+                NC_PID=$!
+                sleep 0.1
+                echo "test" | nc localhost 8080 2>/dev/null || true
+                kill $NC_PID 2>/dev/null || true
+                # UDP operations
+                echo "test" | nc -u localhost 8081 2>/dev/null || true
+                sleep 1
+              done' || true
+              echo "Network workload completed at $(date)"

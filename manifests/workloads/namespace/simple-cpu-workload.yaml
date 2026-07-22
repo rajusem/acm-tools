@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: simple-cpu-workload
+  namespace: offline-workload
+  labels:
+    app: simple-cpu
+    workload-type: cpu
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: simple-cpu
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: cpu-worker
+            image: busybox:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "64Mi"
+              limits:
+                cpu: "500m"
+                memory: "128Mi"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting CPU workload at $(date)"
+              # CPU-intensive loop for 15 minutes
+              timeout 900 sh -c 'while true; do
+                i=0
+                while [ $i -lt 100000 ]; do
+                  i=$((i+1))
+                done
+              done' || true
+              echo "CPU workload completed at $(date)"

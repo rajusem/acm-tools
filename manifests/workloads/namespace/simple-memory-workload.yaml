@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: simple-memory-workload
+  namespace: offline-workload
+  labels:
+    app: simple-memory
+    workload-type: memory
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: simple-memory
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: memory-worker
+            image: busybox:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "128Mi"
+              limits:
+                cpu: "200m"
+                memory: "512Mi"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting memory workload at $(date)"
+              # Allocate and use memory for 15 minutes
+              MEM_SIZE=256
+              dd if=/dev/zero of=/tmp/memory_stress bs=1M count=$MEM_SIZE 2>/dev/null
+              echo "Memory allocated: ${MEM_SIZE}MB"
+              sleep 900
+              rm -f /tmp/memory_stress
+              echo "Memory workload completed at $(date)"

@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: file-io-workload
+  namespace: offline-workload
+  labels:
+    app: file-io
+    workload-type: io
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: file-io
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: io-worker
+            image: busybox:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "50m"
+                memory: "64Mi"
+              limits:
+                cpu: "200m"
+                memory: "128Mi"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting file I/O workload at $(date)"
+              # Generate file I/O operations for 15 minutes
+              timeout 900 sh -c 'while true; do
+                # Write operations
+                dd if=/dev/urandom of=/tmp/testfile bs=1M count=2 2>/dev/null
+                # Read operations
+                cat /tmp/testfile > /dev/null 2>&1
+                # Copy operations
+                cp /tmp/testfile /tmp/testfile2 2>/dev/null
+                rm -f /tmp/testfile /tmp/testfile2 2>/dev/null
+                sleep 1
+              done' || true
+              echo "File I/O workload completed at $(date)"

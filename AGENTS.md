@@ -40,7 +40,7 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 | `install-custom-acm` | Install/manage ACM on hub via OLM (pull secret, catalog source, subscriptions) |
 | `setup-observability` | Install/uninstall MCO, object storage, and observability pipeline |
 | `image-override` | Build, push, and apply custom MCO/MCOA images from local repos |
-| `rs-e2e` | End-to-end right-sizing validation (16+ phases, MCO and MCOA modes) |
+| `rs-e2e` | End-to-end right-sizing validation (22 phases, MCO/MCOA modes, data-plane) |
 | `rs-status` | Dashboard showing right-sizing state (mode, ConfigMaps, ADC, policies) |
 | `rs-mode-switch` | Switch between MCO and MCOA right-sizing modes |
 | `rs-collect-must-gather` | Collect diagnostic data for right-sizing issues |

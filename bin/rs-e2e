@@ -43,6 +43,14 @@
 #   14   Uninstall cleanup (MCOA mode)
 #   15   MCOA uninstall + reinstall    (--mode-switch)
 #   16   Mode switch after reinstall   (--mode-switch)
+#
+#   Group 5: Data-plane validation (--data-plane)
+#   17   Deploy namespace workloads to spoke
+#   18   Deploy VM workloads to spoke
+#   19   Metrics collection wait (~20 min)
+#   20   Namespace metrics validation (Thanos)
+#   21   VM metrics validation (Thanos)
+#   22   Data-plane cleanup
 # =============================================================================
 
 set -euo pipefail
@@ -64,11 +72,15 @@ RS_BINDING_TEST_NS="rs-binding-test"
 
 SKIP_UNINSTALL=false
 MODE_SWITCH=false
+DATA_PLANE=false
+SKIP_VM=false
+NO_METRICS_WAIT=false
 BUILD_TARGET=""
 IMAGE_OVERRIDE_ONLY=false
 SELECTED_PHASES=""
 AUTO_CONFIRM=false
 SKIP_PERSES_CHECK=false
+THANOS_PF_PID=""
 CAPTURED_COO_VERSION=""
 CAPTURED_PERSES_IMAGE=""
 
@@ -95,6 +107,9 @@ Usage: $(basename "$0") [options] [mco|mcoa]
 Options:
   --skip-uninstall       Run phases 0-4a only (no MCO deletion)
   --mode-switch          Include phases 5-12, 15-16 (mode switching tests)
+  --data-plane           Include phases 17-22 (data-plane validation)
+  --skip-vm              Skip VM workload phases (18, 21)
+  --no-metrics-wait      Skip the metrics collection wait (phase 19)
   --build mco|mcoa|both  Build, push, and apply custom images before tests
   --image-override       Apply existing image-override.json (no build)
   --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a)
@@ -109,6 +124,8 @@ Positional:
 Examples:
   $(basename "$0") --skip-uninstall
   $(basename "$0") --mode-switch
+  $(basename "$0") --skip-uninstall --data-plane     # Control + data-plane
+  $(basename "$0") --phases 17-22 --skip-vm          # Data-plane only, no VMs
   $(basename "$0") --build mco --skip-uninstall
   $(basename "$0") --phases 0-3,5,13-16
   $(basename "$0") --release 5.0 --skip-uninstall   # Test 5.0 images on 2.17 cluster
@@ -131,6 +148,9 @@ apply_release_phase_defaults() {
             SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4,4a,13,14"
         fi
     fi
+    if [[ "$DATA_PLANE" == "true" && -n "$SELECTED_PHASES" ]]; then
+        SELECTED_PHASES="${SELECTED_PHASES},17,18,19,20,21,22"
+    fi
     if [[ -n "$SELECTED_PHASES" ]]; then
         SELECTED_PHASES=$(expand_phase_ranges "$SELECTED_PHASES")
     fi
@@ -141,6 +161,9 @@ parse_args() {
         case "$1" in
             --skip-uninstall) SKIP_UNINSTALL=true; shift ;;
             --mode-switch)    MODE_SWITCH=true; shift ;;
+            --data-plane)     DATA_PLANE=true; shift ;;
+            --skip-vm)        SKIP_VM=true; shift ;;
+            --no-metrics-wait) NO_METRICS_WAIT=true; shift ;;
             --build)
                 BUILD_TARGET="${2:-}"
                 [[ -z "$BUILD_TARGET" ]] && { log_error "--build requires mco|mcoa|both"; exit 1; }
@@ -709,6 +732,12 @@ verify_adc_state() {
 
 verify_adc_delegation() {
     local expected="$1"
+
+    if ! resource_exists addondeploymentconfig "$MCOA_NAME" "$OBS_NAMESPACE"; then
+        log_info "  ADC not found — delegation check skipped (MCOA stack torn down)"
+        return 0
+    fi
+
     local actual
     actual=$($KUBE_CLI get addondeploymentconfig "$MCOA_NAME" \
         -n "$OBS_NAMESPACE" \
@@ -855,6 +884,154 @@ get_all_spec_hashes() {
         hashes="${hashes:+$hashes|}$hash"
     done
     echo "$hashes"
+}
+
+# =============================================================================
+# Data-plane Helpers
+# =============================================================================
+
+WORKLOADS_DIR="$SCRIPT_DIR/../manifests/workloads"
+
+discover_thanos_endpoint() {
+    local route_host
+    route_host=$($KUBE_CLI get route rbac-query-proxy \
+        -n "$OBS_NAMESPACE" \
+        -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+    if [[ -n "$route_host" ]]; then
+        THANOS_URL="https://$route_host"
+        THANOS_TOKEN=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
+        return 0
+    fi
+
+    log_warn "  rbac-query-proxy Route not found, trying port-forward"
+    $KUBE_CLI port-forward svc/observability-thanos-query-frontend \
+        -n "$OBS_NAMESPACE" 9090:9090 &>/dev/null &
+    THANOS_PF_PID=$!
+    trap 'stop_thanos_port_forward; $KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null 2>&1 || true' EXIT
+    sleep 3
+    if kill -0 "$THANOS_PF_PID" 2>/dev/null; then
+        THANOS_URL="http://localhost:9090"
+        THANOS_TOKEN=""
+        return 0
+    fi
+    return 1
+}
+
+stop_thanos_port_forward() {
+    if [[ -n "$THANOS_PF_PID" ]]; then
+        kill "$THANOS_PF_PID" 2>/dev/null || true
+        THANOS_PF_PID=""
+    fi
+}
+
+thanos_query_metric() {
+    local metric_name="$1"
+    local label_selector="${2:-}"
+    local range="${3:-30m}"
+
+    local query="last_over_time(${metric_name}{${label_selector}}[${range}])"
+    local -a curl_args=(-sk --connect-timeout 10 --max-time 30)
+    [[ -n "${THANOS_TOKEN:-}" ]] && curl_args+=(-H "Authorization: Bearer $THANOS_TOKEN")
+
+    local response
+    response=$(curl "${curl_args[@]}" \
+        "${THANOS_URL}/api/v1/query" \
+        --data-urlencode "query=${query}" 2>/dev/null)
+
+    echo "$response" | jq -r '.data.result[0].value[1] // empty' 2>/dev/null
+}
+
+thanos_metric_exists() {
+    local value
+    value=$(thanos_query_metric "$@")
+    [[ -n "$value" ]]
+}
+
+deploy_namespace_workloads() {
+    local ctx="$NAMESPACE_SPOKE_CONTEXT"
+    local ns="$RS_NS_WORKLOAD_NS"
+
+    kube_retry $KUBE_CLI --context="$ctx" create namespace "$ns" \
+        --dry-run=client -o yaml 2>/dev/null | \
+        kube_retry $KUBE_CLI --context="$ctx" apply -f - 2>/dev/null
+
+    local deployed=0
+    for file in "$WORKLOADS_DIR"/namespace/*.yaml; do
+        [[ -f "$file" ]] || continue
+        sed "s/namespace: offline-workload/namespace: $ns/g" "$file" | \
+            kube_retry $KUBE_CLI --context="$ctx" apply -f - 2>/dev/null
+        ((deployed++)) || true
+    done
+    log_success "  Deployed $deployed CronJob workloads to $ns on $ctx"
+}
+
+vm_is_running() {
+    local ctx="$1" ns="$2" vm="$3"
+    local status
+    status=$($KUBE_CLI --context="$ctx" get vm "$vm" -n "$ns" \
+        -o jsonpath='{.status.printableStatus}' 2>/dev/null || echo "")
+    [[ "$status" == "Running" ]]
+}
+
+spoke_has_virtualization() {
+    local ctx="$1"
+    $KUBE_CLI --context="$ctx" get csv -n openshift-cnv --no-headers 2>/dev/null | \
+        grep "kubevirt-hyperconverged-operator" >/dev/null 2>&1
+}
+
+deploy_vm_workloads() {
+    local ctx="$VM_SPOKE_CONTEXT"
+    local ns="$RS_VM_WORKLOAD_NS"
+
+    if [[ -z "${RS_VM_SSH_PUBLIC_KEY:-}" ]]; then
+        RS_VM_SSH_PUBLIC_KEY=$(cat ~/.ssh/id_rsa.pub 2>/dev/null || echo "")
+    fi
+
+    kube_retry $KUBE_CLI --context="$ctx" create namespace "$ns" \
+        --dry-run=client -o yaml 2>/dev/null | \
+        kube_retry $KUBE_CLI --context="$ctx" apply -f - 2>/dev/null
+
+    for file in "$WORKLOADS_DIR"/vm/*.yaml; do
+        [[ -f "$file" ]] || continue
+        local content
+        content=$(sed "s/namespace: auto-vm-test/namespace: $ns/g" "$file")
+        if [[ -n "${RS_VM_SSH_PUBLIC_KEY:-}" ]]; then
+            content=$(echo "$content" | sed "s|__RS_VM_SSH_PUBLIC_KEY__|$RS_VM_SSH_PUBLIC_KEY|g")
+        else
+            content=$(echo "$content" | sed '/__RS_VM_SSH_PUBLIC_KEY__/d')
+        fi
+        echo "$content" | kube_retry $KUBE_CLI --context="$ctx" apply -f - 2>/dev/null
+        log_success "  Applied $(basename "$file")"
+    done
+
+    for vm in fedora-vm-1 fedora-vm-2 rhel-vm1; do
+        if $KUBE_CLI --context="$ctx" get vm "$vm" -n "$ns" &>/dev/null; then
+            log_substep "Waiting for VM $vm to boot..."
+            wait_until "$TIMEOUT_VM_BOOT" 10 "VM $vm running" \
+                vm_is_running "$ctx" "$ns" "$vm" || \
+                log_warn "  VM $vm did not reach Running in ${TIMEOUT_VM_BOOT}s"
+        fi
+    done
+}
+
+cleanup_data_plane_workloads() {
+    if $KUBE_CLI --context="$NAMESPACE_SPOKE_CONTEXT" get namespace "$RS_NS_WORKLOAD_NS" &>/dev/null 2>&1; then
+        log_substep "Cleaning namespace workloads from $NAMESPACE_SPOKE_CONTEXT"
+        $KUBE_CLI --context="$NAMESPACE_SPOKE_CONTEXT" delete namespace "$RS_NS_WORKLOAD_NS" \
+            --ignore-not-found=true --timeout=60s 2>/dev/null || \
+            log_warn "  Namespace $RS_NS_WORKLOAD_NS deletion timed out"
+        log_success "  Namespace workloads cleaned"
+    fi
+
+    if [[ "$SKIP_VM" == "false" ]]; then
+        if $KUBE_CLI --context="$VM_SPOKE_CONTEXT" get namespace "$RS_VM_WORKLOAD_NS" &>/dev/null 2>&1; then
+            log_substep "Cleaning VM workloads from $VM_SPOKE_CONTEXT"
+            $KUBE_CLI --context="$VM_SPOKE_CONTEXT" delete namespace "$RS_VM_WORKLOAD_NS" \
+                --ignore-not-found=true --timeout=120s 2>/dev/null || \
+                log_warn "  Namespace $RS_VM_WORKLOAD_NS deletion timed out"
+            log_success "  VM workloads cleaned"
+        fi
+    fi
 }
 
 # =============================================================================
@@ -2805,6 +2982,218 @@ phase_16() {
 }
 
 # =============================================================================
+# Phase 17-22: Data-plane Validation
+# =============================================================================
+
+phase_17() {
+    if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
+        PHASE_SKIP_REASON="Use --data-plane to enable"
+        return 2
+    fi
+
+    local ctx="$NAMESPACE_SPOKE_CONTEXT"
+
+    log_substep "Checking namespace spoke connectivity"
+    if ! $KUBE_CLI --context="$ctx" cluster-info \
+            --request-timeout=10s &>/dev/null 2>&1; then
+        PHASE_FAIL_REASON="Namespace spoke $ctx unreachable"
+        return 1
+    fi
+    log_success "  Spoke $ctx reachable"
+
+    log_substep "Checking RS PrometheusRules on spoke"
+    local pr_count
+    pr_count=$($KUBE_CLI --context="$ctx" get prometheusrules -n openshift-monitoring \
+        --no-headers 2>/dev/null | grep -c 'acm-rs' || true)
+    if [[ "$pr_count" -eq 0 ]]; then
+        PHASE_FAIL_REASON="No RS PrometheusRules on spoke — RS features must be enabled (run phases 0-1 first)"
+        return 1
+    fi
+    log_success "  $pr_count RS PrometheusRule(s) on spoke"
+
+    log_substep "Deploying CronJob workloads to $RS_NS_WORKLOAD_NS"
+    deploy_namespace_workloads
+
+    log_substep "Verifying CronJob count"
+    local count
+    count=$($KUBE_CLI --context="$ctx" get cronjobs \
+        -n "$RS_NS_WORKLOAD_NS" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$count" -ge 5 ]]; then
+        log_success "  $count CronJobs deployed"
+    else
+        log_error "  Expected 5 CronJobs, found $count"
+        PHASE_FAIL_REASON="Incomplete CronJob deployment: $count/5"
+        return 1
+    fi
+
+    return 0
+}
+
+phase_18() {
+    if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
+        PHASE_SKIP_REASON="Use --data-plane to enable"
+        return 2
+    fi
+    if [[ "$SKIP_VM" == "true" ]]; then
+        PHASE_SKIP_REASON="--skip-vm"
+        return 2
+    fi
+
+    local ctx="$VM_SPOKE_CONTEXT"
+
+    log_substep "Checking VM spoke connectivity"
+    if ! $KUBE_CLI --context="$ctx" cluster-info \
+            --request-timeout=10s &>/dev/null 2>&1; then
+        PHASE_FAIL_REASON="VM spoke $ctx unreachable"
+        return 1
+    fi
+    log_success "  Spoke $ctx reachable"
+
+    log_substep "Checking OpenShift Virtualization on VM spoke"
+    if ! spoke_has_virtualization "$ctx"; then
+        PHASE_SKIP_REASON="OpenShift Virtualization not installed on $ctx"
+        return 2
+    fi
+    log_success "  OpenShift Virtualization installed"
+
+    log_substep "Deploying VMs to $RS_VM_WORKLOAD_NS"
+    deploy_vm_workloads
+
+    log_substep "Verifying VM count"
+    local vm_count
+    vm_count=$($KUBE_CLI --context="$ctx" get vm \
+        -n "$RS_VM_WORKLOAD_NS" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$vm_count" -ge 2 ]]; then
+        log_success "  $vm_count VMs deployed"
+    else
+        log_error "  Expected >= 2 VMs, found $vm_count"
+        PHASE_FAIL_REASON="Incomplete VM deployment: $vm_count VMs"
+        return 1
+    fi
+
+    return 0
+}
+
+phase_19() {
+    if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
+        PHASE_SKIP_REASON="Use --data-plane to enable"
+        return 2
+    fi
+    if [[ "$NO_METRICS_WAIT" == "true" ]]; then
+        log_info "  Skipping metrics wait (--no-metrics-wait)"
+        return 0
+    fi
+
+    log_info "  Waiting ${TIMEOUT_METRICS_WAIT}s for Thanos to ingest metrics"
+    log_info "  (Prometheus evaluates recording rules every ~30s, remote-writes every ~5m)"
+    wait_with_message "$TIMEOUT_METRICS_WAIT" "Waiting for Thanos to ingest metrics"
+    return 0
+}
+
+phase_20() {
+    if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
+        PHASE_SKIP_REASON="Use --data-plane to enable"
+        return 2
+    fi
+
+    switch_context "$HUB_CONTEXT" || { PHASE_FAIL_REASON="Cannot switch to hub context"; return 1; }
+
+    log_substep "Discovering Thanos endpoint"
+    if ! discover_thanos_endpoint; then
+        PHASE_FAIL_REASON="No Thanos endpoint found on hub"
+        return 1
+    fi
+    log_success "  Thanos endpoint: $THANOS_URL"
+
+    THANOS_TOKEN=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
+
+    local errors=0
+    local ns_label="namespace=\"$RS_NS_WORKLOAD_NS\""
+
+    log_substep "Checking acm_rs:namespace:* metrics for $RS_NS_WORKLOAD_NS"
+    for metric in cpu_request cpu_usage cpu_recommendation memory_request memory_usage memory_recommendation; do
+        local full_metric="acm_rs:namespace:${metric}"
+        local value
+        value=$(thanos_query_metric "$full_metric" "$ns_label")
+        if [[ -n "$value" ]]; then
+            log_success "  $full_metric = $value"
+        else
+            log_error "  $full_metric: no data"
+            ((errors++)) || true
+        fi
+    done
+
+    stop_thanos_port_forward
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors namespace metric(s) missing"
+        return 1
+    fi
+    return 0
+}
+
+phase_21() {
+    if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
+        PHASE_SKIP_REASON="Use --data-plane to enable"
+        return 2
+    fi
+    if [[ "$SKIP_VM" == "true" ]]; then
+        PHASE_SKIP_REASON="--skip-vm"
+        return 2
+    fi
+
+    switch_context "$HUB_CONTEXT" || { PHASE_FAIL_REASON="Cannot switch to hub context"; return 1; }
+
+    if [[ -z "${THANOS_URL:-}" ]]; then
+        log_substep "Discovering Thanos endpoint"
+        if ! discover_thanos_endpoint; then
+            PHASE_FAIL_REASON="No Thanos endpoint found on hub"
+            return 1
+        fi
+    fi
+
+    THANOS_TOKEN=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
+
+    local errors=0
+    local vm_label="namespace=\"$RS_VM_WORKLOAD_NS\""
+
+    log_substep "Checking acm_rs_vm:namespace:* metrics for $RS_VM_WORKLOAD_NS"
+    for metric in cpu_request cpu_usage cpu_recommendation memory_request memory_usage memory_recommendation; do
+        local full_metric="acm_rs_vm:namespace:${metric}"
+        local value
+        value=$(thanos_query_metric "$full_metric" "$vm_label")
+        if [[ -n "$value" ]]; then
+            log_success "  $full_metric = $value"
+        else
+            log_error "  $full_metric: no data"
+            ((errors++)) || true
+        fi
+    done
+
+    stop_thanos_port_forward
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors VM metric(s) missing"
+        return 1
+    fi
+    return 0
+}
+
+phase_22() {
+    if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
+        PHASE_SKIP_REASON="Use --data-plane to enable"
+        return 2
+    fi
+
+    log_substep "Cleaning up data-plane workloads"
+    cleanup_data_plane_workloads
+
+    stop_thanos_port_forward
+    switch_context "$HUB_CONTEXT" 2>/dev/null || true
+    return 0
+}
+
+# =============================================================================
 # Summary
 # =============================================================================
 
@@ -3000,6 +3389,14 @@ main() {
     run_phase "14"  "Uninstall cleanup (MCOA mode)"   phase_14
     run_phase "15"  "MCOA uninstall + reinstall"      phase_15
     run_phase "16"  "Mode switch after reinstall"     phase_16
+
+    # Group 5: Data-plane validation (--data-plane)
+    run_phase "17"  "Deploy namespace workloads"      phase_17
+    run_phase "18"  "Deploy VM workloads"             phase_18
+    run_phase "19"  "Metrics collection wait"         phase_19
+    run_phase "20"  "Namespace metrics validation"    phase_20
+    run_phase "21"  "VM metrics validation"           phase_21
+    run_phase "22"  "Data-plane cleanup"              phase_22
 
     print_summary
 

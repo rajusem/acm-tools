@@ -206,7 +206,9 @@ End-to-end validation of right-sizing resource lifecycle across MCO and MCOA mod
 bin/rs-e2e                                   # Phases 0-4a, 13-14 (core tests)
 bin/rs-e2e --mode-switch                     # All phases 0-16 (includes MCOA mode switching)
 bin/rs-e2e --skip-uninstall                  # Phases 0-4a only (no MCO deletion)
+bin/rs-e2e --skip-uninstall --data-plane     # Control-plane + data-plane validation
 bin/rs-e2e --phases 0-3,5,9a                 # Run specific phases (ranges OK)
+bin/rs-e2e --phases 17-22 --skip-vm          # Data-plane only, no VMs
 bin/rs-e2e --build mco                       # Build MCO image, then run tests
 bin/rs-e2e --build both                      # Build MCO + MCOA images, then run tests
 bin/rs-e2e --image-override                  # Apply image-override.json, then run tests
@@ -263,13 +265,28 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 15 | MCOA uninstall + reinstall | Deletes MCO in MCOA mode, reinstalls, verifies RS auto-defaults re-populate. Checks for stale IsMCOTerminating flag (operator caches terminating state in memory — requires pod restart). |
 | 16 | Mode switch after reinstall | After fresh MCO install, performs full MCO→MCOA→MCO round-trip. Verifies ManifestWorks and Perses dashboards created in MCOA mode, Policies restored after switching back to MCO. |
 
-Phases 5-12, 15-16 require `--mode-switch` (or explicit `--phases` selection). Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.
+**Group 5: Data-plane validation** (`--data-plane` required)
+
+| Phase | Test | What it validates |
+|-------|------|-------------------|
+| 17 | Deploy namespace workloads | Verifies spoke connectivity and RS PrometheusRules present, deploys 5 CronJob stress workloads (CPU, memory, file I/O, network, combined) to namespace-spoke. |
+| 18 | Deploy VM workloads | Checks OpenShift Virtualization installed on vm-spoke, deploys 3 VMs (2 Fedora, 1 RHEL) with stress-ng. Skipped with `--skip-vm`. |
+| 19 | Metrics collection wait | Waits `TIMEOUT_METRICS_WAIT` seconds (default: 1200/20 min) for Thanos to ingest metrics from spoke PrometheusRules. Skipped with `--no-metrics-wait`. |
+| 20 | Namespace metrics validation | Discovers Thanos endpoint (rbac-query-proxy Route), queries all 6 `acm_rs:namespace:*` metrics for the workload namespace. Reports values or failures. |
+| 21 | VM metrics validation | Queries all 6 `acm_rs_vm:namespace:*` metrics for the VM workload namespace. Skipped with `--skip-vm`. |
+| 22 | Data-plane cleanup | Deletes workload namespaces from spoke clusters. Robust to unreachable spokes. |
+
+Phases 5-12, 15-16 require `--mode-switch`. Phases 17-22 require `--data-plane`. Both can be combined with explicit `--phases` selection. Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.
 
 **Environment variables:**
 
 - `TIMEOUT_E2E_RECONCILE` — Seconds to wait after MCO spec patches (default: 90)
 - `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
 - `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 60)
+- `TIMEOUT_METRICS_WAIT` — Seconds to wait for Thanos metric ingestion (default: 1200)
+- `TIMEOUT_VM_BOOT` — Seconds to wait for VM workloads to boot (default: 600)
+- `RS_NS_WORKLOAD_NS` — Namespace for CronJob workloads on namespace-spoke (default: offline-workload)
+- `RS_VM_WORKLOAD_NS` — Namespace for VM workloads on vm-spoke (default: auto-vm-test)
 
 The `--build` flag reads repo paths from `config.sh` (`MCO_REPO_DIR`, `MCOA_REPO_DIR`), auto-increments the tag in `image-override.json`, builds with `$CONTAINER_ENGINE`, pushes to `$ACM_TOOLS_REGISTRY`, and applies the override before running tests.
 

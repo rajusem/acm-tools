@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: combined-workload
+  namespace: offline-workload
+  labels:
+    app: combined
+    workload-type: combined
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: combined
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: combined-worker
+            image: busybox:latest
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "128Mi"
+              limits:
+                cpu: "500m"
+                memory: "512Mi"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting combined workload at $(date)"
+              # Run CPU, memory, and I/O workloads simultaneously
+              
+              # Memory allocation in background
+              dd if=/dev/zero of=/tmp/mem_stress bs=1M count=128 2>/dev/null &
+              MEM_PID=$!
+              
+              # CPU and I/O intensive operations for 15 minutes
+              timeout 900 sh -c 'while true; do
+                # CPU intensive
+                i=0
+                while [ $i -lt 50000 ]; do
+                  i=$((i+1))
+                done
+                # I/O operations
+                dd if=/dev/urandom of=/tmp/io_test bs=1M count=1 2>/dev/null
+                cat /tmp/io_test > /dev/null 2>&1
+                rm -f /tmp/io_test 2>/dev/null
+                sleep 0.5
+              done' || true
+              
+              # Cleanup
+              kill $MEM_PID 2>/dev/null || true
+              rm -f /tmp/mem_stress 2>/dev/null
+              echo "Combined workload completed at $(date)"

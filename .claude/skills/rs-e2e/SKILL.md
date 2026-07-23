@@ -5,7 +5,7 @@ Run end-to-end validation of right-sizing resource lifecycle on the current clus
 ## Arguments (optional)
 
 - `--release 2.16|2.17|5.0` — ACM release (required when testing 5.0 custom images on a 2.17 cluster; auto-detected from MCH otherwise)
-- `--skip-uninstall` — Run phases 0-4a only, don't delete MCO at the end
+- `--skip-uninstall` — Skip destructive phases (13-16); runs core validation only
 - `--mode-switch` — Also test MCO-to-MCOA mode switching (adds phases 5-12, 15-16)
 - `--build mco|mcoa|both` — Build, push, and apply custom image(s) before running tests
 - `--image-override` — Apply existing `image-override.json` without building
@@ -14,7 +14,7 @@ Run end-to-end validation of right-sizing resource lifecycle on the current clus
 - `--skip-vm` — Skip VM workload phases (18, 21)
 - `--no-metrics-wait` — Skip the 20-minute metrics collection wait (phase 19)
 - `--skip-perses-check` — Skip COO/Perses dashboard verification
-- `--yes` — Auto-confirm destructive phases (13, 14, 15)
+- `--yes` / `-y` — Auto-confirm destructive phases (13, 14, 15)
 - `mco` or `mcoa` — Force testing a specific mode (default: auto-detect)
 
 ## Workflow
@@ -39,7 +39,7 @@ Run `bin/rs-e2e` with the appropriate flags. The script is fully automated and h
 | Test 2.16 behavior | `bin/rs-e2e --release 2.16 --skip-uninstall` |
 | Full run + data-plane (no VMs) | `bin/rs-e2e --mode-switch --data-plane --skip-vm --yes` |
 | Data-plane only | `bin/rs-e2e --phases 17-22` |
-| Data-plane, skip metrics wait | `bin/rs-e2e --phases 17,20,22 --no-metrics-wait` |
+| Data-plane, skip metrics wait | `bin/rs-e2e --data-plane --no-metrics-wait` |
 
 ### Execution
 
@@ -94,9 +94,15 @@ If phases fail, diagnose using the troubleshooting tables below and attempt a fi
 | 11 | MCOA → MCO switch | `--mode-switch` | **2.17 only** |
 | 12 | Version mismatch (any annotation value) | `--mode-switch` | **2.17 only** |
 | 13 | Uninstall cleanup — MCO mode | Destructive (prompts) | 2.16, 2.17 |
-| 14 | Uninstall cleanup — MCOA mode + Perses | Destructive (prompts) | 2.17, 5.0 |
+| 14 | Uninstall cleanup — MCOA mode + Perses | Destructive (prompts) | **2.17 only** |
 | 15 | MCOA uninstall + reinstall | `--mode-switch`, destructive | **2.17 only** |
 | 16 | Mode switch after reinstall + Perses | `--mode-switch` | **2.17 only** |
+| 17 | Deploy namespace workloads to spoke | `--data-plane` | 2.16, 2.17, 5.0 |
+| 18 | Deploy VM workloads to spoke | `--data-plane` | 2.16, 2.17, 5.0 |
+| 19 | Metrics collection wait (~20 min) | `--data-plane` | 2.16, 2.17, 5.0 |
+| 20 | Namespace metrics validation (Thanos) | `--data-plane` | 2.16, 2.17, 5.0 |
+| 21 | VM metrics validation (Thanos) | `--data-plane` | 2.16, 2.17, 5.0 |
+| 22 | Data-plane cleanup | `--data-plane` | 2.16, 2.17, 5.0 |
 
 ## Troubleshooting failures
 
@@ -138,6 +144,16 @@ Timeouts (set in `bin/rs-e2e` or `config.sh`):
 - `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 300)
 - `TIMEOUT_COO_INSTALL` — Seconds to wait for COO installation before checking Perses (default: 120, in `config.sh`)
 - `TIMEOUT_MW_STUCK` — Seconds before a deleting ManifestWork is considered stuck (default: 120, in `config.sh`)
+- `TIMEOUT_MCO_READY` — Seconds to wait for MCO readiness in pre-flight (default: 300, in `config.sh`)
+- `TIMEOUT_ROLLOUT` — Seconds to wait for deployment rollouts (default: 120, in `config.sh`)
+- `TIMEOUT_RS_CLEANUP` — Seconds to wait for RS resource cleanup verification (default: 60, in `config.sh`)
+- `TIMEOUT_METRICS_WAIT` — Seconds to wait for Thanos metrics ingestion in phase 19 (default: 1200, in `config.sh`)
+- `TIMEOUT_VM_BOOT` — Seconds to wait for VM workload boot in data-plane phases (default: 600, in `config.sh`)
+
+Data-plane workload namespaces (set in `config.sh`):
+
+- `RS_NS_WORKLOAD_NS` — Namespace for namespace workloads on spoke (default: `offline-workload`)
+- `RS_VM_WORKLOAD_NS` — Namespace for VM workloads on spoke (default: `auto-vm-test`)
 
 Spoke cluster contexts (set in `config.sh`):
 

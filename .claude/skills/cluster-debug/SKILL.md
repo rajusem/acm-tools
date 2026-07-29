@@ -75,6 +75,54 @@ oc --context=hub delete pod -n open-cluster-management -l name=multicluster-obse
 
 Or use the shortcut: `bin/setup-observability status` shows the full pipeline health in one command.
 
+**Thanos receive StatefulSet**: Check all replicas are ready — a single unhealthy pod blocks MCO from becoming Ready:
+
+```bash
+oc --context=hub get statefulset observability-thanos-receive-default \
+  -n open-cluster-management-observability
+# If not all replicas ready, check the failing pod:
+oc --context=hub get pods -n open-cluster-management-observability \
+  -l app.kubernetes.io/name=thanos-receive --no-headers
+# Check for bucket quota or disk errors:
+oc --context=hub logs -n open-cluster-management-observability \
+  -l app.kubernetes.io/name=thanos-receive --tail=10 | grep -i 'Bucket quota\|error\|disk'
+oc --context=hub logs -n open-cluster-management-observability \
+  -l app.kubernetes.io/name=thanos-compact --tail=10 | grep -i 'Bucket quota\|error'
+```
+
+If `Bucket quota exceeded`: the MinIO/S3 bucket backing object storage is full. Fix by increasing bucket quota or applying retention config. See TROUBLESHOOTING.md "Thanos Receive PVC Full / Bucket Quota Exceeded".
+
+**Thanos compact crash**: If compact is in CrashLoopBackOff, check for `retentionResolution5m` set below 11 days:
+
+```bash
+oc --context=hub logs -n open-cluster-management-observability \
+  -l app.kubernetes.io/name=thanos-compact --tail=5
+```
+
+If error mentions "5m resolution retention must be higher than 10 days", increase to at least 14d. See TROUBLESHOOTING.md "Thanos Compact Crash".
+
+**Node disk pressure**: Check if observability pods are Pending due to disk-pressure taint:
+
+```bash
+oc --context=hub get nodes -o jsonpath='{.items[0].spec.taints}'
+```
+
+If `node.kubernetes.io/disk-pressure` taint exists, clean stale pods or uninstall/reinstall observability. See TROUBLESHOOTING.md "Node Disk Pressure Blocking Observability Pods".
+
+**Stale MCO operator pod**: If the operator pod is weeks/months old, its in-memory cache may be stale. Resources may show as "already existed/unchanged" in logs but don't actually exist:
+
+```bash
+# Check pod age
+oc --context=hub get pods -n open-cluster-management \
+  -l name=multicluster-observability-operator \
+  -o jsonpath='{.items[0].metadata.creationTimestamp}'
+# Check if operator is producing any logs recently
+oc --context=hub logs -n open-cluster-management \
+  -l name=multicluster-observability-operator --since=5m | wc -l
+```
+
+If pod is > 7 days old and issues persist, restart: `oc rollout restart deployment/multicluster-observability-operator -n open-cluster-management`
+
 ### Step 5: MCOA addon health
 
 Check MCOA deployment and addon status:
@@ -306,7 +354,39 @@ oc --context=hub get persesdatasource -A --no-headers 2>/dev/null
 
 COO is installed by MCOA via ManifestWork. If COO is missing, check MCOA health (Step 5) and stuck ManifestWorks (Step 10) first.
 
-### Step 13: OLM Subscription issues
+### Step 13: Spoke metrics not reaching hub
+
+If RS recording rules exist on spokes but no data appears in hub Thanos, check the metrics-collector:
+
+```bash
+# Check enableMetrics for each spoke
+for cluster in $(oc --context=hub get observabilityaddon -A --no-headers | awk '{print $1}'); do
+  enabled=$(oc --context=hub get observabilityaddon observability-addon -n "$cluster" \
+    -o jsonpath='{.spec.enableMetrics}' 2>/dev/null)
+  echo "  $cluster: enableMetrics=$enabled"
+done
+```
+
+If `enableMetrics: false`, the metrics-collector won't deploy. Verify with the cluster admin before enabling — it may be intentional:
+
+```bash
+oc --context=hub patch observabilityaddon observability-addon -n <spoke-name> \
+  --type merge -p '{"spec":{"enableMetrics":true}}'
+```
+
+### Step 14: CRD name collisions
+
+ACM registers CRDs that collide with other operators. Always use fully-qualified resource names:
+
+**Kyverno Policy collision** — `oc get policy` resolves to `policies.kyverno.io` instead of ACM:
+```bash
+# WRONG
+oc get policy -n open-cluster-management-global-set
+# CORRECT
+oc get policy.policy.open-cluster-management.io -n open-cluster-management-global-set
+```
+
+### Step 15: OLM Subscription issues
 
 ACM registers its own `Subscription` CRD under `apps.open-cluster-management.io`, causing API group collision with OLM's `operators.coreos.com` Subscription. Always use the fully-qualified resource:
 
@@ -329,7 +409,7 @@ oc --context=hub get packagemanifest advanced-cluster-management \
   -o jsonpath='{.status.channels[*].name}'
 ```
 
-### Step 14: Analysis and recommendations
+### Step 16: Analysis and recommendations
 
 After gathering all data:
 1. Identify the root cause

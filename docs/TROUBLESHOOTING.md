@@ -845,3 +845,174 @@ oc get mco observability 2>&1  # should be NotFound
 | RS ManifestWorks | per managed cluster namespace | MCOA (ManifestWork mode only) |
 | CMA | cluster-scoped | MCO |
 | ADC | `open-cluster-management-observability` | MCO |
+
+---
+
+## Thanos Receive PVC Full / Bucket Quota Exceeded
+
+**Symptom**: MCO shows `Failed` with `StatefulSetNotReady`. One or more `observability-thanos-receive-default-*` pods are `0/1` with hundreds of restarts. RS Policies may disappear. No new metrics reach Thanos.
+
+**Root cause**: The MinIO/S3 bucket backing object storage hit its quota. Thanos receive can't upload blocks → local TSDB fills the PVC → pod crashes → StatefulSet not ready → MCO Failed.
+
+**Diagnosis**:
+```bash
+# Check receive pods
+oc get pods -n open-cluster-management-observability -l app.kubernetes.io/name=thanos-receive
+
+# Check compact for bucket errors
+oc logs -n open-cluster-management-observability -l app.kubernetes.io/name=thanos-compact --tail=10 | grep 'Bucket quota'
+
+# Check receive for upload errors
+oc logs -n open-cluster-management-observability -l app.kubernetes.io/name=thanos-receive --tail=10 | grep 'Bucket quota'
+
+# Check PVC usage
+oc exec observability-thanos-receive-default-2 -n open-cluster-management-observability -- df -h /var/thanos/receive
+```
+
+**Fix**: Increase the MinIO bucket quota or reduce retention to free space. The bucket quota must be increased first — without it, receive and compact can't upload regardless of PVC size.
+
+```bash
+# Option 1: Increase bucket quota (from MinIO admin)
+mc admin bucket quota <alias>/acm-obs-bucket --hard 500Gi
+
+# Option 2: Reduce retention to purge old data from the bucket
+oc patch mco observability --type merge -p '{
+  "spec": {
+    "advanced": {
+      "retentionConfig": {
+        "retentionResolutionRaw": "3d",
+        "retentionResolution5m": "14d",
+        "retentionResolution1h": "21d"
+      }
+    }
+  }
+}'
+```
+
+After the bucket has space, compact will resume uploading and receive PVCs will free up as local TSDB retention cleans old data.
+
+---
+
+## Thanos Compact Crash — retentionResolution5m Too Low
+
+**Symptom**: `observability-thanos-compact-0` is in `CrashLoopBackOff`. Logs show: `5m resolution retention must be higher than the minimum block size after which 1h resolution downsampling will occur (10 days)`.
+
+**Root cause**: Thanos requires `retentionResolution5m` to be **greater than 10 days** because 1h downsampling creates blocks of up to 10 days. Setting it to `7d` or `10d` causes compact to refuse to start.
+
+**Fix**: Set `retentionResolution5m` to at least `11d` (recommended `14d`):
+```bash
+oc patch mco observability --type merge -p '{"spec":{"advanced":{"retentionConfig":{"retentionResolution5m":"14d"}}}}'
+
+# Delete the crash-looping pod to pick up the new config immediately
+oc delete pod observability-thanos-compact-0 -n open-cluster-management-observability
+```
+
+---
+
+## Spoke Metrics Not Reaching Hub (enableMetrics: false)
+
+**Symptom**: Spoke cluster is `Available`, RS PrometheusRules exist on the spoke, but no RS metrics appear in hub Thanos. The `open-cluster-management-addon-observability` namespace on the spoke is empty (no metrics-collector pod).
+
+**Root cause**: The `ObservabilityAddon` CR for the spoke has `enableMetrics: false`. The `endpoint-observability-operator` won't deploy the metrics-collector when this is false.
+
+**Diagnosis**:
+```bash
+# Check enableMetrics for a specific spoke
+oc get observabilityaddon observability-addon -n <spoke-name> -o jsonpath='{.spec.enableMetrics}'
+
+# Check all spokes
+for cluster in $(oc get observabilityaddon -A --no-headers | awk '{print $1}'); do
+  enabled=$(oc get observabilityaddon observability-addon -n "$cluster" -o jsonpath='{.spec.enableMetrics}')
+  echo "  $cluster: enableMetrics=$enabled"
+done
+```
+
+**Fix**: If metrics should be enabled:
+```bash
+oc patch observabilityaddon observability-addon -n <spoke-name> --type merge -p '{"spec":{"enableMetrics":true}}'
+```
+
+Note: `enableMetrics: false` may be intentionally set by the cluster admin. Verify before changing.
+
+---
+
+## Stale MCO Operator Pod (In-Memory Cache Drift)
+
+**Symptom**: MCO shows `Ready=True` but RS Policies are missing, metrics-collector not deployed on spokes, or ManifestWorks not being updated. The operator logs show `"already existed/unchanged"` for resources that don't actually exist. Toggling RS features or mode switching doesn't trigger reconciliation.
+
+**Root cause**: Long-running MCO operator pods (weeks/months) accumulate stale in-memory state. The controller's informer cache drifts from actual cluster state, especially after infrastructure disruptions (disk pressure, Thanos crashes, node restarts). The operator believes resources exist because its cache says so, but they were deleted externally.
+
+**Diagnosis**:
+```bash
+# Check operator pod age
+oc get pods -n open-cluster-management -l name=multicluster-observability-operator \
+  -o jsonpath='{.items[0].metadata.creationTimestamp}'
+
+# Check if operator is producing any logs
+oc logs -n open-cluster-management -l name=multicluster-observability-operator --since=5m | wc -l
+# If 0 lines: controller is completely unresponsive
+
+# Check RS controller activity
+oc logs -n open-cluster-management -l name=multicluster-observability-operator --since=10m | grep 'rs -'
+```
+
+**Fix**:
+```bash
+oc rollout restart deployment/multicluster-observability-operator -n open-cluster-management
+```
+
+This forces a fresh informer cache sync and triggers reconciliation of all resources including RS Policies, ManifestWorks, and observability addon deployments.
+
+---
+
+## Kyverno Policy CRD Collision (RS Policies Not Visible)
+
+**Symptom**: `oc get policy -n open-cluster-management-global-set` shows no RS Policies, but the MCO operator logs confirm they were created. RS features appear broken when they're actually working.
+
+**Root cause**: Kyverno registers its own `Policy` CRD (`policies.kyverno.io`). When both Kyverno and ACM Policy are installed, `oc get policy` resolves to Kyverno's CRD instead of ACM's `policies.policy.open-cluster-management.io`.
+
+**Diagnosis**:
+```bash
+# Check which CRD "policy" resolves to
+oc api-resources | grep -i policy
+
+# Query ACM policies explicitly
+oc get policy.policy.open-cluster-management.io -n open-cluster-management-global-set
+```
+
+**Fix**: Always use the fully-qualified resource name on clusters with Kyverno:
+```bash
+# Instead of:
+oc get policy -n open-cluster-management-global-set
+
+# Use:
+oc get policy.policy.open-cluster-management.io -n open-cluster-management-global-set
+```
+
+---
+
+## Node Disk Pressure Blocking Observability Pods
+
+**Symptom**: Observability pods (MinIO, Thanos compact, Grafana) stuck in `Pending`. Node shows `disk-pressure` taint. MCO shows `Failed` with `DeploymentNotReady`.
+
+**Root cause**: Node disk full — commonly from accumulated stale pods (hundreds of `ContainerStatusUnknown` pods from repeated crashes/restarts), container images, or PVC data.
+
+**Diagnosis**:
+```bash
+# Check node taint
+oc get nodes -o jsonpath='{.items[0].spec.taints}'
+
+# Count stale pods
+oc get pods -A --no-headers | grep -c 'Unknown\|ContainerStatusUnknown'
+```
+
+**Fix**:
+```bash
+# Clean stale pods
+oc delete pods --field-selector=status.phase==Failed -A --force --grace-period=0
+oc delete pods --field-selector=status.phase==Succeeded -A --force --grace-period=0
+
+# If observability is severely broken, uninstall and reinstall cleanly
+echo "y" | bin/setup-observability uninstall
+bin/setup-observability install
+```

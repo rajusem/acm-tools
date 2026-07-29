@@ -307,6 +307,19 @@ bin/rs-collect-must-gather --log-lines 1000         # More log lines
 
 Collects MCO/MCOA operator logs, resource states (MCO CR, CMA, ADC, ConfigMaps, Policies, Placements, ManifestWorks), events, spoke PrometheusRules, and agent logs into a timestamped directory.
 
+### cluster-diagnose
+
+Automated cluster health diagnostic — runs 15 checks and prints issues + fix commands. Strictly read-only.
+
+```bash
+bin/cluster-diagnose              # Shows only issues + fix commands
+bin/cluster-diagnose --verbose    # Shows all checks including PASS
+bin/cluster-diagnose --quick      # Hub only (skip spoke checks)
+bin/cluster-diagnose --release 5.0  # Override release detection
+```
+
+Checks 5 areas: Infrastructure (node health, operator pods, image overrides), Observability Pipeline (MCO conditions, Thanos health, stuck ManifestWorks), Addon Health (MCOA, MCA CRD, COO/Perses), Cluster Connectivity (ManagedClusters, metrics-collector, KlusterletAddonConfig), and Right-Sizing (RS resources, Thanos data). Mode-aware — detects MCO vs MCOA mode for RS resource validation.
+
 The `analyze` subcommand examines collected data offline (no cluster connection needed) and checks for: pod health, ADC state consistency, resource mismatches, ManifestWork generation lag, log errors/panics, and missing ConfigMaps.
 
 ## Claude Code Skills

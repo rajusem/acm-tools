@@ -1,0 +1,787 @@
+#!/bin/bash
+# =============================================================================
+# cluster-diagnose — Automated cluster health diagnostic
+# =============================================================================
+#
+# Runs 15 checks across 5 sections and prints issues + fix commands.
+# Strictly read-only — never modifies cluster state.
+#
+# Usage:
+#   cluster-diagnose              # Shows only WARN/FAIL + fixes
+#   cluster-diagnose --verbose    # Shows all checks including PASS
+#   cluster-diagnose --quick      # Hub only (skip spoke checks)
+#   cluster-diagnose -h           # Help
+#
+# Checks:
+#   Section 1: Infrastructure
+#     1   Node health (disk-pressure, NotReady)
+#     2   ACM/MCE operator health (crashed pods, CSVs)
+#     3   MCO operator pod staleness (age > 14 days)
+#     4   Image override mismatch
+#
+#   Section 2: Observability Pipeline
+#     5   MCH/MCO conditions (Failed, Installing)
+#     6   Thanos health (receive, compact, bucket quota)
+#     7   Stuck ManifestWorks
+#
+#   Section 3: Addon Health
+#     8   MCOA addon health (deployment, specHash, ADC)
+#     9   ManagedClusterAddon CRD terminating
+#     10  COO/Perses health (MCOA mode only)
+#
+#   Section 4: Cluster Connectivity (--quick skips)
+#     11  ManagedCluster health
+#     12  Spoke metrics-collector (enableMetrics)
+#     13  KlusterletAddonConfig
+#
+#   Section 5: Right-Sizing
+#     14  RS resources (Policies, ConfigMaps, PrometheusRules)
+#     15  RS data in Thanos
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# =============================================================================
+# Global State
+# =============================================================================
+
+VERBOSE=false
+QUICK=false
+
+ISSUE_SEVERITIES=()
+ISSUE_DESCRIPTIONS=()
+ISSUE_FIXES=()
+ISSUE_NOTES=()
+
+SECTION_NAMES=()
+SECTION_TOTAL=()
+SECTION_PASS=()
+CURRENT_SECTION=""
+CURRENT_SECTION_IDX=-1
+
+MCO_READY=""
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options]
+
+Automated cluster health diagnostic — checks 15 areas and prints issues + fix commands.
+Strictly read-only — never modifies cluster state.
+
+Options:
+  --verbose              Show all checks including PASS (default: only WARN/FAIL)
+  --quick                Hub only — skip Section 4 (Cluster Connectivity)
+  --release 2.16|2.17|5.0  ACM release (auto-detected from MCH if not specified)
+  -h, --help             Show this help
+
+Sections:
+  1. Infrastructure        — Node health, operator pods, image overrides
+  2. Observability Pipeline — MCO conditions, Thanos health, ManifestWorks
+  3. Addon Health           — MCOA, MCA CRD, COO/Perses
+  4. Cluster Connectivity   — ManagedClusters, metrics-collector, KlusterletAddonConfig
+  5. Right-Sizing           — RS resources, Thanos data
+
+Examples:
+  $(basename "$0")              # Quick scan — shows issues only
+  $(basename "$0") --verbose    # Full output with all checks
+  $(basename "$0") --quick      # Hub checks only (faster)
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --verbose) VERBOSE=true; shift ;;
+            --quick)   QUICK=true; shift ;;
+            --release)
+                RS_RELEASE="${2:-}"
+                [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || {
+                    log_error "--release must be 2.16, 2.17, or 5.0"; exit 1; }
+                shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            *) log_error "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+}
+
+# =============================================================================
+# Result Tracking
+# =============================================================================
+
+start_section() {
+    CURRENT_SECTION="$1"
+    SECTION_NAMES+=("$CURRENT_SECTION")
+    SECTION_TOTAL+=(0)
+    SECTION_PASS+=(0)
+    CURRENT_SECTION_IDX=$((${#SECTION_NAMES[@]} - 1))
+    if [[ "$VERBOSE" == "true" ]]; then echo ""; log_step "$CURRENT_SECTION"; print_separator; fi
+}
+
+record_pass() {
+    local desc="$1"
+    SECTION_TOTAL[$CURRENT_SECTION_IDX]=$((${SECTION_TOTAL[$CURRENT_SECTION_IDX]} + 1))
+    SECTION_PASS[$CURRENT_SECTION_IDX]=$((${SECTION_PASS[$CURRENT_SECTION_IDX]} + 1))
+    if [[ "$VERBOSE" == "true" ]]; then log_success "  $desc"; fi
+}
+
+record_skip() {
+    local desc="$1"
+    SECTION_TOTAL[$CURRENT_SECTION_IDX]=$((${SECTION_TOTAL[$CURRENT_SECTION_IDX]} + 1))
+    SECTION_PASS[$CURRENT_SECTION_IDX]=$((${SECTION_PASS[$CURRENT_SECTION_IDX]} + 1))
+    if [[ "$VERBOSE" == "true" ]]; then log_info "  $desc [SKIP]"; fi
+}
+
+add_issue() {
+    local severity="$1" desc="$2" fix="${3:-}" note="${4:-}"
+    SECTION_TOTAL[$CURRENT_SECTION_IDX]=$((${SECTION_TOTAL[$CURRENT_SECTION_IDX]} + 1))
+    ISSUE_SEVERITIES+=("$severity")
+    ISSUE_DESCRIPTIONS+=("$desc")
+    ISSUE_FIXES+=("$fix")
+    ISSUE_NOTES+=("$note")
+    if [[ "$VERBOSE" == "true" ]]; then
+        if [[ "$severity" == "FAIL" ]]; then
+            log_error "  $desc"
+        else
+            log_warn "  $desc"
+        fi
+    fi
+}
+
+# =============================================================================
+# Section 1: Infrastructure
+# =============================================================================
+
+check_node_health() {
+    local taints
+    taints=$($KUBE_CLI get nodes -o jsonpath='{range .items[*]}{.spec.taints[*].key}{"\n"}{end}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if echo "$taints" | grep 'disk-pressure' >/dev/null 2>&1; then
+        add_issue "FAIL" "Node has disk-pressure taint" \
+            "Clean stale pods: oc delete pods --field-selector=status.phase==Failed -A --force --grace-period=0
+         Or reinstall observability: echo y | bin/setup-observability uninstall && bin/setup-observability install"
+    elif echo "$taints" | grep 'not-ready\|unreachable' >/dev/null 2>&1; then
+        add_issue "FAIL" "Node is NotReady or unreachable" ""
+    else
+        local node_status
+        node_status=$($KUBE_CLI get nodes --no-headers --request-timeout=10s 2>/dev/null | head -1 || echo "")
+        if [[ -z "$node_status" ]]; then
+            add_issue "FAIL" "Cannot reach cluster API" ""
+            return
+        fi
+        record_pass "Node health: Ready, no taints"
+    fi
+}
+
+check_operator_health() {
+    local bad_pods
+    bad_pods=$($KUBE_CLI get pods -n open-cluster-management --no-headers \
+        --request-timeout=10s 2>/dev/null | grep -v 'Running\|Completed' || true)
+
+    if [[ -n "$bad_pods" ]]; then
+        local count
+        count=$(echo "$bad_pods" | wc -l | tr -d ' ')
+        add_issue "WARN" "ACM namespace: $count pod(s) not Running" \
+            "Investigate: oc get pods -n open-cluster-management | grep -v Running"
+    else
+        local csv
+        csv=$($KUBE_CLI get csv -n open-cluster-management --no-headers \
+            --request-timeout=10s 2>/dev/null | grep 'advanced-cluster-management' | head -1 || echo "")
+        if [[ -z "$csv" ]]; then
+            add_issue "FAIL" "ACM operator CSV not found" \
+                "Install ACM: bin/install-custom-acm"
+        else
+            local phase
+            phase=$(echo "$csv" | awk '{print $NF}')
+            if [[ "$phase" == "Succeeded" ]]; then
+                local version
+                version=$(echo "$csv" | awk '{print $1}')
+                record_pass "ACM operator: $version ($phase)"
+            else
+                add_issue "WARN" "ACM operator CSV: $phase" ""
+            fi
+        fi
+    fi
+}
+
+check_mco_pod_staleness() {
+    local created
+    created=$($KUBE_CLI get pods -n open-cluster-management \
+        -l name=multicluster-observability-operator \
+        -o jsonpath='{.items[0].metadata.creationTimestamp}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -z "$created" ]]; then
+        record_skip "MCO operator pod: not found"
+        return
+    fi
+
+    local created_epoch now_epoch age_days
+    created_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$created" "+%s" 2>/dev/null || \
+                    date -d "$created" "+%s" 2>/dev/null || echo "0")
+    now_epoch=$(date "+%s")
+    age_days=$(( (now_epoch - created_epoch) / 86400 ))
+
+    if [[ $age_days -gt 14 ]]; then
+        add_issue "WARN" "MCO operator pod: ${age_days} days old" \
+            "oc rollout restart deployment/multicluster-observability-operator -n open-cluster-management"
+    else
+        record_pass "MCO operator pod: ${age_days} days old"
+    fi
+}
+
+check_image_override() {
+    local override_exists
+    override_exists=$($KUBE_CLI get configmap image-override \
+        -n open-cluster-management --no-headers \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -z "$override_exists" ]]; then
+        record_pass "Image override: not configured (stock images)"
+        return
+    fi
+
+    local expected_image actual_image
+    expected_image=$($KUBE_CLI get configmap image-override -n open-cluster-management \
+        -o jsonpath='{.data.image-override\.json}' 2>/dev/null | \
+        jq -r '.[] | select(.["image-key"]=="multicluster_observability_operator") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' 2>/dev/null || echo "")
+    actual_image=$($KUBE_CLI get deployment multicluster-observability-operator \
+        -n open-cluster-management \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -n "$expected_image" && -n "$actual_image" && "$actual_image" != *"$expected_image"* && "$expected_image" != *"$actual_image"* ]]; then
+        add_issue "WARN" "Image override mismatch: expected $expected_image, running $actual_image" \
+            "bin/image-override apply --force-reconcile"
+    else
+        record_pass "Image override: configured, images match"
+    fi
+}
+
+# =============================================================================
+# Section 2: Observability Pipeline
+# =============================================================================
+
+check_mco_conditions() {
+    if ! resource_exists mco "$MCO_NAME" 2>/dev/null; then
+        add_issue "FAIL" "MCO CR not found" \
+            "Install observability: bin/setup-observability install"
+        MCO_READY="false"
+        return
+    fi
+
+    local ready
+    ready=$(get_resource_field mco "$MCO_NAME" "" \
+        '{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+
+    if [[ "$ready" == "True" ]]; then
+        MCO_READY="true"
+        record_pass "MCO: Ready"
+    else
+        MCO_READY="false"
+        local reason message
+        reason=$(get_resource_field mco "$MCO_NAME" "" \
+            '{.status.conditions[?(@.type=="Failed")].reason}' 2>/dev/null || echo "unknown")
+        message=$(get_resource_field mco "$MCO_NAME" "" \
+            '{.status.conditions[?(@.type=="Failed")].message}' 2>/dev/null || echo "")
+        add_issue "FAIL" "MCO: $reason — $message" \
+            "Check: oc get mco observability -o jsonpath='{.status.conditions}' | python3 -m json.tool"
+    fi
+}
+
+check_thanos_health() {
+    # Thanos receive StatefulSet
+    local receive_ready receive_replicas
+    receive_ready=$($KUBE_CLI get statefulset observability-thanos-receive-default \
+        -n "$OBS_NAMESPACE" -o jsonpath='{.status.readyReplicas}' \
+        --request-timeout=10s 2>/dev/null || echo "0")
+    receive_replicas=$($KUBE_CLI get statefulset observability-thanos-receive-default \
+        -n "$OBS_NAMESPACE" -o jsonpath='{.spec.replicas}' \
+        --request-timeout=10s 2>/dev/null || echo "0")
+
+    if [[ "$receive_ready" != "$receive_replicas" ]]; then
+        add_issue "FAIL" "Thanos receive: ${receive_ready}/${receive_replicas} ready" \
+            "Check unhealthy pods: oc get pods -n $OBS_NAMESPACE -l app.kubernetes.io/name=thanos-receive"
+    fi
+
+    # Thanos compact
+    local compact_status
+    compact_status=$($KUBE_CLI get pods -n "$OBS_NAMESPACE" \
+        -l app.kubernetes.io/name=thanos-compact --no-headers \
+        --request-timeout=10s 2>/dev/null | head -1 || echo "")
+
+    if echo "$compact_status" | grep -i 'CrashLoop\|Error\|ImagePull' >/dev/null 2>&1; then
+        local compact_err
+        compact_err=$($KUBE_CLI logs -n "$OBS_NAMESPACE" \
+            -l app.kubernetes.io/name=thanos-compact --tail=5 2>/dev/null | \
+            grep 'level=error' | tail -1 | sed 's/.*err="//' | sed 's/".*//' || echo "unknown")
+        if echo "$compact_err" | grep -i 'resolution retention' >/dev/null 2>&1; then
+            add_issue "FAIL" "Thanos compact crashed: retentionResolution5m must be > 10 days" \
+                "oc patch mco observability --type merge -p '{\"spec\":{\"advanced\":{\"retentionConfig\":{\"retentionResolution5m\":\"14d\"}}}}'"
+        else
+            add_issue "FAIL" "Thanos compact: CrashLoopBackOff" \
+                "Check logs: oc logs -n $OBS_NAMESPACE -l app.kubernetes.io/name=thanos-compact --tail=10"
+        fi
+    fi
+
+    # Bucket quota (check receive + compact logs)
+    local bucket_err
+    bucket_err=$($KUBE_CLI logs -n "$OBS_NAMESPACE" \
+        -l app.kubernetes.io/name=thanos-receive --tail=10 2>/dev/null | \
+        grep 'Bucket quota' || true)
+    if [[ -z "$bucket_err" ]]; then
+        bucket_err=$($KUBE_CLI logs -n "$OBS_NAMESPACE" \
+            -l app.kubernetes.io/name=thanos-compact --tail=10 2>/dev/null | \
+            grep 'Bucket quota' || true)
+    fi
+
+    if [[ -n "$bucket_err" ]]; then
+        add_issue "FAIL" "Object storage: Bucket quota exceeded" \
+            "Increase MinIO bucket quota, or apply retention config (WARNING: reduces data retention):
+         oc patch mco observability --type merge -p '{\"spec\":{\"advanced\":{\"retentionConfig\":{\"retentionResolutionRaw\":\"5d\",\"retentionResolution5m\":\"14d\",\"retentionResolution1h\":\"30d\"}}}}'"
+    fi
+
+    # All good if no issues added
+    if [[ "$receive_ready" == "$receive_replicas" && -z "$bucket_err" ]] && \
+       ! echo "$compact_status" | grep -i 'CrashLoop\|Error' >/dev/null 2>&1; then
+        record_pass "Thanos health: receive ${receive_ready}/${receive_replicas}, compact running"
+    fi
+}
+
+check_stuck_manifestworks() {
+    local mc_list stuck_count=0
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -z "$mc_list" ]]; then
+        record_skip "Stuck ManifestWorks: no managed clusters" ""
+        return
+    fi
+
+    for mc in $mc_list; do
+        local stuck
+        stuck=$($KUBE_CLI get manifestwork -n "$mc" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' \
+            --request-timeout=10s 2>/dev/null | grep -v "^$" | grep -c $'\t' || echo "0")
+        if [[ "$stuck" -gt 0 ]]; then
+            ((stuck_count += stuck)) || true
+        fi
+    done
+
+    if [[ $stuck_count -gt 0 ]]; then
+        add_issue "WARN" "Stuck ManifestWorks: $stuck_count across managed clusters" \
+            "bin/setup-observability install --force-cleanup-mw"
+    else
+        record_pass "ManifestWorks: no stuck resources"
+    fi
+}
+
+# =============================================================================
+# Section 3: Addon Health
+# =============================================================================
+
+check_mcoa_health() {
+    local mcoa_deploy
+    mcoa_deploy=$($KUBE_CLI get deployment multicluster-observability-addon-manager \
+        -n "$OBS_NAMESPACE" --no-headers \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -z "$mcoa_deploy" ]]; then
+        record_pass "MCOA addon manager: not deployed (MCO mode)"
+        return
+    fi
+
+    local ready_replicas
+    ready_replicas=$(echo "$mcoa_deploy" | awk '{print $2}' || echo "0/0")
+    if [[ "$ready_replicas" != "1/1" ]]; then
+        add_issue "WARN" "MCOA addon manager: $ready_replicas ready" \
+            "oc rollout restart deployment/multicluster-observability-addon-manager -n $OBS_NAMESPACE"
+    else
+        record_pass "MCOA addon manager: running"
+    fi
+}
+
+check_mca_crd_terminating() {
+    local deletion_ts
+    deletion_ts=$($KUBE_CLI get crd managedclusteraddons.addon.open-cluster-management.io \
+        -o jsonpath='{.metadata.deletionTimestamp}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -n "$deletion_ts" ]]; then
+        add_issue "FAIL" "ManagedClusterAddon CRD stuck terminating (since $deletion_ts) — blocks ALL addon creation" \
+            "WARNING: Removing finalizers may orphan resources. Contact support if unsure.
+         Patch stuck instances: oc get managedclusteraddon -A -o name | xargs -I{} oc patch {} --type=merge -p '{\"metadata\":{\"finalizers\":null}}'
+         Then restart: oc rollout restart deploy/cluster-manager -n multicluster-engine" \
+            ""
+    else
+        record_pass "ManagedClusterAddon CRD: healthy"
+    fi
+}
+
+check_coo_perses() {
+    # Only check in MCOA mode
+    local annotation
+    annotation=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath="{.metadata.annotations.observability\.open-cluster-management\.io/right-sizing-capable}" \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -z "$annotation" ]]; then
+        record_skip "COO/Perses: MCO mode (not applicable)"
+        return
+    fi
+
+    local coo_csv
+    coo_csv=$($KUBE_CLI get csv -n openshift-operators --no-headers \
+        --request-timeout=10s 2>/dev/null | grep 'cluster-observability-operator' | head -1 || echo "")
+
+    if [[ -z "$coo_csv" ]]; then
+        add_issue "WARN" "COO not installed (required for Perses dashboards in MCOA mode)" \
+            "Check MCOA ManifestWork for local-cluster: oc get manifestwork -n local-cluster"
+    else
+        local perses_count
+        perses_count=$($KUBE_CLI get persesdashboard -A --no-headers \
+            --request-timeout=10s 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+        if [[ "$perses_count" -eq 0 ]]; then
+            add_issue "WARN" "COO installed but no Perses dashboards found" \
+                "Check: oc get persesdashboard -A"
+        else
+            record_pass "COO/Perses: $perses_count dashboard(s)"
+        fi
+    fi
+}
+
+# =============================================================================
+# Section 4: Cluster Connectivity
+# =============================================================================
+
+check_managedcluster_health() {
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -z "$mc_list" ]]; then
+        record_pass "ManagedClusters: none found"
+        return
+    fi
+
+    local unhealthy=0
+    for mc in $mc_list; do
+        local avail
+        avail=$($KUBE_CLI get managedcluster "$mc" \
+            -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
+            --request-timeout=10s 2>/dev/null || echo "Unknown")
+        if [[ "$avail" != "True" ]]; then
+            add_issue "WARN" "ManagedCluster $mc: Available=$avail" \
+                "bin/add-managed-cluster add $mc --force-import"
+            ((unhealthy++)) || true
+        fi
+    done
+
+    if [[ $unhealthy -eq 0 ]]; then
+        local count
+        count=$(echo "$mc_list" | wc -w | tr -d ' ')
+        record_pass "ManagedClusters: $count cluster(s), all Available"
+    fi
+}
+
+check_spoke_metrics_collector() {
+    local mc_list
+    mc_list=$($KUBE_CLI get observabilityaddon -A --no-headers \
+        --request-timeout=10s 2>/dev/null | awk '{print $1}' || echo "")
+
+    if [[ -z "$mc_list" ]]; then
+        record_pass "Spoke metrics: no ObservabilityAddon CRs found"
+        return
+    fi
+
+    local issues=0
+    for mc in $mc_list; do
+        local enabled
+        enabled=$($KUBE_CLI get observabilityaddon observability-addon -n "$mc" \
+            -o jsonpath='{.spec.enableMetrics}' \
+            --request-timeout=10s 2>/dev/null || echo "unknown")
+        if [[ "$enabled" == "false" ]]; then
+            add_issue "WARN" "$mc: enableMetrics=false (metrics-collector not deployed)" \
+                "oc patch observabilityaddon observability-addon -n $mc --type merge -p '{\"spec\":{\"enableMetrics\":true}}'" \
+                "enableMetrics may be intentionally disabled — verify with cluster admin before enabling"
+            ((issues++)) || true
+        fi
+    done
+
+    if [[ $issues -eq 0 ]]; then
+        local count
+        count=$(echo "$mc_list" | wc -l | tr -d ' ')
+        record_pass "Spoke metrics: $count spoke(s), all enableMetrics=true"
+    fi
+}
+
+check_klusterletaddonconfig() {
+    local mc_list
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{range .items[?(@.metadata.labels.local-cluster!="true")]}{.metadata.name}{"\n"}{end}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -z "$mc_list" ]]; then
+        record_pass "KlusterletAddonConfig: no non-hub clusters"
+        return
+    fi
+
+    local missing=0
+    for mc in $mc_list; do
+        local kac
+        kac=$($KUBE_CLI get klusterletaddonconfig -n "$mc" --no-headers \
+            --request-timeout=10s 2>/dev/null || echo "")
+        if [[ -z "$kac" ]]; then
+            add_issue "WARN" "$mc: KlusterletAddonConfig missing (Policy addons won't deploy)" \
+                "bin/add-managed-cluster add $mc --force-import"
+            ((missing++)) || true
+        fi
+    done
+
+    if [[ $missing -eq 0 ]]; then
+        record_pass "KlusterletAddonConfig: present on all spokes"
+    fi
+}
+
+# =============================================================================
+# Section 5: Right-Sizing
+# =============================================================================
+
+check_rs_resources() {
+    if [[ "$MCO_READY" != "true" ]]; then
+        record_skip "RS resources: MCO not Ready (skipped)"
+        return
+    fi
+
+    local ns_enabled virt_enabled
+    ns_enabled=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath='{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+    virt_enabled=$($KUBE_CLI get mco "$MCO_NAME" \
+        -o jsonpath='{.spec.capabilities.platform.analytics.virtualizationRightSizingRecommendation.enabled}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ "$ns_enabled" != "true" && "$virt_enabled" != "true" ]]; then
+        record_pass "RS: both features disabled"
+        return
+    fi
+
+    # Check ConfigMaps
+    local cm_issues=0
+    if [[ "$ns_enabled" == "true" ]]; then
+        if ! resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null; then
+            ((cm_issues++)) || true
+        fi
+    fi
+    if [[ "$virt_enabled" == "true" ]]; then
+        if ! resource_exists configmap rs-virt-config "$OBS_NAMESPACE" 2>/dev/null; then
+            ((cm_issues++)) || true
+        fi
+    fi
+
+    # Check delivery mechanism based on release
+    local rs_mode="mco"
+    if release_is_50; then
+        rs_mode="mcoa"
+    else
+        local annotation
+        annotation=$($KUBE_CLI get mco "$MCO_NAME" \
+            -o jsonpath="{.metadata.annotations.observability\.open-cluster-management\.io/right-sizing-capable}" \
+            --request-timeout=10s 2>/dev/null || echo "")
+        if [[ -n "$annotation" ]]; then rs_mode="mcoa"; fi
+    fi
+
+    local delivery_issues=0
+    if [[ "$rs_mode" == "mco" ]]; then
+        # MCO mode — check Policies (use fully-qualified name to avoid Kyverno collision)
+        local policy_count
+        policy_count=$($KUBE_CLI get policy.policy.open-cluster-management.io \
+            -n open-cluster-management-global-set --no-headers \
+            --request-timeout=10s 2>/dev/null | grep -c 'rs-' || true)
+        if [[ $policy_count -eq 0 ]]; then ((delivery_issues++)) || true; fi
+
+        if [[ $cm_issues -gt 0 || $delivery_issues -gt 0 ]]; then
+            add_issue "WARN" "RS resources (MCO mode): $cm_issues ConfigMap(s) missing, $policy_count Policy(s) found" \
+                "Toggle RS features to trigger reconciliation:
+         oc patch mco observability --type merge -p '{\"spec\":{\"capabilities\":{\"platform\":{\"analytics\":{\"namespaceRightSizingRecommendation\":{\"enabled\":false},\"virtualizationRightSizingRecommendation\":{\"enabled\":false}}}}}}'
+         sleep 15
+         oc patch mco observability --type merge -p '{\"spec\":{\"capabilities\":{\"platform\":{\"analytics\":{\"namespaceRightSizingRecommendation\":{\"enabled\":true},\"virtualizationRightSizingRecommendation\":{\"enabled\":true}}}}}}'"
+        else
+            record_pass "RS resources (MCO mode): ConfigMaps present, $policy_count Policy(s)"
+        fi
+    else
+        # MCOA mode — check ManifestWork PrometheusRules
+        local mc_list mw_pr_total=0
+        mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' \
+            --request-timeout=10s 2>/dev/null || echo "")
+        for mc in $mc_list; do
+            local pr_count
+            pr_count=$($KUBE_CLI get manifestwork -n "$mc" -o json \
+                --request-timeout=10s 2>/dev/null | python3 -c "
+import sys,json
+mws=json.load(sys.stdin).get('items',[])
+total=0
+for mw in mws:
+    for m in mw.get('spec',{}).get('workload',{}).get('manifests',[]):
+        if m.get('kind')=='PrometheusRule' and 'acm-rs' in m.get('metadata',{}).get('name',''):
+            total+=1
+print(total)
+" 2>/dev/null || echo "0")
+            ((mw_pr_total += pr_count)) || true
+        done
+
+        if [[ $cm_issues -gt 0 || $mw_pr_total -eq 0 ]]; then
+            add_issue "WARN" "RS resources (MCOA mode): $cm_issues ConfigMap(s) missing, $mw_pr_total ManifestWork PrometheusRule(s)" \
+                "Restart MCOA addon manager:
+         oc rollout restart deployment/multicluster-observability-addon-manager -n open-cluster-management-observability"
+        else
+            record_pass "RS resources (MCOA mode): ConfigMaps present, $mw_pr_total ManifestWork PrometheusRule(s)"
+        fi
+    fi
+}
+
+check_rs_thanos_data() {
+    if [[ "$MCO_READY" != "true" ]]; then
+        record_skip "RS data in Thanos: MCO not Ready (skipped)"
+        return
+    fi
+
+    local route_host
+    route_host=$($KUBE_CLI get route rbac-query-proxy \
+        -n "$OBS_NAMESPACE" -o jsonpath='{.spec.host}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+
+    if [[ -z "$route_host" ]]; then
+        record_skip "RS data in Thanos: rbac-query-proxy route not found (skipped)"
+        return
+    fi
+
+    local token
+    token=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
+    local ns_count
+    ns_count=$(curl -sk --connect-timeout 10 --max-time 15 \
+        -H "Authorization: Bearer $token" \
+        "https://${route_host}/api/v1/query" \
+        --data-urlencode 'query=count(acm_rs:namespace:cpu_request)' 2>/dev/null | \
+        jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo "0")
+
+    if [[ "$ns_count" == "0" ]]; then
+        add_issue "WARN" "RS data in Thanos: 0 namespace RS series" \
+            "Check spoke metrics-collector (check 12) and Thanos health (check 6)"
+    else
+        record_pass "RS data in Thanos: $ns_count namespace series"
+    fi
+}
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+print_summary() {
+    local total_fail=0 total_warn=0
+
+    for sev in "${ISSUE_SEVERITIES[@]}"; do
+        [[ "$sev" == "FAIL" ]] && ((total_fail++)) || true
+        [[ "$sev" == "WARN" ]] && ((total_warn++)) || true
+    done
+
+    echo ""
+    local acm_version
+    acm_version=$($KUBE_CLI get mch multiclusterhub -n open-cluster-management \
+        -o jsonpath='{.status.currentVersion}' --request-timeout=10s 2>/dev/null || echo "N/A")
+    local cluster_url
+    cluster_url=$($KUBE_CLI cluster-info --request-timeout=10s 2>/dev/null | head -1 | \
+        sed 's/.*at //' | sed 's/\x1b\[[0-9;]*m//g' || echo "unknown")
+    log_step "Cluster Diagnostics (ACM $acm_version, $cluster_url)"
+    print_separator
+
+    # Section summaries
+    for i in "${!SECTION_NAMES[@]}"; do
+        local total="${SECTION_TOTAL[$i]}"
+        local pass="${SECTION_PASS[$i]}"
+        if [[ $pass -eq $total ]]; then
+            echo -e "  ${GREEN}${SECTION_NAMES[$i]}: ${pass}/${total} checks passed${NC}"
+        else
+            echo -e "  ${YELLOW}${SECTION_NAMES[$i]}: ${pass}/${total} checks passed${NC}"
+        fi
+    done
+
+    # Issues
+    if [[ ${#ISSUE_SEVERITIES[@]} -gt 0 ]]; then
+        echo ""
+        log_step "Issues Found (${total_fail} FAIL, ${total_warn} WARN)"
+        print_separator
+
+        for i in "${!ISSUE_SEVERITIES[@]}"; do
+            local num=$((i + 1))
+            if [[ "${ISSUE_SEVERITIES[$i]}" == "FAIL" ]]; then
+                echo -e "  ${num}. ${RED}[FAIL]${NC} ${ISSUE_DESCRIPTIONS[$i]}"
+            else
+                echo -e "  ${num}. ${YELLOW}[WARN]${NC} ${ISSUE_DESCRIPTIONS[$i]}"
+            fi
+            if [[ -n "${ISSUE_NOTES[$i]:-}" ]]; then
+                echo -e "     ${BLUE}Note:${NC} ${ISSUE_NOTES[$i]}"
+            fi
+            if [[ -n "${ISSUE_FIXES[$i]:-}" ]]; then
+                echo -e "     ${BLUE}Fix:${NC} ${ISSUE_FIXES[$i]}"
+            fi
+            echo ""
+        done
+    else
+        echo ""
+        log_success "No issues found"
+    fi
+
+    print_separator
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    parse_args "$@"
+    init_acm_tools
+    init_hub_context
+    detect_release
+
+    # Section 1: Infrastructure
+    start_section "Infrastructure"
+    check_node_health || true
+    check_operator_health || true
+    check_mco_pod_staleness || true
+    check_image_override || true
+
+    # Section 2: Observability Pipeline
+    start_section "Observability Pipeline"
+    check_mco_conditions || true
+    check_thanos_health || true
+    check_stuck_manifestworks || true
+
+    # Section 3: Addon Health
+    start_section "Addon Health"
+    check_mcoa_health || true
+    check_mca_crd_terminating || true
+    check_coo_perses || true
+
+    # Section 4: Cluster Connectivity (skip with --quick)
+    if [[ "$QUICK" == "false" ]]; then
+        start_section "Cluster Connectivity"
+        check_managedcluster_health || true
+        check_spoke_metrics_collector || true
+        check_klusterletaddonconfig || true
+    fi
+
+    # Section 5: Right-Sizing
+    start_section "Right-Sizing"
+    check_rs_resources || true
+    check_rs_thanos_data || true
+
+    print_summary
+}
+
+main "$@"

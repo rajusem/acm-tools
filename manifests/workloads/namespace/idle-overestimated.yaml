@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: idle-overestimated
+  namespace: rs-test-overestimated
+  labels:
+    app: idle-overestimated
+    workload-type: overestimated
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: idle-overestimated
+  template:
+    metadata:
+      labels:
+        app: idle-overestimated
+    spec:
+      containers:
+      - name: idle
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        command:
+        - /bin/sh
+        - -c
+        - sleep infinity

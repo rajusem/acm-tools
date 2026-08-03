@@ -62,7 +62,8 @@ spec:
                 - nohup /usr/sbin/sshd > /dev/null 2>&1 &
                 - sleep 3
                 - pgrep -f "/usr/sbin/sshd" && echo "sshd started successfully" || echo "sshd may not be running"
-                - echo "VM Ready for Stress Test" > /etc/vm_status
+                - nohup stress-ng --cpu 2 --vm 1 --vm-bytes 3200M --vm-keep -t 0 > /dev/null 2>&1 &
+                - sleep 5 && pgrep stress-ng && echo STRESS_NG_RUNNING > /etc/vm_status || echo STRESS_NG_FAILED > /etc/vm_status
 ---
 apiVersion: v1
 kind: Service

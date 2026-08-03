@@ -927,6 +927,46 @@ stop_thanos_port_forward() {
     fi
 }
 
+format_bytes() {
+    local bytes="$1"
+    awk "BEGIN {
+        b = $bytes;
+        if (b >= 1073741824) printf \"%.2f GiB\", b/1073741824;
+        else if (b >= 1048576) printf \"%.2f MiB\", b/1048576;
+        else if (b >= 1024) printf \"%.2f KiB\", b/1024;
+        else printf \"%d B\", b;
+    }"
+}
+
+classify_recommendation() {
+    local recommendation="$1" request="$2"
+    awk "BEGIN {
+        ratio = $recommendation / $request
+        if (ratio > 1.2) print \"underestimated\"
+        else if (ratio < 0.8) print \"overestimated\"
+        else print \"ideal\"
+    }"
+}
+
+assert_classification() {
+    local resource="$1" expected_class="$2" recommendation="$3" request="$4"
+    local context_label="$5" soft="${6:-false}"
+    local actual_class
+    actual_class=$(classify_recommendation "$recommendation" "$request")
+    local ratio
+    ratio=$(awk "BEGIN {printf \"%.3f\", $recommendation / $request}")
+    if [[ "$actual_class" == "$expected_class" ]]; then
+        log_success "  $context_label $resource: $actual_class (ratio=$ratio)"
+        return 0
+    elif [[ "$soft" == "true" ]]; then
+        log_warn "  $context_label $resource: $actual_class (expected $expected_class, ratio=$ratio) — soft check"
+        return 0
+    else
+        log_error "  $context_label $resource: $actual_class (expected $expected_class, ratio=$ratio)"
+        return 1
+    fi
+}
+
 thanos_query_metric() {
     local metric_name="$1"
     local label_selector="${2:-}"
@@ -936,12 +976,17 @@ thanos_query_metric() {
     local -a curl_args=(-sk --connect-timeout 10 --max-time 30)
     [[ -n "${THANOS_TOKEN:-}" ]] && curl_args+=(-H "Authorization: Bearer $THANOS_TOKEN")
 
-    local response
-    response=$(curl "${curl_args[@]}" \
-        "${THANOS_URL}/api/v1/query" \
-        --data-urlencode "query=${query}" 2>/dev/null)
-
-    echo "$response" | jq -r '.data.result[0].value[1] // empty' 2>/dev/null
+    local attempt value
+    for attempt in 1 2 3; do
+        local response
+        response=$(curl "${curl_args[@]}" \
+            "${THANOS_URL}/api/v1/query" \
+            --data-urlencode "query=${query}" 2>/dev/null) || true
+        value=$(echo "$response" | jq -r '.data.result[0].value[1] // empty' 2>/dev/null)
+        [[ -n "$value" ]] && break
+        [[ $attempt -lt 3 ]] && sleep 10
+    done
+    echo "$value"
 }
 
 thanos_metric_exists() {
@@ -961,6 +1006,7 @@ deploy_namespace_workloads() {
     local deployed=0
     for file in "$WORKLOADS_DIR"/namespace/*.yaml; do
         [[ -f "$file" ]] || continue
+        grep -q "namespace: offline-workload" "$file" || continue
         sed "s/namespace: offline-workload/namespace: $ns/g" "$file" | \
             kube_retry $KUBE_CLI --context="$ctx" apply -f - 2>/dev/null
         ((deployed++)) || true
@@ -1017,6 +1063,28 @@ deploy_vm_workloads() {
     done
 }
 
+deploy_classification_workloads() {
+    local ctx="$NAMESPACE_SPOKE_CONTEXT"
+    for ns in "$RS_NS_OVERESTIMATED_NS" "$RS_NS_IDEAL_NS"; do
+        kube_retry $KUBE_CLI --context="$ctx" create namespace "$ns" \
+            --dry-run=client -o yaml 2>/dev/null | \
+            kube_retry $KUBE_CLI --context="$ctx" apply -f - 2>/dev/null
+    done
+    $KUBE_CLI --context="$ctx" apply -f "$WORKLOADS_DIR/namespace/idle-overestimated.yaml" 2>/dev/null
+    $KUBE_CLI --context="$ctx" apply -f "$WORKLOADS_DIR/namespace/ideal-range.yaml" 2>/dev/null
+    local ready=0
+    for dep in idle-overestimated ideal-range; do
+        local ns
+        [[ "$dep" == "idle-overestimated" ]] && ns="$RS_NS_OVERESTIMATED_NS" || ns="$RS_NS_IDEAL_NS"
+        if $KUBE_CLI --context="$ctx" rollout status deployment/"$dep" -n "$ns" --timeout=60s &>/dev/null; then
+            ((ready++)) || true
+        else
+            log_warn "  Deployment $dep in $ns did not become ready"
+        fi
+    done
+    log_success "  Deployed $ready/2 classification workloads"
+}
+
 cleanup_data_plane_workloads() {
     if $KUBE_CLI --context="$NAMESPACE_SPOKE_CONTEXT" get namespace "$RS_NS_WORKLOAD_NS" &>/dev/null 2>&1; then
         log_substep "Cleaning namespace workloads from $NAMESPACE_SPOKE_CONTEXT"
@@ -1025,6 +1093,15 @@ cleanup_data_plane_workloads() {
             log_warn "  Namespace $RS_NS_WORKLOAD_NS deletion timed out"
         log_success "  Namespace workloads cleaned"
     fi
+
+    for ns in "$RS_NS_OVERESTIMATED_NS" "$RS_NS_IDEAL_NS"; do
+        if $KUBE_CLI --context="$NAMESPACE_SPOKE_CONTEXT" get namespace "$ns" &>/dev/null 2>&1; then
+            log_substep "Cleaning classification namespace $ns"
+            $KUBE_CLI --context="$NAMESPACE_SPOKE_CONTEXT" delete namespace "$ns" \
+                --ignore-not-found=true --timeout=60s 2>/dev/null || \
+                log_warn "  Namespace $ns deletion timed out"
+        fi
+    done
 
     if [[ "$SKIP_VM" == "false" ]]; then
         if $KUBE_CLI --context="$VM_SPOKE_CONTEXT" get namespace "$RS_VM_WORKLOAD_NS" &>/dev/null 2>&1; then
@@ -2995,6 +3072,7 @@ phase_17() {
     fi
 
     local ctx="$NAMESPACE_SPOKE_CONTEXT"
+    local errors=0
 
     log_substep "Checking namespace spoke connectivity"
     if ! $KUBE_CLI --context="$ctx" cluster-info \
@@ -3028,6 +3106,20 @@ phase_17() {
         PHASE_FAIL_REASON="Incomplete CronJob deployment: $count/5"
         return 1
     fi
+
+    log_substep "Deploying classification workloads (overestimated + ideal)"
+    deploy_classification_workloads
+
+    log_substep "Verifying classification Deployments"
+    for pair in "$RS_NS_OVERESTIMATED_NS:idle-overestimated" "$RS_NS_IDEAL_NS:ideal-range"; do
+        local ns="${pair%%:*}" dep="${pair##*:}"
+        if $KUBE_CLI --context="$NAMESPACE_SPOKE_CONTEXT" get deployment "$dep" -n "$ns" &>/dev/null; then
+            log_success "  $dep in $ns: exists"
+        else
+            log_error "  $dep in $ns: not found"
+            ((errors++)) || true
+        fi
+    done
 
     return 0
 }
@@ -3088,7 +3180,7 @@ phase_19() {
     fi
 
     log_info "  Waiting ${TIMEOUT_METRICS_WAIT}s for Thanos to ingest metrics"
-    log_info "  (Prometheus evaluates recording rules every ~30s, remote-writes every ~5m)"
+    log_info "  (5m rules evaluate every 5m, 1d rules every 15m, remote-write every ~5m)"
     wait_with_message "$TIMEOUT_METRICS_WAIT" "Waiting for Thanos to ingest metrics"
     return 0
 }
@@ -3101,6 +3193,14 @@ phase_20() {
 
     switch_context "$HUB_CONTEXT" || { PHASE_FAIL_REASON="Cannot switch to hub context"; return 1; }
 
+    # Pre-check: verify classification namespaces exist on spoke
+    for ns in "$RS_NS_OVERESTIMATED_NS" "$RS_NS_IDEAL_NS"; do
+        if ! $KUBE_CLI --context="$NAMESPACE_SPOKE_CONTEXT" get namespace "$ns" &>/dev/null 2>&1; then
+            PHASE_FAIL_REASON="Namespace $ns not found on $NAMESPACE_SPOKE_CONTEXT — run phase 17 first"
+            return 1
+        fi
+    done
+
     log_substep "Discovering Thanos endpoint"
     if ! discover_thanos_endpoint; then
         PHASE_FAIL_REASON="No Thanos endpoint found on hub"
@@ -3111,25 +3211,59 @@ phase_20() {
     THANOS_TOKEN=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
 
     local errors=0
-    local ns_label="namespace=\"$RS_NS_WORKLOAD_NS\""
 
-    log_substep "Checking acm_rs:namespace:* metrics for $RS_NS_WORKLOAD_NS"
-    for metric in cpu_request cpu_usage cpu_recommendation memory_request memory_usage memory_recommendation; do
-        local full_metric="acm_rs:namespace:${metric}"
-        local value
-        value=$(thanos_query_metric "$full_metric" "$ns_label")
-        if [[ -n "$value" ]]; then
-            log_success "  $full_metric = $value"
-        else
-            log_error "  $full_metric: no data"
-            ((errors++)) || true
+    # Namespace classification pairs: (namespace, expected_class, cpu_mode, mem_mode)
+    # cpu_mode/mem_mode: "hard" or "soft"
+    local -a ns_tests=(
+        "$RS_NS_WORKLOAD_NS:underestimated:hard:soft"
+        "$RS_NS_OVERESTIMATED_NS:overestimated:hard:hard"
+        "$RS_NS_IDEAL_NS:ideal:skip:hard"
+    )
+
+    for entry in "${ns_tests[@]}"; do
+        IFS=: read -r ns expected_class cpu_mode mem_mode <<< "$entry"
+        log_substep "Checking metrics for $ns (expected: $expected_class)"
+
+        local val_cpu_request="" val_cpu_usage="" val_cpu_recommendation=""
+        local val_memory_request="" val_memory_usage="" val_memory_recommendation=""
+        for metric in cpu_request cpu_usage cpu_recommendation memory_request memory_usage memory_recommendation; do
+            local full_metric="acm_rs:namespace:${metric}"
+            local value
+            value=$(thanos_query_metric "$full_metric" "namespace=\"$ns\"")
+            if [[ -n "$value" ]]; then
+                eval "val_${metric}=\"$value\""
+                log_success "  $full_metric = $value"
+            else
+                log_error "  $full_metric: no data"
+                ((errors++)) || true
+            fi
+        done
+
+        # Memory classification
+        if [[ -n "$val_memory_request" && -n "$val_memory_recommendation" ]]; then
+            local soft_flag="false"
+            [[ "$mem_mode" == "soft" ]] && soft_flag="true"
+            assert_classification "memory" "$expected_class" \
+                "$val_memory_recommendation" "$val_memory_request" "$ns" "$soft_flag" || \
+                ((errors++)) || true
+        fi
+
+        # CPU classification
+        if [[ "$cpu_mode" == "skip" ]]; then
+            log_info "  Skipping CPU classification for $ns (not controllable)"
+        elif [[ -n "$val_cpu_request" && -n "$val_cpu_recommendation" ]]; then
+            local soft_flag="false"
+            [[ "$cpu_mode" == "soft" ]] && soft_flag="true"
+            assert_classification "cpu" "$expected_class" \
+                "$val_cpu_recommendation" "$val_cpu_request" "$ns" "$soft_flag" || \
+                ((errors++)) || true
         fi
     done
 
     stop_thanos_port_forward
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors namespace metric(s) missing"
+        PHASE_FAIL_REASON="$errors namespace metric(s) missing or classification mismatch"
         return 1
     fi
     return 0
@@ -3147,6 +3281,12 @@ phase_21() {
 
     switch_context "$HUB_CONTEXT" || { PHASE_FAIL_REASON="Cannot switch to hub context"; return 1; }
 
+    # Pre-check: verify VMs exist
+    if ! $KUBE_CLI --context="$VM_SPOKE_CONTEXT" get namespace "$RS_VM_WORKLOAD_NS" &>/dev/null 2>&1; then
+        PHASE_FAIL_REASON="VM namespace $RS_VM_WORKLOAD_NS not found on $VM_SPOKE_CONTEXT — run phase 18 first"
+        return 1
+    fi
+
     if [[ -z "${THANOS_URL:-}" ]]; then
         log_substep "Discovering Thanos endpoint"
         if ! discover_thanos_endpoint; then
@@ -3158,25 +3298,81 @@ phase_21() {
     THANOS_TOKEN=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
 
     local errors=0
-    local vm_label="namespace=\"$RS_VM_WORKLOAD_NS\""
 
-    log_substep "Checking acm_rs_vm:namespace:* metrics for $RS_VM_WORKLOAD_NS"
-    for metric in cpu_request cpu_usage cpu_recommendation memory_request memory_usage memory_recommendation; do
-        local full_metric="acm_rs_vm:namespace:${metric}"
-        local value
-        value=$(thanos_query_metric "$full_metric" "$vm_label")
-        if [[ -n "$value" ]]; then
-            log_success "  $full_metric = $value"
-        else
-            log_error "  $full_metric: no data"
-            ((errors++)) || true
+    # VM classification pairs: (vm_name, expected_class, soft, expected_mem_request_gi)
+    # VM memory underestimation (ratio > 1.2) is physically impossible: usage ≤ VM memory = max(request sources).
+    # Max achievable ratio = 1.1 (100% utilization × 110% recommendation). Test ideal + overestimated only.
+    local -a vm_tests=(
+        "fedora-vm-1:ideal:false:4"
+        "fedora-vm-2:overestimated:false:4"
+        "rhel-vm1:ideal:true:4"
+    )
+
+    for entry in "${vm_tests[@]}"; do
+        IFS=: read -r vm_name expected_class is_soft expected_mem_gi <<< "$entry"
+        local label_selector="name=\"$vm_name\",namespace=\"$RS_VM_WORKLOAD_NS\""
+
+        log_substep "Checking VM $vm_name (expected: $expected_class)"
+
+        local val_cpu_request="" val_cpu_usage="" val_cpu_recommendation=""
+        local val_memory_request="" val_memory_usage="" val_memory_recommendation=""
+        local metric_errors=0
+        for metric in cpu_request cpu_usage cpu_recommendation memory_request memory_usage memory_recommendation; do
+            local full_metric="acm_rs_vm:namespace:${metric}"
+            local value
+            value=$(thanos_query_metric "$full_metric" "$label_selector")
+            if [[ -n "$value" ]]; then
+                eval "val_${metric}=\"$value\""
+                log_success "  $full_metric = $value"
+            else
+                if [[ "$is_soft" == "true" ]]; then
+                    log_warn "  $full_metric: no data (soft)"
+                else
+                    log_error "  $full_metric: no data"
+                    ((metric_errors++)) || true
+                fi
+            fi
+        done
+
+        if [[ $metric_errors -gt 0 ]]; then
+            ((errors += metric_errors)) || true
+            continue
+        fi
+
+        # Memory request sanity check (detect KubeVirt source label doubling)
+        if [[ -n "$val_memory_request" ]]; then
+            local expected_bytes=$(( expected_mem_gi * 1073741824 ))
+            local max_acceptable
+            max_acceptable=$(awk "BEGIN {printf \"%.0f\", $expected_bytes * 1.5}")
+            if awk "BEGIN {exit !($val_memory_request > $max_acceptable)}"; then
+                log_error "  memory_request=$(format_bytes "$val_memory_request") exceeds 1.5x expected $(format_bytes "$expected_bytes") — likely doubled by KubeVirt source label bug (sum vs max)"
+                ((errors++)) || true
+            else
+                log_success "  memory_request=$(format_bytes "$val_memory_request") within expected range (spec: ${expected_mem_gi}Gi)"
+            fi
+        fi
+
+        # Memory classification assertion
+        if [[ -n "$val_memory_request" && -n "$val_memory_recommendation" ]]; then
+            assert_classification "memory" "$expected_class" \
+                "$val_memory_recommendation" "$val_memory_request" "$vm_name" "$is_soft" || \
+                ((errors++)) || true
+        fi
+
+        # CPU classification — informational only (VM CPU underestimation is physically impossible)
+        if [[ -n "$val_cpu_request" && -n "$val_cpu_recommendation" ]]; then
+            local cpu_class
+            cpu_class=$(classify_recommendation "$val_cpu_recommendation" "$val_cpu_request")
+            local cpu_ratio
+            cpu_ratio=$(awk "BEGIN {printf \"%.3f\", $val_cpu_recommendation / $val_cpu_request}")
+            log_info "  $vm_name cpu: $cpu_class (ratio=$cpu_ratio) — VM CPU capped at vCPU count"
         fi
     done
 
     stop_thanos_port_forward
 
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors VM metric(s) missing"
+        PHASE_FAIL_REASON="$errors VM metric(s) missing or classification mismatch"
         return 1
     fi
     return 0

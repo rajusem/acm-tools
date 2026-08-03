@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ideal-range
+  namespace: rs-test-ideal
+  labels:
+    app: ideal-range
+    workload-type: ideal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ideal-range
+  template:
+    metadata:
+      labels:
+        app: ideal-range
+    spec:
+      containers:
+      - name: steady-mem
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+        command:
+        - /bin/sh
+        - -c
+        - |
+          dd if=/dev/zero of=/dev/shm/test bs=1M count=55 2>/dev/null
+          sleep infinity

@@ -46,7 +46,9 @@ export TIMEOUT_E2E_MODE_SWITCH="${TIMEOUT_E2E_MODE_SWITCH:-60}"
 
 # --- Data-plane Workloads ---
 export RS_NS_WORKLOAD_NS="${RS_NS_WORKLOAD_NS:-offline-workload}"
+export RS_NS_OVERESTIMATED_NS="${RS_NS_OVERESTIMATED_NS:-rs-test-overestimated}"
+export RS_NS_IDEAL_NS="${RS_NS_IDEAL_NS:-rs-test-ideal}"
 export RS_VM_WORKLOAD_NS="${RS_VM_WORKLOAD_NS:-auto-vm-test}"
 export RS_VM_SSH_PUBLIC_KEY="${RS_VM_SSH_PUBLIC_KEY:-}"
-export TIMEOUT_METRICS_WAIT="${TIMEOUT_METRICS_WAIT:-1200}"
+export TIMEOUT_METRICS_WAIT="${TIMEOUT_METRICS_WAIT:-1800}"
 export TIMEOUT_VM_BOOT="${TIMEOUT_VM_BOOT:-600}"

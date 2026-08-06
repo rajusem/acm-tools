@@ -182,6 +182,23 @@ GLOBAL_SET_NAMESPACE="open-cluster-management-global-set"
 RS_ANNOTATION="observability.open-cluster-management.io/right-sizing-capable"
 ANALYTICS_NAMESPACE="observability-analytics"
 
+# detect_acm_namespace — finds the MCH namespace dynamically.
+# Users can install MCH in any namespace (e.g., "ocm" instead of "open-cluster-management").
+# Must be called after switch_context to hub (so it queries the hub, not whatever was active).
+detect_acm_namespace() {
+    local namespaces count ns
+    namespaces=$($KUBE_CLI get mch -A --no-headers \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+    [[ -z "$namespaces" ]] && return
+    count=$(echo "$namespaces" | wc -l | tr -d ' ')
+    if [[ "$count" -gt 1 ]]; then
+        log_warn "Multiple MCH CRs found ($count); using first. Set ACM_NAMESPACE to override." >&2
+    fi
+    ns=$(echo "$namespaces" | head -1)
+    [[ -n "$ns" ]] && ACM_NAMESPACE="$ns"
+}
+
 # RS_RELEASE: set by --release flag, inherited from parent via export, or auto-detected.
 # The "${RS_RELEASE:-}" form is required for set -euo pipefail — referencing an unset
 # variable would exit immediately; this form preserves any value exported by a parent
@@ -235,6 +252,7 @@ init_hub_context() {
     ORIGINAL_CONTEXT=$($KUBE_CLI config current-context 2>/dev/null || echo "")
     trap '$KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null 2>&1 || true' EXIT
     switch_context "$HUB_CONTEXT" || { log_error "Failed to switch to hub context"; exit 1; }
+    detect_acm_namespace
 }
 
 # Map a ManagedCluster name to its kubeconfig context.

@@ -44,7 +44,7 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 | `rs-status` | Dashboard showing right-sizing state (mode, ConfigMaps, ADC, policies) |
 | `rs-mode-switch` | Switch between MCO and MCOA right-sizing modes |
 | `rs-collect-must-gather` | Collect diagnostic data for right-sizing issues |
-| `cluster-diagnose` | Automated cluster health diagnostic (15 checks, issues + fix commands) |
+| `cluster-diagnose` | Automated cluster health diagnostic (16 checks, issues + fix commands) |
 | `add-managed-cluster` | Import/re-import managed clusters (klusterlet cleanup, pull secret sync) |
 
 ## Configuration

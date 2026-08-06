@@ -496,6 +496,74 @@ kubectl logs -n open-cluster-management-hub \
    kubectl get managedclusteraddon -n <cluster-name>
    ```
 
+**See also**: [MCO Operator Deadlocked by Stuck MCOA ManagedClusterAddon](#mco-operator-deadlocked-by-stuck-mcoa-managedclusteraddon) — individual MCA instances (not the CRD) stuck with finalizers can also deadlock MCO.
+
+---
+
+## MCO Operator Deadlocked by Stuck MCOA ManagedClusterAddon
+
+**Symptom**: MCO operator logs show "Waiting for MCOA ManifestWorks to be deleted" and never progresses. No `ObservabilityAddon` CRs are created on any managed cluster. MCOA addon-manager logs show "ClusterManagementAddOn not found". The hub-wide observability pipeline is blocked — no spoke receives metrics-collector.
+
+**Root cause**: A `ManagedClusterAddon` for `multicluster-observability-addon` on an unreachable managed cluster has a pre-delete finalizer (`addon.open-cluster-management.io/pre-delete`) that cannot complete because the spoke is unreachable. This keeps the MCOA ManifestWorks alive, and the MCO operator sees them and refuses to proceed — creating a hub-wide deadlock that affects ALL managed clusters, not just the unreachable one.
+
+Common triggers:
+- QE test clusters with fake API URLs (e.g., `https://acmqe-*.com`)
+- Managed clusters that were hibernated or decommissioned without proper cleanup
+- Spoke clusters whose API server is temporarily down during addon uninstall
+
+**Diagnosis**:
+
+```bash
+# 1. Check MCO operator logs for the deadlock message
+oc logs -n open-cluster-management \
+  -l name=multicluster-observability-operator --tail=20 | \
+  grep -i "ManifestWork"
+
+# 2. Find MCAs with deletionTimestamp (stuck deleting)
+oc get managedclusteraddon -A -o json | \
+  jq '.items[] | select(.metadata.deletionTimestamp) |
+      {ns: .metadata.namespace, name: .metadata.name,
+       since: .metadata.deletionTimestamp, finalizers: .metadata.finalizers}'
+
+# 3. Check if the managed cluster is reachable
+oc get managedcluster <cluster-name> -o jsonpath='{.status.conditions}' | \
+  python3 -m json.tool
+# Look for Available: False or Unknown
+
+# 4. Verify ManifestWorks are being recreated (MCOA keeps recreating them)
+oc get manifestwork -n <cluster-name> --no-headers | \
+  grep addon-multicluster-observability-addon
+```
+
+**Fix**:
+
+1. **Patch out the finalizer** on the stuck MCA (safe if the spoke is unreachable):
+   ```bash
+   oc patch managedclusteraddon multicluster-observability-addon \
+     -n <stuck-cluster-namespace> --type=merge \
+     -p '{"metadata":{"finalizers":null}}'
+   ```
+
+2. The stale ManifestWorks clear automatically once the MCA is deleted. MCO operator unblocks within seconds and begins creating `ObservabilityAddon` CRs on all healthy clusters.
+
+3. **Verify recovery**:
+   ```bash
+   # MCO operator should stop logging the deadlock message
+   oc logs -n open-cluster-management \
+     -l name=multicluster-observability-operator --tail=5
+
+   # ObservabilityAddons should appear on healthy clusters
+   oc get observabilityaddon -A --no-headers
+
+   # metrics-collector pods should start on spokes
+   oc --context=<spoke-ctx> get pods -n open-cluster-management-addon-observability \
+     --no-headers | grep metrics-collector
+   ```
+
+**Prevention**: Before removing a managed cluster, ensure its addons are cleanly uninstalled. If a cluster becomes permanently unreachable, remove its `ManagedCluster` CR from the hub — this triggers addon cleanup. If cleanup hangs, patch out finalizers on the stuck MCAs.
+
+**See also**: [ManagedClusterAddon CRD Stuck Terminating](#managedclusteraddon-crd-stuck-terminating) — for the case where the entire CRD (not individual instances) is stuck terminating.
+
 ---
 
 ## Spoke Cluster Registered But Klusterlet Not Deployed

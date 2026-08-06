@@ -17,12 +17,16 @@ oc --context=hub get mce -A --no-headers
 oc --context=hub get nodes --no-headers
 ```
 
+**Note**: MCH may be installed in any namespace (e.g., `ocm` instead of `open-cluster-management`). Use the `-A` output above to identify the actual MCH namespace and use it in subsequent namespace-scoped commands.
+
 ### Step 2: Operator health
 
+Use the MCH namespace identified in Step 1 (default: `open-cluster-management`):
+
 ```bash
-oc --context=hub get csv -n open-cluster-management --no-headers
+oc --context=hub get csv -n <mch-namespace> --no-headers
 oc --context=hub get csv -n multicluster-engine --no-headers
-oc --context=hub get pods -n open-cluster-management --no-headers | grep -v Running
+oc --context=hub get pods -n <mch-namespace> --no-headers | grep -v Running
 oc --context=hub get pods -n open-cluster-management-observability --no-headers | grep -v Running
 oc --context=hub get pods -n multicluster-engine --no-headers | grep -v Running
 ```
@@ -125,7 +129,24 @@ If pod is > 7 days old and issues persist, restart: `oc rollout restart deployme
 
 ### Step 5: MCOA addon health
 
-Check MCOA deployment and addon status:
+First check that the `ClusterManagementAddOn` registration exists — MCOA cannot function without it:
+
+```bash
+oc --context=hub get clustermanagementaddon multicluster-observability-addon
+```
+
+If not found, check MCO operator logs for "Waiting for MCOA ManifestWorks" and check for stuck MCAs with `deletionTimestamp` on unreachable managed clusters:
+
+```bash
+oc --context=hub get managedclusteraddon -A -o json | \
+  jq '.items[] | select(.metadata.deletionTimestamp) |
+      {ns: .metadata.namespace, name: .metadata.name,
+       since: .metadata.deletionTimestamp, finalizers: .metadata.finalizers}'
+```
+
+If stuck MCAs are found on unreachable clusters, see TROUBLESHOOTING.md "MCO Operator Deadlocked by Stuck MCOA ManagedClusterAddon".
+
+Then check MCOA deployment and addon status:
 
 ```bash
 # MCOA deployment

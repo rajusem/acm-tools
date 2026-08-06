@@ -3,7 +3,7 @@
 # cluster-diagnose — Automated cluster health diagnostic
 # =============================================================================
 #
-# Runs 15 checks across 5 sections and prints issues + fix commands.
+# Runs 16 checks across 5 sections and prints issues + fix commands.
 # Strictly read-only — never modifies cluster state.
 #
 # Usage:
@@ -26,17 +26,18 @@
 #
 #   Section 3: Addon Health
 #     8   MCOA addon health (deployment, specHash, ADC)
-#     9   ManagedClusterAddon CRD terminating
-#     10  COO/Perses health (MCOA mode only)
+#     9   Stuck MCA finalizers (>10min, may block MCO)
+#     10  ManagedClusterAddon CRD terminating
+#     11  COO/Perses health (MCOA mode only)
 #
 #   Section 4: Cluster Connectivity (--quick skips)
-#     11  ManagedCluster health
-#     12  Spoke metrics-collector (enableMetrics)
-#     13  KlusterletAddonConfig
+#     12  ManagedCluster health
+#     13  Spoke metrics-collector (enableMetrics)
+#     14  KlusterletAddonConfig
 #
 #   Section 5: Right-Sizing
-#     14  RS resources (Policies, ConfigMaps, PrometheusRules)
-#     15  RS data in Thanos
+#     15  RS resources (Policies, ConfigMaps, PrometheusRules)
+#     16  RS data in Thanos
 # =============================================================================
 
 set -euo pipefail
@@ -71,7 +72,7 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [options]
 
-Automated cluster health diagnostic — checks 15 areas and prints issues + fix commands.
+Automated cluster health diagnostic — checks 16 areas and prints issues + fix commands.
 Strictly read-only — never modifies cluster state.
 
 Options:
@@ -181,17 +182,17 @@ check_node_health() {
 
 check_operator_health() {
     local bad_pods
-    bad_pods=$($KUBE_CLI get pods -n open-cluster-management --no-headers \
+    bad_pods=$($KUBE_CLI get pods -n "$ACM_NAMESPACE" --no-headers \
         --request-timeout=10s 2>/dev/null | grep -v 'Running\|Completed' || true)
 
     if [[ -n "$bad_pods" ]]; then
         local count
         count=$(echo "$bad_pods" | wc -l | tr -d ' ')
         add_issue "WARN" "ACM namespace: $count pod(s) not Running" \
-            "Investigate: oc get pods -n open-cluster-management | grep -v Running"
+            "Investigate: oc get pods -n $ACM_NAMESPACE | grep -v Running"
     else
         local csv
-        csv=$($KUBE_CLI get csv -n open-cluster-management --no-headers \
+        csv=$($KUBE_CLI get csv -n "$ACM_NAMESPACE" --no-headers \
             --request-timeout=10s 2>/dev/null | grep 'advanced-cluster-management' | head -1 || echo "")
         if [[ -z "$csv" ]]; then
             add_issue "FAIL" "ACM operator CSV not found" \
@@ -212,7 +213,7 @@ check_operator_health() {
 
 check_mco_pod_staleness() {
     local created
-    created=$($KUBE_CLI get pods -n open-cluster-management \
+    created=$($KUBE_CLI get pods -n "$ACM_NAMESPACE" \
         -l name=multicluster-observability-operator \
         -o jsonpath='{.items[0].metadata.creationTimestamp}' \
         --request-timeout=10s 2>/dev/null || echo "")
@@ -230,7 +231,7 @@ check_mco_pod_staleness() {
 
     if [[ $age_days -gt 14 ]]; then
         add_issue "WARN" "MCO operator pod: ${age_days} days old" \
-            "oc rollout restart deployment/multicluster-observability-operator -n open-cluster-management"
+            "oc rollout restart deployment/multicluster-observability-operator -n $ACM_NAMESPACE"
     else
         record_pass "MCO operator pod: ${age_days} days old"
     fi
@@ -239,7 +240,7 @@ check_mco_pod_staleness() {
 check_image_override() {
     local override_exists
     override_exists=$($KUBE_CLI get configmap image-override \
-        -n open-cluster-management --no-headers \
+        -n "$ACM_NAMESPACE" --no-headers \
         --request-timeout=10s 2>/dev/null || echo "")
 
     if [[ -z "$override_exists" ]]; then
@@ -248,11 +249,11 @@ check_image_override() {
     fi
 
     local expected_image actual_image
-    expected_image=$($KUBE_CLI get configmap image-override -n open-cluster-management \
+    expected_image=$($KUBE_CLI get configmap image-override -n "$ACM_NAMESPACE" \
         -o jsonpath='{.data.image-override\.json}' 2>/dev/null | \
         jq -r '.[] | select(.["image-key"]=="multicluster_observability_operator") | "\(.["image-remote"])/\(.["image-name"]):\(.["image-tag"])"' 2>/dev/null || echo "")
     actual_image=$($KUBE_CLI get deployment multicluster-observability-operator \
-        -n open-cluster-management \
+        -n "$ACM_NAMESPACE" \
         -o jsonpath='{.spec.template.spec.containers[0].image}' \
         --request-timeout=10s 2>/dev/null || echo "")
 
@@ -367,7 +368,7 @@ check_stuck_manifestworks() {
     for mc in $mc_list; do
         local stuck
         stuck=$($KUBE_CLI get manifestwork -n "$mc" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' \
-            --request-timeout=10s 2>/dev/null | grep -v "^$" | grep -c $'\t' || echo "0")
+            --request-timeout=10s 2>/dev/null | grep -v "^$" | awk -F'\t' '$2!=""' | wc -l | tr -d ' ')
         if [[ "$stuck" -gt 0 ]]; then
             ((stuck_count += stuck)) || true
         fi
@@ -403,6 +404,38 @@ check_mcoa_health() {
             "oc rollout restart deployment/multicluster-observability-addon-manager -n $OBS_NAMESPACE"
     else
         record_pass "MCOA addon manager: running"
+    fi
+}
+
+check_stuck_mca_finalizers() {
+    local stuck_mcas
+    stuck_mcas=$($KUBE_CLI get managedclusteraddon -A \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}' \
+        --request-timeout=10s 2>/dev/null | awk -F'\t' '$3!=""' || echo "")
+
+    if [[ -z "$stuck_mcas" ]]; then
+        record_pass "ManagedClusterAddon finalizers: none stuck"
+        return
+    fi
+
+    local now_epoch stuck_count=0
+    now_epoch=$(date +%s)
+    while IFS=$'\t' read -r ns name ts; do
+        local ts_epoch age_min
+        ts_epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null || \
+                   date -d "$ts" +%s 2>/dev/null || echo "0")
+        age_min=$(( (now_epoch - ts_epoch) / 60 ))
+        if [[ $age_min -gt 10 ]]; then
+            ((stuck_count++)) || true
+        fi
+    done <<< "$stuck_mcas"
+
+    if [[ $stuck_count -gt 0 ]]; then
+        add_issue "WARN" "Stuck ManagedClusterAddon(s): $stuck_count deleting >10min (may block MCO operator)" \
+            "Check: oc get managedclusteraddon -A -o json | jq '.items[] | select(.metadata.deletionTimestamp) | {ns: .metadata.namespace, name: .metadata.name, finalizers: .metadata.finalizers}'" \
+            "Patch finalizers on unreachable clusters: oc patch managedclusteraddon <name> -n <ns> --type=merge -p '{\"metadata\":{\"finalizers\":null}}'"
+    else
+        record_pass "ManagedClusterAddon finalizers: none stuck"
     fi
 }
 
@@ -691,7 +724,7 @@ print_summary() {
 
     echo ""
     local acm_version
-    acm_version=$($KUBE_CLI get mch multiclusterhub -n open-cluster-management \
+    acm_version=$($KUBE_CLI get mch multiclusterhub -n "$ACM_NAMESPACE" \
         -o jsonpath='{.status.currentVersion}' --request-timeout=10s 2>/dev/null || echo "N/A")
     local cluster_url
     cluster_url=$($KUBE_CLI cluster-info --request-timeout=10s 2>/dev/null | head -1 | \
@@ -765,6 +798,7 @@ main() {
     # Section 3: Addon Health
     start_section "Addon Health"
     check_mcoa_health || true
+    check_stuck_mca_finalizers || true
     check_mca_crd_terminating || true
     check_coo_perses || true
 

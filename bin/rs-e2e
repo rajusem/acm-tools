@@ -44,6 +44,8 @@
 #   19   Metrics collection wait (~20 min)
 #   20   Namespace metrics validation (Thanos)
 #   21   VM metrics validation (Thanos)
+#   21a  VM dashboard query consistency (Thanos)
+#   21b  Stopped VM exclusion (ACM-41141)
 #   22   Data-plane cleanup
 #
 #   Group 5: Destructive tests (MCO deletion/reinstall, runs last)
@@ -108,7 +110,7 @@ Options:
   --skip-uninstall       Skip destructive phases (13-16)
   --mode-switch          Include phases 5-12, 15-16 (mode switching tests)
   --data-plane           Include phases 17-22 (data-plane validation)
-  --skip-vm              Skip VM workload phases (18, 21)
+  --skip-vm              Skip VM workload phases (18, 21, 21a, 21b)
   --no-metrics-wait      Skip the metrics collection wait (phase 19)
   --build mco|mcoa|both  Build, push, and apply custom images before tests
   --image-override       Apply existing image-override.json (no build)
@@ -1032,6 +1034,24 @@ thanos_query_metric() {
     local range="${3:-30m}"
 
     local query="last_over_time(${metric_name}{${label_selector}}[${range}])"
+    local -a curl_args=(-sk --connect-timeout 10 --max-time 30)
+    [[ -n "${THANOS_TOKEN:-}" ]] && curl_args+=(-H "Authorization: Bearer $THANOS_TOKEN")
+
+    local attempt value
+    for attempt in 1 2 3; do
+        local response
+        response=$(curl "${curl_args[@]}" \
+            "${THANOS_URL}/api/v1/query" \
+            --data-urlencode "query=${query}" 2>/dev/null) || true
+        value=$(echo "$response" | jq -r '.data.result[0].value[1] // empty' 2>/dev/null)
+        [[ -n "$value" ]] && break
+        [[ $attempt -lt 3 ]] && sleep 10
+    done
+    echo "$value"
+}
+
+thanos_query_promql() {
+    local query="$1"
     local -a curl_args=(-sk --connect-timeout 10 --max-time 30)
     [[ -n "${THANOS_TOKEN:-}" ]] && curl_args+=(-H "Authorization: Bearer $THANOS_TOKEN")
 
@@ -3551,6 +3571,370 @@ phase_21() {
     return 0
 }
 
+# =============================================================================
+# Phase 21a: VM Dashboard Stat vs Table Query Consistency
+# Validates that stat panel queries (total overestimation/underestimation)
+# produce values consistent with sum(table panel per-VM values).
+# Source: multicluster-observability-addon/internal/perses/panels/rightsizing/vm-panels.go
+# Stat panels: lines 72-134 (VMTotalCPU/MemOverestimation/UnderestimationPanel)
+# Table panels: lines 181-344 (query #5 = overestimation/underestimation column)
+# If queries change in vm-panels.go, update these templates.
+# =============================================================================
+
+# Stat panel PromQL templates (with running VM filter)
+STAT_CPU_OVEREST_TMPL='sum(
+(floor(max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:cpu_request{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])-
+max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:cpu_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])) > 0)
+and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)
+)'
+
+STAT_CPU_UNDEREST_TMPL='sum(
+(floor(max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:cpu_request{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])-
+max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:cpu_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])) < 0) * (-1)
+and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)
+)'
+
+STAT_MEM_OVEREST_TMPL='(sum(
+(floor((max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_request{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:]) / 1073741824)-
+(max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:]) / 1073741824)) > 0)
+and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)
+)) * 1073741824'
+
+STAT_MEM_UNDEREST_TMPL='(sum(
+(floor((max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_request{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:]) / 1073741824)-
+(max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:]) / 1073741824)) < 0) * (-1)
+and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)
+)) * 1073741824'
+
+# Table panel PromQL templates (with running VM filter, stripped label_join, wrapped in sum)
+TABLE_CPU_OVEREST_TMPL='sum(
+floor(max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:cpu_request{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])-max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:cpu_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:]))
+> 0 and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)
+)'
+
+TABLE_CPU_UNDEREST_TMPL='sum(
+(floor(max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:cpu_request{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])-max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:cpu_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])) * (-1))
+> 0 and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)
+)'
+
+TABLE_MEM_OVEREST_TMPL='sum(
+(floor((max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_request{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])) / 1073741824 - (max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])) / 1073741824)) * 1073741824
+> 0 and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)
+)'
+
+TABLE_MEM_UNDEREST_TMPL='sum(
+((floor((max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_request{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])) / 1073741824 - (max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace"})[$days:])) / 1073741824)) * (-1)) * 1073741824
+> 0 and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)
+)'
+
+subst_dashboard_vars() {
+    local tmpl="$1" cluster="$2" profile="$3" namespace="$4" days="$5"
+    echo "$tmpl" | sed \
+        -e "s/\\\$cluster/$cluster/g" \
+        -e "s/\\\$profile/$profile/g" \
+        -e "s/\\\$namespace/$namespace/g" \
+        -e "s/\\\$days/$days/g"
+}
+
+assert_stat_table_match() {
+    local label="$1" stat_val="$2" table_val="$3" stat_query="$4" table_query="$5"
+
+    if [[ -z "$stat_val" && -z "$table_val" ]]; then
+        log_success "  $label: MATCH (both empty — no VMs in this category)"
+        return 0
+    fi
+
+    if [[ -z "$stat_val" ]]; then
+        log_error "  $label: MISMATCH stat=empty vs table_sum=$table_val"
+        log_error "    stat query:  $stat_query"
+        log_error "    table query: $table_query"
+        return 1
+    fi
+
+    if [[ -z "$table_val" ]]; then
+        log_error "  $label: MISMATCH stat=$stat_val vs table_sum=empty"
+        log_error "    stat query:  $stat_query"
+        log_error "    table query: $table_query"
+        return 1
+    fi
+
+    local match
+    match=$(awk "BEGIN {d = $stat_val - $table_val; if (d < 0) d = -d; print (d < 0.01) ? \"yes\" : \"no\"}")
+    if [[ "$match" == "yes" ]]; then
+        log_success "  $label: MATCH stat=$stat_val table_sum=$table_val"
+        return 0
+    else
+        local delta pct
+        delta=$(awk "BEGIN {d = $stat_val - $table_val; if (d < 0) d = -d; printf \"%.2f\", d}")
+        pct=$(awk "BEGIN {if ($table_val != 0) printf \"%.1f\", (($stat_val - $table_val) / $table_val) * 100; else print \"inf\"}")
+        log_error "  $label: MISMATCH stat=$stat_val vs table_sum=$table_val delta=$delta ($pct%)"
+        log_error "    stat query:  $stat_query"
+        log_error "    table query: $table_query"
+        return 1
+    fi
+}
+
+phase_21a() {
+    if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
+        PHASE_SKIP_REASON="Use --data-plane to enable"
+        return 2
+    fi
+    if [[ "$SKIP_VM" == "true" ]]; then
+        PHASE_SKIP_REASON="--skip-vm"
+        return 2
+    fi
+
+    switch_context "$HUB_CONTEXT" || { PHASE_FAIL_REASON="Cannot switch to hub context"; return 1; }
+
+    if ! $KUBE_CLI --context="$VM_SPOKE_CONTEXT" get namespace "$RS_VM_WORKLOAD_NS" &>/dev/null 2>&1; then
+        PHASE_FAIL_REASON="VM namespace $RS_VM_WORKLOAD_NS not found on $VM_SPOKE_CONTEXT — run phase 18 first"
+        return 1
+    fi
+
+    log_substep "Pre-check: checking test VM running state"
+    local stopped_count=0
+    for vm in fedora-vm-1 fedora-vm-2 rhel-vm1; do
+        if vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$vm"; then
+            log_success "  $vm: Running"
+        else
+            log_warn "  $vm: not Running"
+            ((stopped_count++)) || true
+        fi
+    done
+    if [[ $stopped_count -gt 0 ]]; then
+        log_warn "  $stopped_count VM(s) not running — stat/table values will exclude them (both use running VM filter)"
+    fi
+
+    if [[ -z "${THANOS_URL:-}" ]]; then
+        log_substep "Discovering Thanos endpoint"
+        if ! discover_thanos_endpoint; then
+            PHASE_FAIL_REASON="No Thanos endpoint found on hub"
+            return 1
+        fi
+    fi
+    THANOS_TOKEN=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
+
+    local cluster="$VM_SPOKE_CONTEXT"
+    local profile="Max OverAll"
+    local namespace="$RS_VM_WORKLOAD_NS"
+    local days="1d"
+    local errors=0
+
+    log_substep "Comparing stat vs table queries (cluster=$cluster, namespace=$namespace)"
+
+    local -a pairs=(
+        "CPU Overestimation:STAT_CPU_OVEREST_TMPL:TABLE_CPU_OVEREST_TMPL"
+        "CPU Underestimation:STAT_CPU_UNDEREST_TMPL:TABLE_CPU_UNDEREST_TMPL"
+        "Memory Overestimation:STAT_MEM_OVEREST_TMPL:TABLE_MEM_OVEREST_TMPL"
+        "Memory Underestimation:STAT_MEM_UNDEREST_TMPL:TABLE_MEM_UNDEREST_TMPL"
+    )
+
+    for entry in "${pairs[@]}"; do
+        IFS=: read -r label stat_tmpl_name table_tmpl_name <<< "$entry"
+
+        local stat_query table_query
+        stat_query=$(subst_dashboard_vars "${!stat_tmpl_name}" "$cluster" "$profile" "$namespace" "$days")
+        table_query=$(subst_dashboard_vars "${!table_tmpl_name}" "$cluster" "$profile" "$namespace" "$days")
+
+        local stat_val table_val
+        stat_val=$(thanos_query_promql "$stat_query")
+        table_val=$(thanos_query_promql "$table_query")
+
+        assert_stat_table_match "$label" "$stat_val" "$table_val" "$stat_query" "$table_query" || \
+            ((errors++)) || true
+    done
+
+    stop_thanos_port_forward
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors dashboard stat/table pair(s) diverged"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 21b: Stopped VM Exclusion (ACM-41141 regression test)
+# Stops a VM and verifies it is excluded from both stat and table queries.
+# Validates that running VM filter works end-to-end.
+# =============================================================================
+
+phase_21b() {
+    if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
+        PHASE_SKIP_REASON="Use --data-plane to enable"
+        return 2
+    fi
+    if [[ "$SKIP_VM" == "true" ]]; then
+        PHASE_SKIP_REASON="--skip-vm"
+        return 2
+    fi
+
+    switch_context "$HUB_CONTEXT" || { PHASE_FAIL_REASON="Cannot switch to hub context"; return 1; }
+
+    if ! $KUBE_CLI --context="$VM_SPOKE_CONTEXT" get namespace "$RS_VM_WORKLOAD_NS" &>/dev/null 2>&1; then
+        PHASE_FAIL_REASON="VM namespace $RS_VM_WORKLOAD_NS not found on $VM_SPOKE_CONTEXT — run phase 18 first"
+        return 1
+    fi
+
+    local test_vm="fedora-vm-2"
+    if ! $KUBE_CLI --context="$VM_SPOKE_CONTEXT" get vm "$test_vm" -n "$RS_VM_WORKLOAD_NS" &>/dev/null 2>&1; then
+        PHASE_FAIL_REASON="VM $test_vm not found on $VM_SPOKE_CONTEXT — run phase 18 first"
+        return 1
+    fi
+
+    if ! vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm"; then
+        PHASE_FAIL_REASON="VM $test_vm is not running — cannot test stop/exclusion cycle"
+        return 1
+    fi
+
+    if [[ -z "${THANOS_URL:-}" ]]; then
+        log_substep "Discovering Thanos endpoint"
+        if ! discover_thanos_endpoint; then
+            PHASE_FAIL_REASON="No Thanos endpoint found on hub"
+            return 1
+        fi
+    fi
+    THANOS_TOKEN=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
+
+    local errors=0
+
+    # Cleanup trap: always restart the VM on exit from this function
+    local vm_stopped=false
+    restart_test_vm() {
+        if [[ "$vm_stopped" == "true" ]]; then
+            log_substep "Cleanup: restarting $test_vm"
+            $KUBE_CLI --context="$VM_SPOKE_CONTEXT" patch vm "$test_vm" -n "$RS_VM_WORKLOAD_NS" \
+                --type=merge -p '{"spec":{"running":true}}' &>/dev/null || true
+            wait_until "$TIMEOUT_VM_BOOT" 10 "$test_vm running" \
+                vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm" || \
+                log_warn "  $test_vm did not reach Running in ${TIMEOUT_VM_BOOT}s"
+        fi
+    }
+    trap restart_test_vm RETURN
+
+    # Step 1: Stop the VM
+    log_substep "Stopping VM $test_vm"
+    $KUBE_CLI --context="$VM_SPOKE_CONTEXT" patch vm "$test_vm" -n "$RS_VM_WORKLOAD_NS" \
+        --type=merge -p '{"spec":{"running":false}}' &>/dev/null
+    vm_stopped=true
+
+    # Step 2: Wait for VM to leave Running state
+    local elapsed=0
+    while [[ $elapsed -lt 120 ]]; do
+        if ! vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm"; then
+            break
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    if vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm"; then
+        log_warn "  $test_vm did not leave Running in 120s, continuing anyway"
+    else
+        log_success "  $test_vm: Stopped"
+    fi
+
+    # Step 3: Wait for spoke Prometheus to reflect stopped state
+    if [[ -z "${SPOKE_THANOS_HOST:-}" ]]; then
+        spoke_discover_thanos "$VM_SPOKE_CONTEXT" || true
+    fi
+    if [[ -n "${SPOKE_THANOS_HOST:-}" ]]; then
+        log_substep "Waiting for spoke running_status metric to clear for $test_vm"
+        local spoke_cleared=false
+        local attempt=0
+        while [[ $attempt -lt 8 ]]; do
+            local val
+            val=$(spoke_query_metric "kubevirt_vm_running_status_last_transition_timestamp_seconds" \
+                "name=\"$test_vm\",namespace=\"$RS_VM_WORKLOAD_NS\"")
+            if [[ -z "$val" || "$val" == "0" ]]; then
+                spoke_cleared=true
+                break
+            fi
+            ((attempt++)) || true
+            sleep 15
+        done
+        if [[ "$spoke_cleared" == "true" ]]; then
+            log_success "  Spoke: running_status cleared for $test_vm"
+        else
+            log_warn "  Spoke: running_status not cleared after 120s, relying on hub Thanos wait"
+        fi
+    else
+        log_warn "  Spoke Prometheus unreachable, relying on hub Thanos wait"
+    fi
+
+    # Step 4: Wait for hub Thanos to reflect stopped state
+    log_substep "Waiting for hub Thanos running_status to clear for $test_vm (up to ${TIMEOUT_HUB_METRIC_PROPAGATION}s)"
+    local hub_cleared=false
+    local attempt=0
+    local max_attempts=$(( TIMEOUT_HUB_METRIC_PROPAGATION / 30 ))
+    while [[ $attempt -lt $max_attempts ]]; do
+        local val
+        val=$(thanos_query_promql "max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster=\"$VM_SPOKE_CONTEXT\", namespace=\"$RS_VM_WORKLOAD_NS\", name=\"$test_vm\"} > 0) > 0")
+        if [[ -z "$val" ]]; then
+            hub_cleared=true
+            break
+        fi
+        ((attempt++)) || true
+        sleep 30
+    done
+    if [[ "$hub_cleared" != "true" ]]; then
+        PHASE_FAIL_REASON="Hub Thanos still shows $test_vm as running after ${TIMEOUT_HUB_METRIC_PROPAGATION}s — federation lag exceeded timeout"
+        return 1
+    fi
+    log_success "  Hub Thanos: running_status cleared for $test_vm"
+
+    # Step 5: Exclusion check — stopped VM should not appear in overestimation table
+    log_substep "Exclusion check: verifying $test_vm is absent from memory overestimation query"
+    local cluster="$VM_SPOKE_CONTEXT"
+    local profile="Max OverAll"
+    local namespace="$RS_VM_WORKLOAD_NS"
+    local days="1d"
+
+    local excl_query
+    excl_query=$(subst_dashboard_vars \
+        '(floor((max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_request{cluster="$cluster", profile="$profile", namespace=~"$namespace", name="'"$test_vm"'"})[$days:]) / 1073741824)-(max_over_time(sum by (name, namespace) (acm_rs_vm:namespace:memory_recommendation{cluster="$cluster", profile="$profile", namespace=~"$namespace", name="'"$test_vm"'"})[$days:]) / 1073741824)) > 0) and on (name, namespace) (max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster="$cluster", namespace=~"$namespace"} > 0) > 0)' \
+        "$cluster" "$profile" "$namespace" "$days")
+    local excl_val
+    excl_val=$(thanos_query_promql "$excl_query")
+    if [[ -z "$excl_val" ]]; then
+        log_success "  $test_vm: correctly excluded from memory overestimation query (empty result)"
+    else
+        log_error "  $test_vm: STILL PRESENT in memory overestimation query (value=$excl_val)"
+        ((errors++)) || true
+    fi
+
+    # Step 6: Consistency check — stat vs table should still match
+    log_substep "Consistency check: stat vs table with $test_vm stopped"
+    local -a pairs=(
+        "CPU Overestimation:STAT_CPU_OVEREST_TMPL:TABLE_CPU_OVEREST_TMPL"
+        "CPU Underestimation:STAT_CPU_UNDEREST_TMPL:TABLE_CPU_UNDEREST_TMPL"
+        "Memory Overestimation:STAT_MEM_OVEREST_TMPL:TABLE_MEM_OVEREST_TMPL"
+        "Memory Underestimation:STAT_MEM_UNDEREST_TMPL:TABLE_MEM_UNDEREST_TMPL"
+    )
+
+    for entry in "${pairs[@]}"; do
+        IFS=: read -r label stat_tmpl_name table_tmpl_name <<< "$entry"
+
+        local stat_query table_query
+        stat_query=$(subst_dashboard_vars "${!stat_tmpl_name}" "$cluster" "$profile" "$namespace" "$days")
+        table_query=$(subst_dashboard_vars "${!table_tmpl_name}" "$cluster" "$profile" "$namespace" "$days")
+
+        local stat_val table_val
+        stat_val=$(thanos_query_promql "$stat_query")
+        table_val=$(thanos_query_promql "$table_query")
+
+        assert_stat_table_match "$label" "$stat_val" "$table_val" "$stat_query" "$table_query" || \
+            ((errors++)) || true
+    done
+
+    stop_thanos_port_forward
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors check(s) failed with stopped VM"
+        return 1
+    fi
+    return 0
+}
+
 phase_22() {
     if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
         PHASE_SKIP_REASON="Use --data-plane to enable"
@@ -3765,6 +4149,8 @@ main() {
     run_phase "19"  "Metrics collection wait"         phase_19
     run_phase "20"  "Namespace metrics validation"    phase_20
     run_phase "21"  "VM metrics validation"           phase_21
+    run_phase "21a" "VM dashboard query consistency"  phase_21a
+    run_phase "21b" "Stopped VM exclusion"            phase_21b
     run_phase "22"  "Data-plane cleanup"              phase_22
 
     # Group 4: Destructive tests (last — MCO deletion/reinstall)

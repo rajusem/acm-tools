@@ -201,18 +201,23 @@ do_install() {
     fi
 
     # Auto-derive MCE channel from ACM version if not provided
+    # ACM 5.x:   MCE stable-5.x, e.g. ACM 5.0 -> MCE stable-5.0
     # ACM <=2.16: MCE 2.(x-5), e.g. ACM 2.16 -> MCE 2.11
     # ACM >=2.17: MCE matches ACM, e.g. ACM 2.17 -> MCE 2.17
     local mce_channel_source
     if [[ -z "$MCE_CHANNEL" ]]; then
-        local acm_minor mce_minor
+        local acm_major acm_minor mce_minor
+        acm_major=$(echo "$ACM_VERSION" | cut -d. -f1)
         acm_minor=$(echo "$ACM_VERSION" | cut -d. -f2)
-        if [[ $acm_minor -ge 17 ]]; then
+        if [[ $acm_major -ge 5 ]]; then
+            MCE_CHANNEL="stable-${ACM_VERSION}"
+        elif [[ $acm_minor -ge 17 ]]; then
             mce_minor=$acm_minor
+            MCE_CHANNEL="stable-2.${mce_minor}"
         else
             mce_minor=$((acm_minor - 5))
+            MCE_CHANNEL="stable-2.${mce_minor}"
         fi
-        MCE_CHANNEL="stable-2.${mce_minor}"
         mce_channel_source="auto-derived from ACM $ACM_VERSION"
     else
         mce_channel_source="user-provided"

@@ -739,6 +739,81 @@ kubectl get persesdatasource -n observability-analytics
 - COO CRDs not yet installed — check if COO CSV reached `Succeeded` phase
 - `observability-analytics` namespace not created — check ManifestWork includes Namespace resource
 
+**See also**: [COO Namespace Stuck Terminating on Perses Finalizer](#coo-namespace-stuck-terminating-on-perses-finalizer) — if COO never installs because its namespace is deadlocked.
+
+---
+
+## COO Namespace Stuck Terminating on Perses Finalizer
+
+**Symptom**: Right-sizing appears "not enabled by default" even though **all configuration is correct** — the MCO CR spec has both RS features `enabled: true`, the ADC has `rightSizingDelegated=true` with both RS keys `enabled`, and the ManifestWork was delivered. But the `multicluster-observability-addon` ManagedClusterAddon on `local-cluster` shows `Available=False` ("N of 18 resources are not available") and `ManifestApplied=False` ("failed to apply the manifests of addon"). The Cluster Observability Operator (COO) never installs, so no Perses dashboards or UIPlugin appear.
+
+The failing manifests are the COO `OperatorGroup` and `Subscription`, both with:
+```
+forbidden: unable to create new content in namespace
+  openshift-cluster-observability-operator because it is being terminated
+```
+
+**Root cause**: Finalizer deadlock. The `openshift-cluster-observability-operator` namespace is stuck in `Terminating` because a leftover `Perses` CR (`perses.perses.dev`) still holds `perses.dev/finalizer`. The controller that clears that finalizer — the `perses-operator` — runs *inside that same namespace*, so once namespace deletion begins the operator is torn down and can never process the finalizer. The namespace is blocked forever, which blocks MCOA from recreating the `OperatorGroup`/`Subscription`, which blocks COO reinstall, which blocks all right-sizing dashboards/UIPlugin.
+
+Common triggers: disabling right-sizing, COO uninstall/reinstall churn, or the COO namespace being deleted while the `Perses` CR still exists — frequent in dev/test install-uninstall cycles.
+
+**Secondary blocker**: The namespace may *also* be held by a transient `NamespaceDeletionDiscoveryFailure` (e.g. `metrics.k8s.io/v1beta1: stale GroupVersion discovery`) when an aggregated APIService is briefly unavailable. This usually self-resolves once the backing APIService reports `Available=True`; the namespace controller retries on its own.
+
+**Diagnosis**:
+```bash
+# 1. Namespace stuck Terminating, and WHY (conditions name the blocker)
+oc get ns openshift-cluster-observability-operator \
+  -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}: {.message}{"\n"}{end}'
+# Look for: NamespaceContentRemaining "perses.perses.dev has 1 resource instances"
+#           NamespaceFinalizersRemaining "perses.dev/finalizer in 1 resource instances"
+
+# 2. Find the stuck Perses CR and confirm its finalizer
+oc get perses.perses.dev -A \
+  -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} finalizers={.metadata.finalizers} deletionTimestamp={.metadata.deletionTimestamp}{"\n"}{end}'
+
+# 3. Confirm NO perses-operator pod is running anywhere (nothing will clear the finalizer)
+oc get pods -A | grep -iE "perses|observability-operator"
+
+# 4. See the exact addon failure
+oc get manifestwork addon-multicluster-observability-addon-deploy-0 -n local-cluster -o json | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); [print(m['resourceMeta']['kind'], m['resourceMeta'].get('namespace',''), m['resourceMeta']['name'], '->', [c['message'] for c in m.get('conditions',[]) if c['status']=='False']) for m in d['status']['resourceStatus']['manifests'] if any(c['status']=='False' for c in m.get('conditions',[]))]"
+```
+
+**Fix**: Remove the finalizer from the stuck `Perses` CR. This is safe when the perses-operator is gone and the namespace is already being deleted — the CR is orphaned and nothing else will ever act on it.
+```bash
+oc patch perses.perses.dev/perses -n openshift-cluster-observability-operator \
+  --type=merge -p '{"metadata":{"finalizers":[]}}'
+```
+
+The recovery then self-heals — no operator restarts needed:
+1. Namespace finishes deleting (seconds to a couple minutes).
+2. MCOA's ManifestWork recreates the `Namespace`, `OperatorGroup`, and `Subscription` on its next reconcile.
+3. OLM installs COO (CSV reaches `Succeeded`); `perses-operator`, `perses-0`, and `monitoring` pods start.
+4. Perses dashboards, datasources, and the `monitoring` UIPlugin apply; the addon flips to `Available=True`.
+
+**Verify**:
+```bash
+# Namespace deletes, then MCOA recreates it Active
+oc get ns openshift-cluster-observability-operator
+
+# COO installs
+oc get csv -n openshift-cluster-observability-operator | grep observability   # -> Succeeded
+oc get pods -n openshift-cluster-observability-operator                        # perses-operator, perses-0, monitoring Running
+
+# Right-sizing resources land
+oc get persesdashboard -n observability-analytics
+oc get uiplugin monitoring
+oc get prometheusrule -n openshift-monitoring | grep acm-rs
+
+# Addon healthy
+oc get managedclusteraddon multicluster-observability-addon -n local-cluster \
+  -o jsonpath='{range .status.conditions[?(@.type=="Available")]}Available={.status}{"\n"}{end}'
+```
+
+**Prevention**: This deadlock recurs any time the COO namespace is deleted while the `Perses` CR still carries its finalizer. When intentionally tearing down COO/right-sizing, delete the `Perses` CR (and let the perses-operator finalize it) *before* the namespace goes, or remove the finalizer as above once the operator is gone.
+
+**See also**: [Perses Not Deploying](#perses-not-deploying) — for other reasons Perses dashboards may be absent when the COO namespace is healthy.
+
 ---
 
 ## Placement/ConfigMap GC Cascade During MCOA→MCO Switch

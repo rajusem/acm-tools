@@ -23,6 +23,18 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_step()    { echo -e "${CYAN}==> ${BOLD}$*${NC}"; }
 log_substep() { echo -e "    ${BLUE}-> $*${NC}"; }
 
+# Print the cluster this script will act on. Call after init_hub_context so
+# ACM_NAMESPACE has been detected. Logs to stdout (status banners, not captured).
+log_target_cluster() {
+    local api_url context
+    api_url=$($KUBE_CLI cluster-info 2>/dev/null | grep -o 'https://[^ ]*' | head -1 || echo "unknown")
+    context=$($KUBE_CLI config current-context 2>/dev/null || echo "unknown")
+    echo -e "${BOLD}Target Cluster:${NC} $api_url"
+    echo -e "${BOLD}Context:${NC}        $context"
+    echo -e "${BOLD}ACM Namespace:${NC}  $ACM_NAMESPACE"
+    echo ""
+}
+
 # Separator
 print_separator() {
     echo -e "${CYAN}$(printf '%.0s─' {1..60})${NC}"

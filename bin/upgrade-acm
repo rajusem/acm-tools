@@ -7,16 +7,16 @@
 # (plain "subscription" resolves to apps.open-cluster-management.io on ACM hubs).
 #
 # Usage:
-#   upgrade-acm                              # ACM stable-5.0 + MCE stable-5.0
+#   upgrade-acm                              # ACM release-5.0 + MCE stable-5.0
 #   upgrade-acm fix-mce                      # MCE only -> stable-5.0 (auto catalog)
 #   upgrade-acm apply-mce-catalog              # Add mce-dev-catalog:latest-5.0
 #   upgrade-acm list-channels                # Show MCE channels per catalog (like UI)
 #   upgrade-acm status
 #
 # Notes:
-#   - ACM channel: stable-5.0
-#   - MCE channel: stable-5.0 -> CSV multicluster-engine.v5.0.0-xxx
-#   - stable-5.0 may only exist in mce-dev-catalog, not redhat-operators
+#   - ACM channel: release-<version> (matches install-custom-acm / stolostron deploy)
+#   - MCE channel: stable-<version>  (5.x and 2.17+); 2.16 and below: ACM minor - 5
+#   - stable-5.x may only exist in mce-dev-catalog, not redhat-operators
 # =============================================================================
 
 set -euo pipefail
@@ -33,6 +33,8 @@ TARGET_VERSION="${TARGET_VERSION:-5.0}"
 ACM_CHANNEL="${ACM_CHANNEL:-}"
 MCE_CHANNEL="${MCE_CHANNEL:-}"
 MCE_SOURCE="${MCE_SOURCE:-}"
+MCE_SOURCE_EXPLICIT=false
+[[ -n "$MCE_SOURCE" ]] && MCE_SOURCE_EXPLICIT=true
 MCE_SOURCE_NS="${MCE_SOURCE_NS:-openshift-marketplace}"
 MCE_CATALOG_IMAGE="${MCE_CATALOG_IMAGE:-mce-dev-catalog}"
 MCE_CATALOG_REGISTRY="${MCE_CATALOG_REGISTRY:-quay.io:443/acm-d}"
@@ -41,6 +43,10 @@ WAIT_TIMEOUT="${WAIT_TIMEOUT:-$TIMEOUT_MCH_READY}"
 DRY_RUN=false
 FORCE_MCE=false
 APPLY_MCE_CATALOG=false
+
+_PKG_ROWS_CACHE=""
+_PKG_ROWS_CACHE_KEY=""
+_MCE_CATALOG_ENSURED=""
 
 usage() {
     cat <<EOF
@@ -55,12 +61,12 @@ Commands:
 
 Options:
   --version VER           Target ACM version (default: $TARGET_VERSION)
-  --channel CHANNEL       ACM OLM channel (default: stable-<version>)
+  --channel CHANNEL       ACM OLM channel (default: release-<version>)
   --mce-channel CHANNEL   MCE OLM channel (default: stable-<version>)
   --mce-source SOURCE     MCE catalog source (default: auto-detect for channel)
   --mce-catalog-tag TAG   Dev catalog image tag (default: latest-<mce-version>)
   --apply-mce-catalog     Apply mce-dev-catalog before MCE upgrade if needed
-  --wait-timeout SECS     Wait for MCH/MCE (default: $WAIT_TIMEOUT)
+  --wait-timeout SECS     Wait for MCH/MCE CSV/compliance (default: $WAIT_TIMEOUT)
   --force-mce             Always patch MCE subscription
   --dry-run               Show planned changes only
   -h, --help
@@ -69,44 +75,30 @@ Examples:
   $(basename "$0") list-channels
   $(basename "$0") apply-mce-catalog --mce-catalog-tag latest-5.0
   $(basename "$0") fix-mce --mce-channel stable-5.0 --apply-mce-catalog
-  $(basename "$0") --channel stable-5.0 --mce-channel stable-5.0
+  $(basename "$0") --channel release-5.0 --mce-channel stable-5.0
   $(basename "$0") status
 
 Typical ACM 5.0 + MCE 5.0 flow:
   $(basename "$0") apply-mce-catalog
-  $(basename "$0") fix-mce --mce-channel stable-5.0
+  $(basename "$0") --version 5.0 --apply-mce-catalog
 EOF
-}
-
-log_target_cluster() {
-    local api_url context
-    api_url=$($KUBE_CLI cluster-info 2>/dev/null | grep -o 'https://[^ ]*' | head -1 || echo "unknown")
-    context=$($KUBE_CLI config current-context 2>/dev/null || echo "unknown")
-    echo -e "${BOLD}Target Cluster:${NC} $api_url"
-    echo -e "${BOLD}Context:${NC}        $context"
-    echo -e "${BOLD}ACM Namespace:${NC}  $ACM_NAMESPACE"
-    echo ""
 }
 
 derive_channels() {
     local version="$1"
     local major minor
 
-    major=$(echo "$version" | cut -d. -f1)
-    minor=$(echo "$version" | cut -d. -f2)
+    IFS=. read -r major minor _ <<< "${version}."
+    minor="${minor:-0}"
 
+    # ACM always uses release-X.Y (install-custom-acm, stolostron/deploy).
     if [[ -z "$ACM_CHANNEL" ]]; then
-        if [[ "$major" == "5" ]]; then
-            ACM_CHANNEL="stable-5.0"
-        else
-            ACM_CHANNEL="release-${major}.${minor}"
-        fi
+        ACM_CHANNEL="release-${major}.${minor}"
     fi
 
+    # MCE: 5.x and 2.17+ share the ACM minor; <=2.16 is ACM minor - 5.
     if [[ -z "$MCE_CHANNEL" ]]; then
-        if [[ "$major" == "5" ]]; then
-            MCE_CHANNEL="stable-5.0"
-        elif [[ "$minor" -ge 17 ]]; then
+        if [[ "$major" == "5" ]] || [[ "$minor" -ge 17 ]]; then
             MCE_CHANNEL="stable-${major}.${minor}"
         else
             MCE_CHANNEL="stable-${major}.$((minor - 5))"
@@ -124,7 +116,7 @@ parse_common_options() {
             --version)           TARGET_VERSION="$2"; shift 2 ;;
             --channel)           ACM_CHANNEL="$2"; shift 2 ;;
             --mce-channel)       MCE_CHANNEL="$2"; shift 2 ;;
-            --mce-source)        MCE_SOURCE="$2"; shift 2 ;;
+            --mce-source)        MCE_SOURCE="$2"; MCE_SOURCE_EXPLICIT=true; shift 2 ;;
             --mce-catalog-tag)   MCE_CATALOG_TAG="$2"; shift 2 ;;
             --apply-mce-catalog) APPLY_MCE_CATALOG=true; shift ;;
             --wait-timeout)      WAIT_TIMEOUT="$2"; shift 2 ;;
@@ -169,19 +161,40 @@ get_mce_compliance_message() {
     get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.mceVersionCompliance.message}' || echo ""
 }
 
-# List all multicluster-engine packagemanifest rows: catalog<TAB>channel<TAB>csv
-list_mce_catalog_rows() {
-    $KUBE_CLI get packagemanifest -n openshift-marketplace \
+invalidate_package_cache() {
+    _PKG_ROWS_CACHE=""
+    _PKG_ROWS_CACHE_KEY=""
+}
+
+# List packagemanifest rows: catalog<TAB>channel<TAB>csv
+list_package_catalog_rows() {
+    local package="$1"
+    local key="${package}/${MCE_SOURCE_NS}"
+
+    if [[ "$_PKG_ROWS_CACHE_KEY" == "$key" && -n "$_PKG_ROWS_CACHE" ]]; then
+        echo "$_PKG_ROWS_CACHE"
+        return 0
+    fi
+
+    _PKG_ROWS_CACHE=$($KUBE_CLI get packagemanifest -n "$MCE_SOURCE_NS" \
         -o json --request-timeout=20s 2>/dev/null | \
-        jq -r '.items[]
-            | select(.metadata.name=="multicluster-engine")
+        jq -r --arg pkg "$package" '.items[]
+            | select(.metadata.name==$pkg)
             | .status.catalogSource as $cat
             | .status.channels[]
-            | "\($cat)\t\(.name)\t\(.currentCSV)"' 2>/dev/null || true
+            | "\($cat)\t\(.name)\t\(.currentCSV)"' 2>/dev/null || true)
+    _PKG_ROWS_CACHE_KEY="$key"
+    echo "$_PKG_ROWS_CACHE"
+}
+
+list_mce_catalog_rows() {
+    list_package_catalog_rows "multicluster-engine"
 }
 
 # Resolve best catalog source for an MCE channel.
 # Prefers: explicit --mce-source > mce-dev-catalog > acm-dev-catalog > subscription source > redhat-operators
+# On failure: print nothing (callers treat empty as not found). Never echo a fallback here —
+# a printed line plus return 1 is captured by $(cmd || echo fallback) as two lines.
 resolve_mce_catalog_source() {
     local channel="$1"
     local rows best_cat best_csv sub_src
@@ -191,10 +204,9 @@ resolve_mce_catalog_source() {
         return 0
     fi
 
-    rows=$(list_mce_catalog_rows | grep -F "	${channel}	" || true)
+    rows=$(list_mce_catalog_rows | awk -F'\t' -v c="$channel" '$2==c')
     if [[ -z "$rows" ]]; then
         log_warn "Channel '$channel' not found in any catalog packagemanifest" >&2
-        echo "redhat-operators"
         return 1
     fi
 
@@ -202,11 +214,10 @@ resolve_mce_catalog_source() {
 
     for prefer in mce-dev-catalog acm-dev-catalog "$sub_src" redhat-operators; do
         [[ -z "$prefer" ]] && continue
-        if echo "$rows" | grep -q "^${prefer}	"; then
-            best_cat="$prefer"
-            best_csv=$(echo "$rows" | grep "^${prefer}	" | head -1 | cut -f3)
-            log_info "Resolved MCE catalog: $best_cat (channel $channel -> $best_csv)" >&2
-            echo "$best_cat"
+        best_csv=$(echo "$rows" | awk -F'\t' -v p="$prefer" '$1==p {print $3; exit}')
+        if [[ -n "$best_csv" ]]; then
+            log_info "Resolved MCE catalog: $prefer (channel $channel -> $best_csv)" >&2
+            echo "$prefer"
             return 0
         fi
     done
@@ -218,44 +229,28 @@ resolve_mce_catalog_source() {
 }
 
 get_catalog_csv_for_channel() {
-    local channel="$1" source="${2:-}"
+    local package="$1" channel="$2" source="${3:-}"
     local rows
-
+    rows=$(list_package_catalog_rows "$package")
     if [[ -n "$source" ]]; then
-        list_mce_catalog_rows | grep "^${source}	${channel}	" | head -1 | cut -f3
+        echo "$rows" | awk -F'\t' -v s="$source" -v c="$channel" '$1==s && $2==c {print $3; exit}'
         return 0
     fi
-
-    rows=$(list_mce_catalog_rows | grep -F "	${channel}	" || true)
-    [[ -z "$rows" ]] && return 0
-    echo "$rows" | head -1 | cut -f3
+    echo "$rows" | awk -F'\t' -v c="$channel" '$2==c {print $3; exit}'
 }
 
-approve_pending_installplans() {
-    local namespace="$1"
-    local plans
-    plans=$($KUBE_CLI get installplan -n "$namespace" \
-        -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{"\n"}{end}' \
-        --request-timeout=10s 2>/dev/null || echo "")
-    [[ -z "$plans" ]] && return 0
-
-    while IFS= read -r plan; do
-        [[ -z "$plan" ]] && continue
-        log_substep "Approving InstallPlan $plan in $namespace"
-        if [[ "$DRY_RUN" == "true" ]]; then
-            log_info "[dry-run] patch installplan $plan approved=true"
-            continue
-        fi
-        $KUBE_CLI patch installplan "$plan" -n "$namespace" --type=merge -p '{"spec":{"approved":true}}'
-    done <<< "$plans"
+version_matches_target() {
+    local actual="$1" target="$2"
+    [[ -n "$actual" && -n "$target" ]] || return 1
+    [[ "$actual" == "$target" || "$actual" == "$target".* ]]
 }
 
 wait_for_catalog_source() {
-    local cs_name="$1" timeout="${2:-300}"
+    local cs_name="$1" timeout="${2:-$WAIT_TIMEOUT}"
     local elapsed=0 state
     log_substep "Waiting for CatalogSource $cs_name to be READY..."
     while [[ $elapsed -lt $timeout ]]; do
-        state=$($KUBE_CLI get catalogsource "$cs_name" -n openshift-marketplace \
+        state=$($KUBE_CLI get catalogsource "$cs_name" -n "$MCE_SOURCE_NS" \
             -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "")
         if [[ "$state" == "READY" ]]; then
             log_success "CatalogSource $cs_name is READY"
@@ -272,10 +267,21 @@ wait_for_catalog_source() {
 
 apply_mce_dev_catalog() {
     local image="${MCE_CATALOG_REGISTRY}/${MCE_CATALOG_IMAGE}:${MCE_CATALOG_TAG}"
-    log_substep "Applying MCE CatalogSource: $image"
+    log_substep "Applying MCE CatalogSource: $image (namespace $MCE_SOURCE_NS)"
+
+    # Honour an explicit --mce-source. Only default the subscription source to the
+    # CatalogSource we create when the caller did not pin a source. Set this on the
+    # dry-run path too so the preview matches the real run.
+    if [[ "$MCE_SOURCE_EXPLICIT" == "true" ]]; then
+        if [[ "$MCE_SOURCE" != "$MCE_CATALOG_IMAGE" ]]; then
+            log_warn "Keeping --mce-source $MCE_SOURCE (CatalogSource name remains $MCE_CATALOG_IMAGE)"
+        fi
+    else
+        MCE_SOURCE="$MCE_CATALOG_IMAGE"
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] apply CatalogSource $MCE_CATALOG_IMAGE image=$image"
+        log_info "[dry-run] apply CatalogSource $MCE_CATALOG_IMAGE image=$image namespace=$MCE_SOURCE_NS"
         return 0
     fi
 
@@ -284,7 +290,7 @@ apiVersion: operators.coreos.com/v1alpha1
 kind: CatalogSource
 metadata:
   name: $MCE_CATALOG_IMAGE
-  namespace: openshift-marketplace
+  namespace: $MCE_SOURCE_NS
 spec:
   displayName: MultiCluster Engine Dev
   image: $image
@@ -294,8 +300,8 @@ spec:
     registryPoll:
       interval: 10m
 EOF
-    wait_for_catalog_source "$MCE_CATALOG_IMAGE" 300 || true
-    MCE_SOURCE="$MCE_CATALOG_IMAGE"
+    wait_for_catalog_source "$MCE_CATALOG_IMAGE" "$WAIT_TIMEOUT" || true
+    invalidate_package_cache
     log_success "MCE dev catalog applied (source: $MCE_CATALOG_IMAGE)"
 }
 
@@ -303,26 +309,31 @@ ensure_mce_catalog_for_channel() {
     local channel="$1"
     local resolved
 
-    resolved=$(resolve_mce_catalog_source "$channel" 2>/dev/null || echo "")
-    if [[ -n "$resolved" ]] && [[ "$(get_catalog_csv_for_channel "$channel" "$resolved")" != "" ]]; then
-        MCE_SOURCE="$resolved"
+    if [[ "$_MCE_CATALOG_ENSURED" == "$channel" && -n "$MCE_SOURCE" ]]; then
         return 0
     fi
 
-    if [[ "$APPLY_MCE_CATALOG" == "true" ]] || [[ "$channel" == stable-5.* ]] || [[ "$channel" == stable-5.0 ]]; then
-        log_warn "Channel $channel not in redhat-operators — applying dev catalog"
-        APPLY_MCE_CATALOG=true
+    resolved=$(resolve_mce_catalog_source "$channel") || resolved=""
+    resolved=$(printf '%s' "$resolved" | tr -d '\n')
+    if [[ -n "$resolved" ]] && [[ "$(get_catalog_csv_for_channel "multicluster-engine" "$channel" "$resolved")" != "" ]]; then
+        MCE_SOURCE="$resolved"
+        _MCE_CATALOG_ENSURED="$channel"
+        return 0
     fi
 
     if [[ "$APPLY_MCE_CATALOG" == "true" ]]; then
+        log_warn "Channel $channel not in existing catalogs — applying dev catalog"
         apply_mce_dev_catalog
-        resolved=$(resolve_mce_catalog_source "$channel" 2>/dev/null || echo "$MCE_CATALOG_IMAGE")
+        resolved=$(resolve_mce_catalog_source "$channel") || resolved="$MCE_CATALOG_IMAGE"
+        resolved=$(printf '%s' "$resolved" | tr -d '\n')
         MCE_SOURCE="${resolved:-$MCE_CATALOG_IMAGE}"
+        _MCE_CATALOG_ENSURED="$channel"
         return 0
     fi
 
     log_error "Channel '$channel' not available. Run: $(basename "$0") apply-mce-catalog"
     log_info "Or: $(basename "$0") list-channels"
+    log_info "Or pass --apply-mce-catalog"
     return 1
 }
 
@@ -352,13 +363,13 @@ patch_mch_mce_annotation() {
 }
 
 patch_mce_subscription() {
-    local force="${1:-true}"
+    local force="${1:-false}"
     local current installed src catalog_csv need_patch=false
 
     current=$(get_resource_field "$OLM_SUB" "$MCE_SUB_NAME" "$MCE_NAMESPACE" '{.spec.channel}' || echo "")
     src=$(get_resource_field "$OLM_SUB" "$MCE_SUB_NAME" "$MCE_NAMESPACE" '{.spec.source}' || echo "")
     installed=$(get_resource_field "$OLM_SUB" "$MCE_SUB_NAME" "$MCE_NAMESPACE" '{.status.installedCSV}' || echo "")
-    catalog_csv=$(get_catalog_csv_for_channel "$MCE_CHANNEL" "$MCE_SOURCE")
+    catalog_csv=$(get_catalog_csv_for_channel "multicluster-engine" "$MCE_CHANNEL" "$MCE_SOURCE")
 
     [[ "$current" != "$MCE_CHANNEL" ]] && need_patch=true
     [[ "$src" != "$MCE_SOURCE" ]] && need_patch=true
@@ -389,7 +400,6 @@ patch_mce_subscription() {
         }
     }"
     log_success "MCE subscription patched"
-    approve_pending_installplans "$MCE_NAMESPACE"
 }
 
 patch_acm_subscription() {
@@ -416,20 +426,35 @@ patch_acm_subscription() {
             \"installPlanApproval\": \"Automatic\"
         }
     }"
-    approve_pending_installplans "$ACM_NAMESPACE"
 }
 
+# Wait until installedCSV is Succeeded AND matches expected_csv from the catalog.
+# If expected_csv is empty, require installedCSV to differ from previous_csv so we
+# never report success on the pre-upgrade CSV.
 wait_for_csv() {
-    local sub_name="$1" namespace="$2" label="$3" expected_csv="${4:-}" timeout="${5:-600}"
+    local sub_name="$1" namespace="$2" label="$3" expected_csv="${4:-}" timeout="${5:-$WAIT_TIMEOUT}" previous_csv="${6:-}"
     local elapsed=0 csv_name csv_phase=""
 
     log_substep "Waiting for $label CSV (timeout: ${timeout}s)..."
+    if [[ -n "$expected_csv" ]]; then
+        log_info "Expecting $label CSV: $expected_csv"
+    elif [[ -n "$previous_csv" ]]; then
+        log_info "Expecting $label CSV to change from $previous_csv"
+    else
+        log_warn "No expected $label CSV resolved from catalog — waiting for a CSV change"
+    fi
+
     while [[ $elapsed -lt $timeout ]]; do
         csv_name=$(get_resource_field "$OLM_SUB" "$sub_name" "$namespace" '{.status.installedCSV}' || echo "")
         if [[ -n "$csv_name" ]]; then
             csv_phase=$(get_resource_field csv "$csv_name" "$namespace" '{.status.phase}' || echo "")
             if [[ "$csv_phase" == "Succeeded" ]]; then
-                if [[ -z "$expected_csv" || "$csv_name" == "$expected_csv" || "$csv_name" == *"${expected_csv#multicluster-engine.}"* ]]; then
+                # Exact catalog CSV, or the same CSV with a snapshot suffix (v5.0.0-DOWNSTREAM-...).
+                if [[ -n "$expected_csv" && ( "$csv_name" == "$expected_csv" || "$csv_name" == "$expected_csv"-* ) ]]; then
+                    log_success "$label CSV ready: $csv_name"
+                    return 0
+                fi
+                if [[ -z "$expected_csv" && -n "$previous_csv" && "$csv_name" != "$previous_csv" ]]; then
                     log_success "$label CSV ready: $csv_name"
                     return 0
                 fi
@@ -447,14 +472,16 @@ wait_for_csv() {
 }
 
 wait_for_mch() {
+    local target_version="${1:-$TARGET_VERSION}"
     local elapsed=0 phase="" current="" desired=""
 
-    log_substep "Waiting for MCH Running (timeout: ${WAIT_TIMEOUT}s)..."
+    log_substep "Waiting for MCH Running at $target_version (timeout: ${WAIT_TIMEOUT}s)..."
     while [[ $elapsed -lt $WAIT_TIMEOUT ]]; do
         phase=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.phase}' || echo "")
         current=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.currentVersion}' || echo "")
         desired=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.desiredVersion}' || echo "")
-        if [[ "$phase" == "Running" && -n "$desired" && "$current" == "$desired" ]]; then
+        if [[ "$phase" == "Running" && -n "$desired" && "$current" == "$desired" ]] && \
+           version_matches_target "$current" "$target_version"; then
             log_success "MCH Running at $current"
             return 0
         fi
@@ -464,12 +491,12 @@ wait_for_mch() {
         elapsed=$((elapsed + 15))
     done
     echo ""
-    log_warn "MCH not Running within ${WAIT_TIMEOUT}s"
+    log_warn "MCH not Running at $target_version within ${WAIT_TIMEOUT}s"
     return 1
 }
 
 wait_for_mce_compliance() {
-    local elapsed=0 compliant="" timeout=600
+    local elapsed=0 compliant="" timeout="${1:-$WAIT_TIMEOUT}"
 
     log_substep "Waiting for mceVersionCompliance=true (timeout: ${timeout}s)..."
     while [[ $elapsed -lt $timeout ]]; do
@@ -500,17 +527,20 @@ fix_mce_subscription() {
     msg=$(get_mce_compliance_message)
     [[ -n "$msg" && "$(get_mce_compliance)" != "true" ]] && log_warn "MCE compliance: $msg"
 
+    local previous_csv
+    previous_csv=$(get_resource_field "$OLM_SUB" "$MCE_SUB_NAME" "$MCE_NAMESPACE" '{.status.installedCSV}' || echo "")
+
     patch_mch_mce_annotation
-    patch_mce_subscription "true"
+    patch_mce_subscription "$FORCE_MCE"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         return 0
     fi
 
     local target_csv
-    target_csv=$(get_catalog_csv_for_channel "$MCE_CHANNEL" "$MCE_SOURCE")
-    wait_for_csv "$MCE_SUB_NAME" "$MCE_NAMESPACE" "MCE" "$target_csv" 900 || true
-    wait_for_mce_compliance || true
+    target_csv=$(get_catalog_csv_for_channel "multicluster-engine" "$MCE_CHANNEL" "$MCE_SOURCE")
+    wait_for_csv "$MCE_SUB_NAME" "$MCE_NAMESPACE" "MCE" "$target_csv" "$WAIT_TIMEOUT" "$previous_csv" || true
+    wait_for_mce_compliance "$WAIT_TIMEOUT" || true
 }
 
 do_list_channels() {
@@ -569,7 +599,7 @@ do_status() {
         mce_ch=$(get_resource_field "$OLM_SUB" "$MCE_SUB_NAME" "$MCE_NAMESPACE" '{.spec.channel}' || echo "")
         mce_src=$(get_resource_field "$OLM_SUB" "$MCE_SUB_NAME" "$MCE_NAMESPACE" '{.spec.source}' || echo "")
         mce_csv=$(get_resource_field "$OLM_SUB" "$MCE_SUB_NAME" "$MCE_NAMESPACE" '{.status.installedCSV}' || echo "")
-        target_csv=$(get_catalog_csv_for_channel "${mce_ch:-$MCE_CHANNEL}" "$mce_src")
+        target_csv=$(get_catalog_csv_for_channel "multicluster-engine" "${mce_ch:-$MCE_CHANNEL}" "$mce_src")
         log_info "MCE ($OLM_SUB): source=$mce_src channel=$mce_ch csv=${mce_csv:-<pending>}"
         [[ -n "$target_csv" && "$target_csv" != "$mce_csv" ]] && \
             log_warn "  catalog offers $target_csv for channel ${mce_ch:-$MCE_CHANNEL}"
@@ -620,7 +650,11 @@ do_upgrade() {
     mch_phase=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.phase}' || echo "")
     [[ "$mch_phase" == "MCHpaused" ]] && { log_error "MCH is paused"; exit 1; }
 
-    ensure_mce_catalog_for_channel "$MCE_CHANNEL" || true
+    local acm_src previous_acm_csv target_acm_csv
+    acm_src=$(get_resource_field "$OLM_SUB" "$acm_sub" "$ACM_NAMESPACE" '{.spec.source}' || echo "")
+    previous_acm_csv=$(get_resource_field "$OLM_SUB" "$acm_sub" "$ACM_NAMESPACE" '{.status.installedCSV}' || echo "")
+    target_acm_csv=$(get_catalog_csv_for_channel "advanced-cluster-management" "$ACM_CHANNEL" "$acm_src")
+
     patch_acm_subscription "$acm_sub"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -631,11 +665,11 @@ do_upgrade() {
         return 0
     fi
 
-    wait_for_csv "$acm_sub" "$ACM_NAMESPACE" "ACM" "" 600 || true
-    wait_for_mch || true
-
-    FORCE_MCE=true
+    # ACM operator first, then MCE. Waiting for MCH Running before MCE would stall
+    # for WAIT_TIMEOUT if MCH is blocked on mceVersionCompliance.
+    wait_for_csv "$acm_sub" "$ACM_NAMESPACE" "ACM" "$target_acm_csv" "$WAIT_TIMEOUT" "$previous_acm_csv" || true
     fix_mce_subscription || true
+    wait_for_mch "$TARGET_VERSION" || true
 
     echo ""
     print_separator

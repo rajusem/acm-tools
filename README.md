@@ -84,7 +84,7 @@ export CATALOG_IMAGE="acm-dev-catalog"           # Catalog image name (--catalog
 Upgrade ACM and MCE on an existing hub via OLM. Uses `subscription.operators.coreos.com` (not plain `subscription`). Auto-detects which catalog has the target channel (often `mce-dev-catalog`, not `redhat-operators`).
 
 ```bash
-# Full ACM 5.0 + MCE 5.0 upgrade (both use stable-5.0)
+# Full ACM 5.0 + MCE 5.0 upgrade
 bin/upgrade-acm --version 5.0 --apply-mce-catalog
 
 # Dry-run to preview changes without applying
@@ -108,21 +108,24 @@ bin/upgrade-acm status
 
 | Command | ACM Channel | MCE Channel | Notes |
 |---------|-------------|-------------|-------|
-| `--version 5.0` | stable-5.0 | stable-5.0 | ACM 5.0 (both use stable) |
+| `--version 5.0` | release-5.0 | stable-5.0 | ACM uses `release-`; MCE uses `stable-` |
+| `--version 5.1` | release-5.1 | stable-5.1 | Minor is not hardcoded to 5.0 |
 | `--version 2.17` | release-2.17 | stable-2.17 | ACM 2.17 |
 | `--version 2.16` | release-2.16 | stable-2.11 | ACM 2.16 (MCE = ACM minor - 5) |
 | `--channel release-2.17 --mce-channel stable-2.17` | release-2.17 | stable-2.17 | Explicit channels |
 
 Channel derivation logic:
-- **ACM 5.x** → `stable-5.0` (both ACM and MCE use `stable-` prefix)
-- **ACM 2.17+** → ACM `release-2.17`, MCE `stable-2.17` (same minor)
-- **ACM 2.16 and below** → ACM `release-2.16`, MCE `stable-2.11` (minor - 5)
+- **ACM** → always `release-<major>.<minor>` (same as `install-custom-acm`)
+- **MCE 5.x and ACM 2.17+** → `stable-<major>.<minor>`
+- **ACM 2.16 and below** → MCE `stable-2.<minor-5>`
+
+`--mce-source` is honoured and is not overwritten when `--apply-mce-catalog` creates `mce-dev-catalog`. `--wait-timeout` applies to MCH, ACM/MCE CSV, MCE compliance, and CatalogSource waits.
 
 **Environment variables:**
 
 ```bash
 export TARGET_VERSION="5.0"                          # Target version (--version)
-export ACM_CHANNEL="stable-5.0"                      # ACM OLM channel (--channel)
+export ACM_CHANNEL="release-5.0"                     # ACM OLM channel (--channel)
 export MCE_CHANNEL="stable-5.0"                      # MCE OLM channel (--mce-channel)
 export MCE_SOURCE="mce-dev-catalog"                  # MCE catalog source (--mce-source)
 export MCE_SOURCE_NS="openshift-marketplace"         # CatalogSource namespace
@@ -132,46 +135,10 @@ export MCE_CATALOG_TAG="latest-5.0"                  # Dev catalog tag (--mce-ca
 export MCE_NAMESPACE="multicluster-engine"           # MCE subscription namespace
 export ACM_SUB_NAME=""                               # ACM subscription name (auto-detected)
 export MCE_SUB_NAME="multicluster-engine"            # MCE subscription name
-export WAIT_TIMEOUT="900"                            # MCH/MCE wait timeout in seconds
+export WAIT_TIMEOUT="900"                            # MCH / CSV / MCE / catalog wait timeout
 ```
 
 The dev catalog image defaults to `quay.io:443/acm-d/mce-dev-catalog:latest-5.0`. Override with `--mce-catalog-tag`.
-
-Equivalent manual CLI (what the script does for MCE):
-
-```bash
-# 1. Dev catalog (if stable-5.0 not in redhat-operators)
-oc apply -f - <<'EOF'
-apiVersion: operators.coreos.com/v1alpha1
-kind: CatalogSource
-metadata:
-  name: mce-dev-catalog
-  namespace: openshift-marketplace
-spec:
-  displayName: MultiCluster Engine Dev
-  image: quay.io:443/acm-d/mce-dev-catalog:latest-5.0
-  publisher: Red Hat
-  sourceType: grpc
-  updateStrategy:
-    registryPoll:
-      interval: 10m
-EOF
-
-# 2. MCH annotation
-oc annotate mch multiclusterhub -n open-cluster-management \
-  installer.open-cluster-management.io/mce-subscription-spec='{"channel":"stable-5.0","source":"mce-dev-catalog","sourceNamespace":"openshift-marketplace"}' \
-  --overwrite
-
-# 3. MCE subscription (channel + source)
-oc patch subscription.operators.coreos.com multicluster-engine -n multicluster-engine --type=merge -p '{
-  "spec": {
-    "channel": "stable-5.0",
-    "source": "mce-dev-catalog",
-    "sourceNamespace": "openshift-marketplace",
-    "installPlanApproval": "Automatic"
-  }
-}'
-```
 
 ### setup-observability
 

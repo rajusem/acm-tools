@@ -29,7 +29,14 @@ MCE_NAMESPACE="${MCE_NAMESPACE:-multicluster-engine}"
 ACM_SUB_NAME="${ACM_SUB_NAME:-}"
 MCE_SUB_NAME="${MCE_SUB_NAME:-multicluster-engine}"
 
-TARGET_VERSION="${TARGET_VERSION:-5.0}"
+# Distinguish an explicit version (--version or TARGET_VERSION env) from the 5.0
+# default. --channel without --version must not wait for MCH 5.0.
+if [[ -n "${TARGET_VERSION:-}" ]]; then
+    TARGET_VERSION_SET=true
+else
+    TARGET_VERSION_SET=false
+    TARGET_VERSION="5.0"
+fi
 ACM_CHANNEL="${ACM_CHANNEL:-}"
 MCE_CHANNEL="${MCE_CHANNEL:-}"
 MCE_SOURCE="${MCE_SOURCE:-}"
@@ -94,6 +101,13 @@ derive_channels() {
     # ACM always uses release-X.Y (install-custom-acm, stolostron/deploy).
     if [[ -z "$ACM_CHANNEL" ]]; then
         ACM_CHANNEL="release-${major}.${minor}"
+    elif [[ "$TARGET_VERSION_SET" != "true" ]]; then
+        # --channel without --version: wait_for_mch and MCE derivation must
+        # follow the channel, not the 5.0 default.
+        TARGET_VERSION="${ACM_CHANNEL#release-}"
+        TARGET_VERSION="${TARGET_VERSION#stable-}"
+        IFS=. read -r major minor _ <<< "${TARGET_VERSION}."
+        minor="${minor:-0}"
     fi
 
     # MCE: 5.x and 2.17+ share the ACM minor; <=2.16 is ACM minor - 5.
@@ -113,7 +127,7 @@ derive_channels() {
 parse_common_options() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --version)           TARGET_VERSION="$2"; shift 2 ;;
+            --version)           TARGET_VERSION="$2"; TARGET_VERSION_SET=true; shift 2 ;;
             --channel)           ACM_CHANNEL="$2"; shift 2 ;;
             --mce-channel)       MCE_CHANNEL="$2"; shift 2 ;;
             --mce-source)        MCE_SOURCE="$2"; MCE_SOURCE_EXPLICIT=true; shift 2 ;;
@@ -344,11 +358,15 @@ patch_mch_mce_annotation() {
     fi
 
     local mce_sub_spec
+    # Keep installPlanApproval in the annotation so MCH re-templates match the
+    # direct subscription patch (Automatic). install-custom-acm only annotates
+    # because it creates MCH from scratch; on upgrade the subscription already
+    # exists and the patch starts OLM immediately.
     mce_sub_spec=$(jq -nc \
         --arg ch "$MCE_CHANNEL" \
         --arg src "$MCE_SOURCE" \
         --arg ns "$MCE_SOURCE_NS" \
-        '{channel: $ch, source: $src, sourceNamespace: $ns}')
+        '{channel: $ch, source: $src, sourceNamespace: $ns, installPlanApproval: "Automatic"}')
 
     log_substep "Updating MCH mce-subscription-spec (source=$MCE_SOURCE channel=$MCE_CHANNEL)"
     if [[ "$DRY_RUN" == "true" ]]; then

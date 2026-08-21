@@ -38,6 +38,7 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 | Script | Purpose |
 |--------|---------|
 | `install-custom-acm` | Install/manage ACM on hub via OLM (pull secret, catalog source, subscriptions) |
+| `upgrade-acm` | Upgrade ACM/MCE via OLM; `list-channels`, `apply-mce-catalog`, `fix-mce` for stable-5.0 |
 | `setup-observability` | Install/uninstall MCO, object storage, and observability pipeline |
 | `image-override` | Build, push, and apply custom MCO/MCOA images from local repos |
 | `rs-e2e` | End-to-end right-sizing validation (22 phases, MCO/MCOA modes, data-plane) |

@@ -128,16 +128,6 @@ merge_pull_secret() {
     log_info "Cluster nodes will restart to pick up the new pull secret"
 }
 
-log_target_cluster() {
-    local api_url
-    api_url=$($KUBE_CLI cluster-info 2>/dev/null | grep -o 'https://[^ ]*' | head -1 || echo "unknown")
-    local context
-    context=$($KUBE_CLI config current-context 2>/dev/null || echo "unknown")
-    echo -e "${BOLD}Target Cluster:${NC} $api_url"
-    echo -e "${BOLD}Context:${NC}        $context"
-    echo ""
-}
-
 copy_pull_secret_to_namespace() {
     local target_ns="$1"
     log_substep "Copying pull secret to namespace: $target_ns"

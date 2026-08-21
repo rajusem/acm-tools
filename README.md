@@ -79,6 +79,67 @@ export CATALOG_REGISTRY="quay.io:443/acm-d"      # Catalog registry (--catalog-r
 export CATALOG_IMAGE="acm-dev-catalog"           # Catalog image name (--catalog-image)
 ```
 
+### upgrade-acm
+
+Upgrade ACM and MCE on an existing hub via OLM. Uses `subscription.operators.coreos.com` (not plain `subscription`). Auto-detects which catalog has the target channel (often `mce-dev-catalog`, not `redhat-operators`).
+
+```bash
+# Full ACM 5.0 + MCE 5.0 upgrade
+bin/upgrade-acm --version 5.0 --apply-mce-catalog
+
+# Dry-run to preview changes without applying
+bin/upgrade-acm --version 5.0 --apply-mce-catalog --dry-run
+
+# MCE only: stable-2.17 -> stable-5.0
+bin/upgrade-acm fix-mce --mce-channel stable-5.0 --apply-mce-catalog
+
+# Apply MCE dev catalog separately, then fix MCE
+bin/upgrade-acm apply-mce-catalog
+bin/upgrade-acm fix-mce --mce-channel stable-5.0
+
+# See all MCE channels per catalog (matches console UI)
+bin/upgrade-acm list-channels
+
+# Check current state
+bin/upgrade-acm status
+```
+
+**Version examples:**
+
+| Command | ACM Channel | MCE Channel | Notes |
+|---------|-------------|-------------|-------|
+| `--version 5.0` | release-5.0 | stable-5.0 | ACM uses `release-`; MCE uses `stable-` |
+| `--version 5.1` | release-5.1 | stable-5.1 | Minor is not hardcoded to 5.0 |
+| `--version 2.17` | release-2.17 | stable-2.17 | ACM 2.17 |
+| `--version 2.16` | release-2.16 | stable-2.11 | ACM 2.16 (MCE = ACM minor - 5) |
+| `--channel release-2.17 --mce-channel stable-2.17` | release-2.17 | stable-2.17 | Explicit channels |
+
+Channel derivation logic:
+- **ACM** → always `release-<major>.<minor>` (same as `install-custom-acm`)
+- **MCE 5.x and ACM 2.17+** → `stable-<major>.<minor>`
+- **ACM 2.16 and below** → MCE `stable-2.<minor-5>`
+
+`--mce-source` is honoured and is not overwritten when `--apply-mce-catalog` creates `mce-dev-catalog`. `--wait-timeout` applies to MCH, ACM/MCE CSV, MCE compliance, and CatalogSource waits.
+
+**Environment variables:**
+
+```bash
+export TARGET_VERSION="5.0"                          # Target version (--version)
+export ACM_CHANNEL="release-5.0"                     # ACM OLM channel (--channel)
+export MCE_CHANNEL="stable-5.0"                      # MCE OLM channel (--mce-channel)
+export MCE_SOURCE="mce-dev-catalog"                  # MCE catalog source (--mce-source)
+export MCE_SOURCE_NS="openshift-marketplace"         # CatalogSource namespace
+export MCE_CATALOG_IMAGE="mce-dev-catalog"           # Dev catalog image name
+export MCE_CATALOG_REGISTRY="quay.io:443/acm-d"     # Dev catalog registry
+export MCE_CATALOG_TAG="latest-5.0"                  # Dev catalog tag (--mce-catalog-tag)
+export MCE_NAMESPACE="multicluster-engine"           # MCE subscription namespace
+export ACM_SUB_NAME=""                               # ACM subscription name (auto-detected)
+export MCE_SUB_NAME="multicluster-engine"            # MCE subscription name
+export WAIT_TIMEOUT="900"                            # MCH / CSV / MCE / catalog wait timeout
+```
+
+The dev catalog image defaults to `quay.io:443/acm-d/mce-dev-catalog:latest-5.0`. Override with `--mce-catalog-tag`.
+
 ### setup-observability
 
 Bootstrap MCO observability on a hub cluster with Minio storage.

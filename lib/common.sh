@@ -164,9 +164,18 @@ get_resource_field() {
     fi
 }
 
-# Confirm action (returns 0 for yes)
+# Confirm action (returns 0 for yes).
+# Non-interactive / CI: set ACM_TOOLS_YES=true or pass --yes / --force-import.
 confirm() {
     local message="${1:-Continue?}"
+    if [[ "${ACM_TOOLS_YES:-}" == "true" ]]; then
+        log_info "$message [yes]"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        log_error "$message — non-interactive stdin; pass --yes or --force-import"
+        return 1
+    fi
     read -rp "$(echo -e "${YELLOW}$message [y/N]: ${NC}")" response
     [[ "$response" =~ ^[Yy]$ ]]
 }
@@ -270,4 +279,100 @@ mc_to_context() {
 check_coo_installed() {
     $KUBE_CLI get csv -n openshift-operators --no-headers 2>/dev/null | \
         awk '{print $1}' | grep "^cluster-observability-operator" >/dev/null 2>&1
+}
+
+# --- Version-cycle helpers (OBSINTA-1606 T1/T3/T6/T7) -------------------------
+
+# Clear OCM CRDs stuck Terminating after ACM uninstall/reinstall (T1).
+clear_terminating_ocm_crds() {
+    local crd resource ns name ts
+    for crd in \
+        managedclusteraddons.addon.open-cluster-management.io \
+        manifestworks.work.open-cluster-management.io
+    do
+        ts=$($KUBE_CLI get crd "$crd" -o jsonpath='{.metadata.deletionTimestamp}' \
+            --request-timeout=10s 2>/dev/null || echo "")
+        [[ -z "$ts" ]] && continue
+        resource="${crd%%.*}"
+        log_warn "CRD $crd is terminating — clearing instance and CRD finalizers"
+        while read -r ns name; do
+            [[ -z "${name:-}" ]] && continue
+            if [[ -n "${ns:-}" && "$ns" != "<none>" && "$ns" != "null" ]]; then
+                $KUBE_CLI patch "$resource" "$name" -n "$ns" --type=merge \
+                    -p '{"metadata":{"finalizers":[]}}' --request-timeout=15s 2>/dev/null || true
+            else
+                $KUBE_CLI patch "$resource" "$name" --type=merge \
+                    -p '{"metadata":{"finalizers":[]}}' --request-timeout=15s 2>/dev/null || true
+            fi
+        done < <($KUBE_CLI get "$resource" -A --no-headers \
+            -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name \
+            --request-timeout=15s 2>/dev/null || true)
+        $KUBE_CLI patch crd "$crd" --type=merge \
+            -p '{"metadata":{"finalizers":[]}}' --request-timeout=15s 2>/dev/null || true
+    done
+}
+
+# MCH validating/mutating webhooks can block uninstall (T7).
+remove_mch_admission_webhooks() {
+    local webhooks
+    webhooks=$($KUBE_CLI get validatingwebhookconfiguration,mutatingwebhookconfiguration \
+        -o name --request-timeout=15s 2>/dev/null | grep -Ei 'multiclusterhub|multicluster-hub|mch-operator' || true)
+    [[ -z "$webhooks" ]] && return 0
+    log_substep "Removing MCH admission webhooks that can block uninstall"
+    while IFS= read -r wh; do
+        [[ -z "$wh" ]] && continue
+        log_info "  Deleting $wh"
+        $KUBE_CLI delete "$wh" --ignore-not-found --timeout=30s 2>/dev/null || true
+    done <<< "$webhooks"
+}
+
+# Leftover MCE CSV/CR from a prior ACM major blocks the next install (T3).
+cleanup_mce_leftovers() {
+    local mce_ns="multicluster-engine"
+    if ! $KUBE_CLI get namespace "$mce_ns" --request-timeout=10s &>/dev/null; then
+        return 0
+    fi
+    log_substep "Removing leftover MCE (namespace $mce_ns)"
+    local mce_list
+    mce_list=$($KUBE_CLI get mce -o name --request-timeout=15s 2>/dev/null || true)
+    if [[ -n "$mce_list" ]]; then
+        $KUBE_CLI delete mce --all --timeout=180s 2>/dev/null || true
+        while IFS= read -r mce; do
+            [[ -z "$mce" ]] && continue
+            $KUBE_CLI patch "$mce" --type=merge -p '{"metadata":{"finalizers":[]}}' \
+                --request-timeout=15s 2>/dev/null || true
+        done <<< "$mce_list"
+        $KUBE_CLI delete mce --all --timeout=60s --ignore-not-found 2>/dev/null || true
+    fi
+    $KUBE_CLI delete subscription.operators.coreos.com --all -n "$mce_ns" \
+        --timeout=60s --ignore-not-found 2>/dev/null || true
+    local csv
+    while IFS= read -r csv; do
+        [[ -z "$csv" ]] && continue
+        $KUBE_CLI delete "$csv" -n "$mce_ns" --timeout=60s --ignore-not-found 2>/dev/null || true
+    done < <($KUBE_CLI get csv -n "$mce_ns" -o name --request-timeout=15s 2>/dev/null | \
+        grep -Ei 'multicluster-engine|mce' || true)
+}
+
+# Fail install if an existing MCE CSV major.minor does not match the target channel (T3).
+preflight_mce_csv_channel() {
+    local expected_channel="${1:-}"
+    [[ -z "$expected_channel" ]] && return 0
+    local csv_names expected_ver csv_name leftover
+    csv_names=$($KUBE_CLI get csv -n multicluster-engine --no-headers \
+        -o custom-columns=NAME:.metadata.name --request-timeout=15s 2>/dev/null || true)
+    [[ -z "$csv_names" ]] && return 0
+    expected_ver="${expected_channel#stable-}"
+    while IFS= read -r csv_name; do
+        [[ -z "$csv_name" ]] && continue
+        if [[ "$csv_name" =~ \.v([0-9]+)\.([0-9]+) ]]; then
+            leftover="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            if [[ "$leftover" != "$expected_ver" ]]; then
+                log_error "Leftover MCE CSV '$csv_name' does not match channel $expected_channel"
+                log_info "Uninstall first: bin/install-custom-acm uninstall --force-remove"
+                return 1
+            fi
+        fi
+    done <<< "$csv_names"
+    return 0
 }

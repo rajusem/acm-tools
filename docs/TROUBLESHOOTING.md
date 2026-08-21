@@ -444,6 +444,26 @@ bin/install-custom-acm uninstall
 
 ---
 
+## Never use `oc delete ip` (InstallPlan vs IPAddress)
+
+**Symptom**: After a typed `oc delete ip --all` (intending OLM InstallPlans), cluster networking breaks — `IPAddress` objects from `networking.k8s.io` are deleted cluster-wide. Hub API / console can become unreachable for hours.
+
+**Root cause**: The short resource name `ip` matches `ipaddress.networking.k8s.io`, **not** `installplan.operators.coreos.com`.
+
+**Fix / prevention**:
+```bash
+# WRONG — deletes IPAddress CRs
+oc delete ip --all
+
+# RIGHT — always use the fully qualified OLM resource
+oc get installplan.operators.coreos.com -A
+oc delete installplan.operators.coreos.com <name> -n <namespace>
+```
+
+`install-custom-acm` never uses the short name `ip`. Do not add it to scripts or runbooks.
+
+---
+
 ## ManagedClusterAddon CRD Stuck Terminating
 
 **Symptom**: No `ManagedClusterAddon` resources are created for any cluster. `kubectl get managedclusteraddon -n <cluster>` returns "the server could not find the requested resource". GPU or RS policies show `compliant: null` (violations) on all clusters.

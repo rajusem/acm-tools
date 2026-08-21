@@ -58,6 +58,7 @@ usage() {
     echo "Options (for add):"
     echo "  --name NAME          ManagedCluster name (default: context name)"
     echo "  --force-import       Clean up existing klusterlet and re-import (also repairs local-cluster)"
+    echo "  --yes                Skip confirmation prompts (also implied by --force-import for retry)"
     echo "  --sync-pull-secret   Sync hub's quay.io:443 credentials to spoke's global pull secret"
     echo "  --no-wait            Skip waiting for cluster to become Available"
     echo "  --timeout N          Wait timeout in seconds (default: 120)"
@@ -370,7 +371,8 @@ do_add() {
         case "$1" in
             --name)         cluster_name="$2"; shift 2 ;;
             --no-wait)           no_wait=true; shift ;;
-            --force-import)      force_import=true; shift ;;
+            --force-import)      force_import=true; ACM_TOOLS_YES=true; export ACM_TOOLS_YES; shift ;;
+            --yes)               ACM_TOOLS_YES=true; export ACM_TOOLS_YES; shift ;;
             --sync-pull-secret)  sync_pull_secret=true; shift ;;
             --timeout)           wait_timeout="$2"; shift 2 ;;
             *) log_error "Unknown option: $1"; usage; exit 1 ;;
@@ -400,7 +402,9 @@ do_add() {
             return 0
         else
             log_warn "ManagedCluster '$cluster_name' exists but is not Available (status: ${existing_available:-Unknown})"
-            if ! confirm "Re-create import manifests to retry import?"; then
+            if [[ "$force_import" == "true" ]] || [[ "${ACM_TOOLS_YES:-}" == "true" ]]; then
+                log_info "Re-creating import manifests (--force-import/--yes)"
+            elif ! confirm "Re-create import manifests to retry import?"; then
                 log_info "Cancelled"
                 return 0
             fi

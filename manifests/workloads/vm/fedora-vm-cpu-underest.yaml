@@ -1,0 +1,70 @@
+# CPU-underestimation fixture (floor-based dashboard panels).
+#
+# RS cpu_request = count(kubevirt_vmi_vcpu_seconds_total) = guest vCPU COUNT (not requests.cpu).
+# RS cpu_usage   = rate(kubevirt_vmi_cpu_usage_seconds_total); capped at the vCPU count.
+# Underestimation panel fires when floor(request - usage*1.1) < 0, i.e. usage > request/1.1.
+# With 1 guest vCPU pegged at ~100%: request=1, usage->1.0, reco=1.1 -> floor(1-1.1) = -1.
+#
+# Determinism notes (validated on vm-spoke Aug 2026, see docs/TROUBLESHOOTING.md):
+#   - Exactly ONE guest vCPU (domain.cpu.cores: 1) pegged by a base-image shell busy loop.
+#   - NO network package install (dnf) — that was the root cause of prior non-determinism.
+#   - Keep memory small / unpressured so the busy loop is not starved of CPU cycles
+#     (memory pressure steals cycles and drops guest cpu usage below the 90.9% threshold).
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: cpu-underest-vm
+  namespace: auto-vm-test
+  labels:
+    app: cpu-underest-vm
+    type: fedora
+    vm-type: stress-test
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: cpu-underest-vm
+        app: cpu-underest-vm
+        type: fedora
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        memory:
+          guest: 2Gi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+        resources:
+          requests:
+            memory: 2Gi
+            cpu: "1"
+          limits:
+            memory: 2Gi
+            cpu: "2"
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/containerdisks/fedora:latest
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              password: fedora
+              chpasswd: { expire: False }
+              runcmd:
+                # Peg the single guest vCPU with a base-image shell busy loop (no network).
+                - nohup sh -c 'while :; do :; done' >/dev/null 2>&1 &
+                - sleep 5 && pgrep -f 'while' >/dev/null && echo CPU_LOAD_RUNNING > /etc/vm_status || echo CPU_LOAD_FAILED > /etc/vm_status

@@ -1132,7 +1132,7 @@ deploy_vm_workloads() {
         log_success "  Applied $(basename "$file")"
     done
 
-    for vm in fedora-vm-1 fedora-vm-2 rhel-vm1; do
+    for vm in fedora-vm-1 fedora-vm-2 rhel-vm1 cpu-underest-vm mem-underest-vm; do
         if $KUBE_CLI --context="$ctx" get vm "$vm" -n "$ns" &>/dev/null; then
             log_substep "Waiting for VM $vm to boot..."
             wait_until "$TIMEOUT_VM_BOOT" 10 "VM $vm running" \
@@ -3435,8 +3435,13 @@ phase_21() {
     local errors=0
 
     # VM classification pairs: (vm_name, expected_class, soft, expected_mem_request_gi)
-    # VM memory underestimation (ratio > 1.2) is physically impossible: usage ≤ VM memory = max(request sources).
-    # Max achievable ratio = 1.1 (100% utilization × 110% recommendation). Test ideal + overestimated only.
+    # NOTE: this phase uses the RATIO classifier (classify_recommendation: ratio>1.2 under, <0.8 over).
+    # Under that classifier, VM underestimation cannot register: max ratio = 1.1 (100% utilization ×
+    # 110% recommendation) never exceeds the 1.2 "underestimated" threshold, so only ideal +
+    # overestimated appear here. The dashboard's floor-based panels use a DIFFERENT rule
+    # (floor(request - reco) < 0, i.e. usage > request/1.1 ≈ 90.9%), under which underestimation IS
+    # achievable — that is validated separately in phase_21a with the cpu-underest-vm / mem-underest-vm
+    # fixtures. Do not "fix" this list to expect underestimated here.
     local -a vm_tests=(
         "fedora-vm-1:ideal:false:4"
         "fedora-vm-2:overestimated:false:4"
@@ -3552,7 +3557,9 @@ phase_21() {
             fi
         fi
 
-        # CPU classification — informational only (VM CPU underestimation is physically impossible)
+        # CPU classification — informational only under the ratio classifier (cpu usage is capped at
+        # the vCPU count, so ratio maxes at 1.1 and never reaches the 1.2 "underestimated" cutoff).
+        # Floor-based CPU underestimation (usage > request/1.1) is validated in phase_21a instead.
         if [[ "$spoke_fallback_needed" != "true" && -n "$val_cpu_request" && -n "$val_cpu_recommendation" ]]; then
             local cpu_class
             cpu_class=$(classify_recommendation "$val_cpu_recommendation" "$val_cpu_request")
@@ -3693,7 +3700,7 @@ phase_21a() {
 
     log_substep "Pre-check: checking test VM running state"
     local stopped_count=0
-    for vm in fedora-vm-1 fedora-vm-2 rhel-vm1; do
+    for vm in fedora-vm-1 fedora-vm-2 rhel-vm1 cpu-underest-vm mem-underest-vm; do
         if vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$vm"; then
             log_success "  $vm: Running"
         else
@@ -3729,6 +3736,11 @@ phase_21a() {
         "Memory Underestimation:STAT_MEM_UNDEREST_TMPL:TABLE_MEM_UNDEREST_TMPL"
     )
 
+    # Track the underestimation stat values so we can assert the dedicated fixtures actually fired
+    # (assert_stat_table_match treats "both empty" as a trivial MATCH — that would silently pass even
+    # if the cpu-underest-vm / mem-underest-vm fixtures failed to load or stopped underestimating).
+    local cpu_underest_stat="" mem_underest_stat=""
+
     for entry in "${pairs[@]}"; do
         IFS=: read -r label stat_tmpl_name table_tmpl_name <<< "$entry"
 
@@ -3742,7 +3754,36 @@ phase_21a() {
 
         assert_stat_table_match "$label" "$stat_val" "$table_val" "$stat_query" "$table_query" || \
             ((errors++)) || true
+
+        [[ "$label" == "CPU Underestimation" ]] && cpu_underest_stat="$stat_val"
+        [[ "$label" == "Memory Underestimation" ]] && mem_underest_stat="$stat_val"
     done
+
+    # Explicit non-empty coverage: the cpu-underest-vm and mem-underest-vm fixtures are deployed by
+    # phase 18 specifically to make these panels fire. If they are running (pre-check above) but the
+    # stat is empty/zero, the fixture is not underestimating (metrics not federated yet, fill failed,
+    # or the recording-rule semantics changed) — fail loudly instead of passing as "both empty".
+    if vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" cpu-underest-vm; then
+        if [[ -n "$cpu_underest_stat" ]] && awk "BEGIN {exit !($cpu_underest_stat > 0)}"; then
+            log_success "  CPU Underestimation: fixture cpu-underest-vm is underestimating (stat=$cpu_underest_stat)"
+        else
+            log_error "  CPU Underestimation: cpu-underest-vm running but stat='${cpu_underest_stat:-empty}' (expected > 0)"
+            ((errors++)) || true
+        fi
+    else
+        log_warn "  CPU Underestimation: cpu-underest-vm not running — skipping non-empty assertion"
+    fi
+
+    if vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" mem-underest-vm; then
+        if [[ -n "$mem_underest_stat" ]] && awk "BEGIN {exit !($mem_underest_stat > 0)}"; then
+            log_success "  Memory Underestimation: fixture mem-underest-vm is underestimating (stat=$(format_bytes "$mem_underest_stat"))"
+        else
+            log_error "  Memory Underestimation: mem-underest-vm running but stat='${mem_underest_stat:-empty}' (expected > 0)"
+            ((errors++)) || true
+        fi
+    else
+        log_warn "  Memory Underestimation: mem-underest-vm not running — skipping non-empty assertion"
+    fi
 
     stop_thanos_port_forward
 

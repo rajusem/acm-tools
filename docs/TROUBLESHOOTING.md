@@ -1179,3 +1179,46 @@ oc delete pods --field-selector=status.phase==Succeeded -A --force --grace-perio
 echo "y" | bin/setup-observability uninstall
 bin/setup-observability install
 ```
+
+## Forcing VM Right-Sizing UNDERestimation (Fixture Design)
+
+The RS dashboard's **Underestimation** stat/table panels fire when
+`floor(request - recommendation) < 0`, i.e. when `usage > request / 1.1` (~90.9% utilization,
+since `recommendation = usage × 1.1`). Getting a VM to underestimate *consistently* is subtle
+because of how the KubeVirt recording rules define request and usage:
+
+- `acm_rs_vm:namespace:memory_request = max by(name,namespace)(kubevirt_vm_resource_requests{resource="memory"})`.
+  KubeVirt emits three `source` variants (`domain` = `resources.requests.memory`, `guest`,
+  `guest_effective`) and `max()` **always picks the guest RAM**. Lowering
+  `resources.requests.memory` is therefore *ignored* — the RS request equals `domain.memory.guest`.
+- `acm_rs_vm:namespace:memory_usage = sum(kubevirt_vmi_memory_available_bytes - kubevirt_vmi_memory_usable_bytes)`
+  (guest-reported "used"). Memory underestimation thus requires guest usage > ~90.9% of guest RAM
+  → intrinsically **near-OOM**. For a 4Gi guest the underest window is only ~3.64–3.71 GiB wide.
+- `acm_rs_vm:namespace:cpu_request = count(kubevirt_vmi_vcpu_seconds_total)` = **guest vCPU count**
+  (NOT `resources.requests.cpu`); set by `domain.cpu.cores`. `cpu_usage` is capped at that count.
+
+**Deterministic fixtures** (`manifests/workloads/vm/`, deployed by `bin/rs-e2e` phase 18, asserted
+in phase 21a):
+
+- `fedora-vm-cpu-underest.yaml` (`cpu-underest-vm`): 1 guest vCPU pegged by a base-image shell
+  busy loop (`while :; do :; done`) → cpu usage → 1.0, reco 1.1, `floor(1 - 1.1) = -1`. Keep guest
+  memory small/unpressured (2Gi) so the loop is not starved of cycles.
+- `fedora-vm-mem-underest.yaml` (`mem-underest-vm`): 4Gi guest filled with **anonymous** memory
+  (`python3 -c "a=bytearray(3400*1024*1024)"`, python3 ships in the fedora cloud image). 3400 MiB
+  is the validated sweet spot — usage lands ~3.70 GiB (~65 MiB over the threshold) with ~110 MiB
+  headroom.
+
+**Pitfalls that cause non-determinism** (all learned the hard way):
+
+- **`dnf install stress-ng`** — network-dependent, silently fails on a spoke without egress → the
+  workload never runs. Use base-image-only workloads (shell loop / python3).
+- **tmpfs / page-cache fill** (`mount -t tmpfs` + `dd`) — drifts over time and straddles the
+  90.9% threshold (three identical VMs after 16h landed 3.674 / 3.666 / 3.544 GiB = 2 underest +
+  1 ideal). Anonymous `bytearray` is resident and does not drift.
+- **Combining CPU + memory load in one single-vCPU VM** — memory pressure (tight ~110 MiB free)
+  steals cycles from the CPU loop, capping cpu usage ~0.73 and flipping CPU to *over*estimation.
+  Use **separate** fixtures for CPU-underest and memory-underest.
+
+> Note: phase 21 uses the *ratio* classifier (`ratio > 1.2` = underestimated), under which VM
+> underestimation can never register (max ratio = 1.1). The floor-based panels above are validated
+> in phase 21a instead.

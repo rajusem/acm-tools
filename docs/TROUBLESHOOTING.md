@@ -101,6 +101,8 @@ The `--force-cleanup-mw` flag removes all finalizers from stuck MCOA ManifestWor
 
 **Common trigger (dev)**: Hibernating and resuming SNO dev clusters. The klusterlet's `bootstrap-hub-kubeconfig` or derived `hub-kubeconfig-secret` becomes stale after resume, so the registration agent cannot renew its lease. This is primarily a dev/test concern — production 3-node hub clusters typically don't hibernate.
 
+> **ClusterPool SNO clusters (`obsint-sno-4xlarge-*`)**: For these clusters the lease typically stops because of **pending CSRs** (expired kubelet certs, not stale bootstrap credentials). The klusterlet pods can't reach the hub because OVN/CNI is down, which is itself caused by the kubelet TLS failure. The symptom on the hub is a `renewTime` that is days old while `ClusterDeployment Ready=True`. Do not follow the escalating fix below — go to [Cluster Unreachable After Hibernate/Resume (Pending CSRs)](#cluster-unreachable-after-hibernateresume-pending-csrs) instead and approve the pending CSRs first. Only return here if the lease still doesn't renew after the console comes back.
+
 **Impact**: Work agent cannot process ManifestWork updates. PrometheusRules, COO Subscription, Perses dashboards all pending.
 
 **Diagnosis**:
@@ -213,6 +215,13 @@ If none of the above work, the spoke cluster may be unreachable (powered off, ne
 ## Cluster Unreachable After Hibernate/Resume (Pending CSRs)
 
 **Symptom**: After resuming hibernated ClusterPool clusters (via ACM console or cronjob), the console URLs return `SSL_ERROR_SYSCALL` or connection refused. The API server (port 6443) may still respond, but `*.apps` routes on port 443 do not. The ClusterDeployment may misleadingly show `Ready: True` / `Unreachable: False` even though the console is not accessible — these conditions reflect API server reachability (port 6443), not ingress/console health.
+
+**ACM-side indicator**: The hub-side signal is a stale `managed-cluster-lease` `renewTime` (days old) combined with the cluster showing `ManagedClusterConditionAvailable: Unknown`. Check the lease before touching the spoke:
+```bash
+oc get lease managed-cluster-lease -n <cluster-name> \
+  -o jsonpath='{.spec.renewTime}'
+# If this is days old while ClusterDeployment shows Ready=True → pending CSRs
+```
 
 **Root cause**: During hibernation, kubelet client certificates and internal signing CAs (CSR signer, aggregator client signer) expire. On resume, kubelets fall back to the bootstrap token (`node-bootstrapper` service account) and request new certificates via CSRs. The `cluster-machine-approver` cannot auto-approve these because:
 

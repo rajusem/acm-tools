@@ -55,9 +55,12 @@ usage() {
     echo ""
     echo "Options (for uninstall):"
     echo "  --force-remove  Detach all managed clusters before deleting MCH"
+    echo "  --yes           Skip confirmation prompts (also set ACM_TOOLS_YES=true)"
     echo ""
     echo "Options (for install):"
     echo "  --version VER          ACM version, e.g., 2.16, 2.15 (sets channel to release-VER)"
+    echo "  --disable-search       Disable the MCH search component (default on ACM 2.16; recommended after version-cycle)"
+    echo "  --yes                  Skip confirmation prompts (ACM_TOOLS_YES=true)"
     echo "  --mce-channel CHANNEL  MCE OLM channel (default: auto-derived from ACM version)"
     echo "  --mce-source SOURCE    MCE CatalogSource name (default: redhat-operators)"
     echo "  --channel CHANNEL      ACM OLM channel (default: $ACM_CHANNEL)"
@@ -165,6 +168,7 @@ do_install() {
     local skip_mch=false
     local merge_pull=false
     local apply_catalog=false
+    local disable_search=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -181,6 +185,8 @@ do_install() {
             --catalog-tag)      CATALOG_TAG="$2"; shift 2 ;;
             --catalog-image)    CATALOG_IMAGE="$2"; shift 2 ;;
             --catalog-registry) CATALOG_REGISTRY="$2"; shift 2 ;;
+            --disable-search)   disable_search=true; shift ;;
+            --yes)              ACM_TOOLS_YES=true; export ACM_TOOLS_YES; shift ;;
             *) log_error "Unknown option: $1"; usage; exit 1 ;;
         esac
     done
@@ -223,6 +229,9 @@ do_install() {
         log_info "Catalog Tag:   $CATALOG_TAG"
     fi
     echo ""
+
+    clear_terminating_ocm_crds
+    preflight_mce_csv_channel "$MCE_CHANNEL" || exit 1
 
     # 0a. Merge pull secret if requested
     if [[ "$merge_pull" == "true" ]]; then
@@ -410,7 +419,7 @@ EOF
     if [[ "$csv_ready" == "false" ]]; then
         log_error "ACM operator failed to install within 300s"
         log_info "Check: $KUBE_CLI get csv -n $ACM_NAMESPACE"
-        log_info "Check: $KUBE_CLI get installplan -n $ACM_NAMESPACE"
+        log_info "Check: $KUBE_CLI get installplan.operators.coreos.com -n $ACM_NAMESPACE"
         return 1
     fi
 
@@ -422,14 +431,26 @@ EOF
 
     if resource_exists multiclusterhub multiclusterhub "$ACM_NAMESPACE"; then
         log_info "MultiClusterHub already exists, skipping creation"
+        if [[ "$disable_search" == "true" ]] || [[ "$ACM_VERSION" == "2.16" ]]; then
+            disable_search=true
+            log_info "Disabling search on existing MCH (ACM 2.16 / --disable-search)"
+            $KUBE_CLI patch mch multiclusterhub -n "$ACM_NAMESPACE" --type=merge \
+                -p '{"spec":{"overrides":{"components":[{"name":"search","enabled":false}]}}}' \
+                --request-timeout=30s 2>/dev/null || true
+        fi
     else
         log_substep "Creating MultiClusterHub"
         # MCE comes from redhat-operators unless user explicitly set --source
         # (custom ACM dev catalogs don't contain MCE packages)
         local mce_source="${MCE_SOURCE:-redhat-operators}"
         local mce_source_ns="openshift-marketplace"
-        local mce_sub_spec
+        local mce_sub_spec search_spec=""
         mce_sub_spec="{\"channel\":\"$MCE_CHANNEL\",\"source\":\"$mce_source\",\"sourceNamespace\":\"$mce_source_ns\"}"
+        if [[ "$disable_search" == "true" ]] || [[ "$ACM_VERSION" == "2.16" ]]; then
+            disable_search=true
+            search_spec=$'\n  overrides:\n    components:\n    - name: search\n      enabled: false'
+            log_info "MCH search component disabled (--disable-search or ACM 2.16)"
+        fi
         cat <<EOF | $KUBE_CLI apply -f -
 apiVersion: operator.open-cluster-management.io/v1
 kind: MultiClusterHub
@@ -439,7 +460,7 @@ metadata:
   annotations:
     installer.open-cluster-management.io/mce-subscription-spec: '$mce_sub_spec'
 spec:
-  imagePullSecret: multiclusterhub-operator-pull-secret
+  imagePullSecret: multiclusterhub-operator-pull-secret${search_spec}
 EOF
         log_info "MCH configured with MCE source: $mce_source (channel: $MCE_CHANNEL)"
     fi
@@ -455,11 +476,52 @@ EOF
             log_success "MCH is Running"
             break
         fi
+        if [[ "$ACM_VERSION" == "2.16" ]]; then
+            local mch_dump
+            mch_dump=$($KUBE_CLI get mch multiclusterhub -n "$ACM_NAMESPACE" -o yaml 2>/dev/null || true)
+            if echo "$mch_dump" | grep -A12 'name: search' | grep -Ei 'Error|collectorconfig' >/dev/null; then
+                log_warn "Search component Error on ACM 2.16 — disabling search"
+                $KUBE_CLI patch mch multiclusterhub -n "$ACM_NAMESPACE" --type=merge \
+                    -p '{"spec":{"overrides":{"components":[{"name":"search","enabled":false}]}}}' \
+                    --request-timeout=30s 2>/dev/null || true
+            fi
+        fi
         printf "\r  MCH status: %-20s (%ds/%ds)" "${mch_status:-Pending}" "$elapsed" "$MCH_WAIT_TIMEOUT"
         sleep 15
         elapsed=$((elapsed + 15))
     done
     echo ""
+
+    if resource_exists managedcluster local-cluster; then
+        # local-cluster is commonly still registering right after MCH reaches Running; give it a
+        # short grace period to become Available on its own before resorting to a destructive
+        # force-import (klusterlet teardown + re-import). Only repair if it never settles.
+        local lc_status="" lc_wait=0 lc_grace=120
+        while [[ $lc_wait -lt $lc_grace ]]; do
+            lc_status=$($KUBE_CLI get managedcluster local-cluster \
+                -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
+                --request-timeout=15s 2>/dev/null || echo "")
+            [[ "$lc_status" == "True" ]] && break
+            printf "\r  Waiting for local-cluster Available=True (%ds/%ds, current: %s)   " \
+                "$lc_wait" "$lc_grace" "${lc_status:-missing}"
+            sleep 15
+            lc_wait=$((lc_wait + 15))
+        done
+        echo ""
+        if [[ "$lc_status" != "True" ]]; then
+            log_warn "local-cluster Available=${lc_status:-missing} after ${lc_grace}s — repairing via force-import"
+            ACM_TOOLS_YES=true "$SCRIPT_DIR/add-managed-cluster" add "$HUB_CONTEXT" --force-import || \
+                log_warn "local-cluster repair failed — run: bin/add-managed-cluster add $HUB_CONTEXT --force-import"
+        else
+            log_success "local-cluster is Available"
+        fi
+    fi
+    if ! $KUBE_CLI get crd managedclusteraddons.addon.open-cluster-management.io \
+        --request-timeout=10s &>/dev/null; then
+        log_warn "managedclusteraddons CRD missing — restarting cluster-manager"
+        $KUBE_CLI rollout restart deploy/cluster-manager -n multicluster-engine \
+            --request-timeout=30s 2>/dev/null || true
+    fi
 
     if [[ $elapsed -ge $MCH_WAIT_TIMEOUT ]]; then
         log_warn "MCH not Running within timeout. It may still be initializing."
@@ -484,12 +546,15 @@ do_uninstall() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force-remove) force_remove=true; shift ;;
+            --yes)          ACM_TOOLS_YES=true; export ACM_TOOLS_YES; shift ;;
             *) log_error "Unknown option: $1"; usage; exit 1 ;;
         esac
     done
 
     log_target_cluster
     log_step "Uninstalling ACM"
+
+    remove_mch_admission_webhooks
 
     # Remove managed clusters if --force-remove (MCH webhook blocks deletion if ManagedClusters exist)
     if [[ "$force_remove" == "true" ]]; then
@@ -551,6 +616,9 @@ do_uninstall() {
             log_success "ACM operator removed"
         fi
     fi
+
+    cleanup_mce_leftovers
+    clear_terminating_ocm_crds
 
     echo ""
     log_success "ACM uninstall complete"

@@ -101,6 +101,8 @@ The `--force-cleanup-mw` flag removes all finalizers from stuck MCOA ManifestWor
 
 **Common trigger (dev)**: Hibernating and resuming SNO dev clusters. The klusterlet's `bootstrap-hub-kubeconfig` or derived `hub-kubeconfig-secret` becomes stale after resume, so the registration agent cannot renew its lease. This is primarily a dev/test concern — production 3-node hub clusters typically don't hibernate.
 
+> **ClusterPool SNO clusters (`obsint-sno-4xlarge-*`)**: For these clusters the lease typically stops because of **pending CSRs** (expired kubelet certs, not stale bootstrap credentials). The klusterlet pods can't reach the hub because OVN/CNI is down, which is itself caused by the kubelet TLS failure. The symptom on the hub is a `renewTime` that is days old while `ClusterDeployment Ready=True`. Do not follow the escalating fix below — go to [Cluster Unreachable After Hibernate/Resume (Pending CSRs)](#cluster-unreachable-after-hibernateresume-pending-csrs) instead and approve the pending CSRs first. Only return here if the lease still doesn't renew after the console comes back.
+
 **Impact**: Work agent cannot process ManifestWork updates. PrometheusRules, COO Subscription, Perses dashboards all pending.
 
 **Diagnosis**:
@@ -213,6 +215,13 @@ If none of the above work, the spoke cluster may be unreachable (powered off, ne
 ## Cluster Unreachable After Hibernate/Resume (Pending CSRs)
 
 **Symptom**: After resuming hibernated ClusterPool clusters (via ACM console or cronjob), the console URLs return `SSL_ERROR_SYSCALL` or connection refused. The API server (port 6443) may still respond, but `*.apps` routes on port 443 do not. The ClusterDeployment may misleadingly show `Ready: True` / `Unreachable: False` even though the console is not accessible — these conditions reflect API server reachability (port 6443), not ingress/console health.
+
+**ACM-side indicator**: The hub-side signal is a stale `managed-cluster-lease` `renewTime` (days old) combined with the cluster showing `ManagedClusterConditionAvailable: Unknown`. Check the lease before touching the spoke:
+```bash
+oc get lease managed-cluster-lease -n <cluster-name> \
+  -o jsonpath='{.spec.renewTime}'
+# If this is days old while ClusterDeployment shows Ready=True → pending CSRs
+```
 
 **Root cause**: During hibernation, kubelet client certificates and internal signing CAs (CSR signer, aggregator client signer) expire. On resume, kubelets fall back to the bootstrap token (`node-bootstrapper` service account) and request new certificates via CSRs. The `cluster-machine-approver` cannot auto-approve these because:
 
@@ -441,6 +450,26 @@ Or manually remove managed clusters first:
 kubectl delete managedcluster --all
 bin/install-custom-acm uninstall
 ```
+
+---
+
+## Never use `oc delete ip` (InstallPlan vs IPAddress)
+
+**Symptom**: After a typed `oc delete ip --all` (intending OLM InstallPlans), cluster networking breaks — `IPAddress` objects from `networking.k8s.io` are deleted cluster-wide. Hub API / console can become unreachable for hours.
+
+**Root cause**: The short resource name `ip` matches `ipaddress.networking.k8s.io`, **not** `installplan.operators.coreos.com`.
+
+**Fix / prevention**:
+```bash
+# WRONG — deletes IPAddress CRs
+oc delete ip --all
+
+# RIGHT — always use the fully qualified OLM resource
+oc get installplan.operators.coreos.com -A
+oc delete installplan.operators.coreos.com <name> -n <namespace>
+```
+
+`install-custom-acm` never uses the short name `ip`. Do not add it to scripts or runbooks.
 
 ---
 
@@ -1159,3 +1188,46 @@ oc delete pods --field-selector=status.phase==Succeeded -A --force --grace-perio
 echo "y" | bin/setup-observability uninstall
 bin/setup-observability install
 ```
+
+## Forcing VM Right-Sizing UNDERestimation (Fixture Design)
+
+The RS dashboard's **Underestimation** stat/table panels fire when
+`floor(request - recommendation) < 0`, i.e. when `usage > request / 1.1` (~90.9% utilization,
+since `recommendation = usage × 1.1`). Getting a VM to underestimate *consistently* is subtle
+because of how the KubeVirt recording rules define request and usage:
+
+- `acm_rs_vm:namespace:memory_request = max by(name,namespace)(kubevirt_vm_resource_requests{resource="memory"})`.
+  KubeVirt emits three `source` variants (`domain` = `resources.requests.memory`, `guest`,
+  `guest_effective`) and `max()` **always picks the guest RAM**. Lowering
+  `resources.requests.memory` is therefore *ignored* — the RS request equals `domain.memory.guest`.
+- `acm_rs_vm:namespace:memory_usage = sum(kubevirt_vmi_memory_available_bytes - kubevirt_vmi_memory_usable_bytes)`
+  (guest-reported "used"). Memory underestimation thus requires guest usage > ~90.9% of guest RAM
+  → intrinsically **near-OOM**. For a 4Gi guest the underest window is only ~3.64–3.71 GiB wide.
+- `acm_rs_vm:namespace:cpu_request = count(kubevirt_vmi_vcpu_seconds_total)` = **guest vCPU count**
+  (NOT `resources.requests.cpu`); set by `domain.cpu.cores`. `cpu_usage` is capped at that count.
+
+**Deterministic fixtures** (`manifests/workloads/vm/`, deployed by `bin/rs-e2e` phase 18, asserted
+in phase 21a):
+
+- `fedora-vm-cpu-underest.yaml` (`cpu-underest-vm`): 1 guest vCPU pegged by a base-image shell
+  busy loop (`while :; do :; done`) → cpu usage → 1.0, reco 1.1, `floor(1 - 1.1) = -1`. Keep guest
+  memory small/unpressured (2Gi) so the loop is not starved of cycles.
+- `fedora-vm-mem-underest.yaml` (`mem-underest-vm`): 4Gi guest filled with **anonymous** memory
+  (`python3 -c "a=bytearray(3400*1024*1024)"`, python3 ships in the fedora cloud image). 3400 MiB
+  is the validated sweet spot — usage lands ~3.70 GiB (~65 MiB over the threshold) with ~110 MiB
+  headroom.
+
+**Pitfalls that cause non-determinism** (all learned the hard way):
+
+- **`dnf install stress-ng`** — network-dependent, silently fails on a spoke without egress → the
+  workload never runs. Use base-image-only workloads (shell loop / python3).
+- **tmpfs / page-cache fill** (`mount -t tmpfs` + `dd`) — drifts over time and straddles the
+  90.9% threshold (three identical VMs after 16h landed 3.674 / 3.666 / 3.544 GiB = 2 underest +
+  1 ideal). Anonymous `bytearray` is resident and does not drift.
+- **Combining CPU + memory load in one single-vCPU VM** — memory pressure (tight ~110 MiB free)
+  steals cycles from the CPU loop, capping cpu usage ~0.73 and flipping CPU to *over*estimation.
+  Use **separate** fixtures for CPU-underest and memory-underest.
+
+> Note: phase 21 uses the *ratio* classifier (`ratio > 1.2` = underestimated), under which VM
+> underestimation can never register (max ratio = 1.1). The floor-based panels above are validated
+> in phase 21a instead.

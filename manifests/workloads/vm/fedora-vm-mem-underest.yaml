@@ -1,0 +1,85 @@
+# Memory-underestimation fixture (floor-based dashboard panels).
+#
+# RS memory_request = max by(name,namespace)(kubevirt_vm_resource_requests{resource="memory"}).
+# KubeVirt emits three `source` variants (domain=requests.memory, guest, guest_effective) and
+# max() ALWAYS picks the GUEST RAM — so lowering resources.requests.memory is IGNORED; the RS
+# request equals domain.memory.guest below (4Gi).
+# RS memory_usage = sum(kubevirt_vmi_memory_available_bytes - kubevirt_vmi_memory_usable_bytes)
+# = guest-reported "used". Underestimation panel fires when floor(request - usage*1.1) < 0,
+# i.e. usage > request/1.1 (~90.9%). For a 4Gi guest the underest window is ~3.64-3.71 GiB.
+#
+# Determinism notes (validated on vm-spoke Aug 2026, see docs/TROUBLESHOOTING.md):
+#   - Fill with ANONYMOUS memory (python3 bytearray, ships in the fedora cloud image) — it is
+#     resident and does not drift. tmpfs/page-cache fill drifts and straddles the threshold.
+#   - 3400 MiB is the validated sweet spot: guest usage lands ~3.70 GiB (~65 MiB above the
+#     3.636 GiB threshold) while leaving ~110 MiB headroom (no OOM).
+#   - NO cpu busy loop here: on a single vCPU, memory pressure steals cycles and would flip CPU
+#     to overestimation AND risks starving the fill. Use the separate cpu-underest-vm for CPU.
+#   - NO network package install (dnf). Base cloud image only.
+#
+# CAVEAT: this fixture runs intrinsically near-OOM (~110 MiB guest headroom). It is safe for a
+# bounded rs-e2e run; do not leave it running indefinitely.
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: mem-underest-vm
+  namespace: auto-vm-test
+  labels:
+    app: mem-underest-vm
+    type: fedora
+    vm-type: stress-test
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: mem-underest-vm
+        app: mem-underest-vm
+        type: fedora
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        memory:
+          guest: 4Gi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: "1"
+          limits:
+            memory: 5Gi
+            cpu: "2"
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            # Pinned by digest for determinism: this fixture lives in a ~65 MiB-over-threshold /
+            # ~110 MiB-headroom window (see notes above), and the guest baseline RAM footprint that
+            # sets that window is a function of the base image — a moving :latest tag can push the
+            # fill out of the underest window or into OOM. This digest is Fedora 44
+            # (quay.io/containerdisks/fedora:latest as of 2026-08-25). If you bump it, re-validate
+            # that guest usage still lands ~3.70 GiB and adjust the 3400 MiB fill target if needed.
+            image: quay.io/containerdisks/fedora@sha256:1217dcc8c58dbc3ca08e0323929b86f609506121adb01d0fd892232f2c0544f6
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              password: fedora
+              chpasswd: { expire: False }
+              runcmd:
+                # anonymous memory hog ~3400 MiB (resident, no page-cache drift). No cpu loop.
+                - nohup python3 -c "import time; a=bytearray(3400*1024*1024); time.sleep(10**9)" >/dev/null 2>&1 &
+                - sleep 8 && pgrep -f bytearray >/dev/null && echo MEM_LOAD_RUNNING > /etc/vm_status || echo MEM_LOAD_FAILED > /etc/vm_status

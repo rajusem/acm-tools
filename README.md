@@ -333,10 +333,12 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | Phase | Test | What it validates |
 |-------|------|-------------------|
 | 17 | Deploy namespace workloads | Verifies spoke connectivity and RS PrometheusRules present, deploys 5 CronJob stress workloads (CPU, memory, file I/O, network, combined) to namespace-spoke. |
-| 18 | Deploy VM workloads | Checks OpenShift Virtualization installed on vm-spoke, deploys 3 VMs (2 Fedora, 1 RHEL) with stress-ng. Skipped with `--skip-vm`. |
+| 18 | Deploy VM workloads | Checks OpenShift Virtualization installed on vm-spoke, deploys 5 VMs: `fedora-vm-1`/`fedora-vm-2` (Fedora), `rhel-vm1` (RHEL), plus deterministic underestimation fixtures `cpu-underest-vm` (pegs 1 vCPU) and `mem-underest-vm` (anonymous ~3.4 GiB fill). Skipped with `--skip-vm`. |
 | 19 | Metrics collection wait | Waits `TIMEOUT_METRICS_WAIT` seconds (default: 1200/20 min) for Thanos to ingest metrics from spoke PrometheusRules. Skipped with `--no-metrics-wait`. |
 | 20 | Namespace metrics validation | Discovers Thanos endpoint (rbac-query-proxy Route), queries all 6 `acm_rs:namespace:*` metrics for the workload namespace. Reports values or failures. |
-| 21 | VM metrics validation | Queries all 6 `acm_rs_vm:namespace:*` metrics for the VM workload namespace. Skipped with `--skip-vm`. |
+| 21 | VM metrics validation | Queries all 6 `acm_rs_vm:namespace:*` metrics for the VM workload namespace (ratio classifier: ideal/overestimated). Skipped with `--skip-vm`. |
+| 21a | VM dashboard stat/table consistency | Compares dashboard stat-panel totals against summed table-panel values for all 4 CPU/Memory × Over/Under categories, and asserts the underestimation fixtures (`cpu-underest-vm`, `mem-underest-vm`) actually make the floor-based Underestimation panels fire (non-zero). Skipped with `--skip-vm`. |
+| 21b | Stopped VM exclusion (ACM-41141) | Stops `fedora-vm-2` and verifies it is excluded from the running-VM-filtered stat/table queries. Skipped with `--skip-vm`. |
 | 22 | Data-plane cleanup | Deletes workload namespaces from spoke clusters. Robust to unreachable spokes. |
 
 Phases 5-12, 15-16 require `--mode-switch`. Phases 17-22 require `--data-plane`. Both can be combined with explicit `--phases` selection. Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.

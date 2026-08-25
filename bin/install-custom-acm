@@ -503,14 +503,25 @@ EOF
     echo ""
 
     if resource_exists managedcluster local-cluster; then
-        local lc_status
-        lc_status=$($KUBE_CLI get managedcluster local-cluster \
-            -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
-            --request-timeout=15s 2>/dev/null || echo "")
+        # local-cluster is commonly still registering right after MCH reaches Running; give it a
+        # short grace period to become Available on its own before resorting to a destructive
+        # force-import (klusterlet teardown + re-import). Only repair if it never settles.
+        local lc_status="" lc_wait=0 lc_grace=120
+        while [[ $lc_wait -lt $lc_grace ]]; do
+            lc_status=$($KUBE_CLI get managedcluster local-cluster \
+                -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' \
+                --request-timeout=15s 2>/dev/null || echo "")
+            [[ "$lc_status" == "True" ]] && break
+            printf "\r  Waiting for local-cluster Available=True (%ds/%ds, current: %s)   " \
+                "$lc_wait" "$lc_grace" "${lc_status:-missing}"
+            sleep 15
+            lc_wait=$((lc_wait + 15))
+        done
+        echo ""
         if [[ "$lc_status" != "True" ]]; then
-            log_warn "local-cluster Available=${lc_status:-missing} after MCH install — repairing"
-            ACM_TOOLS_YES=true "$SCRIPT_DIR/add-managed-cluster" add hub --force-import || \
-                log_warn "local-cluster repair failed — run: bin/add-managed-cluster add hub --force-import"
+            log_warn "local-cluster Available=${lc_status:-missing} after ${lc_grace}s — repairing via force-import"
+            ACM_TOOLS_YES=true "$SCRIPT_DIR/add-managed-cluster" add "$HUB_CONTEXT" --force-import || \
+                log_warn "local-cluster repair failed — run: bin/add-managed-cluster add $HUB_CONTEXT --force-import"
         else
             log_success "local-cluster is Available"
         fi

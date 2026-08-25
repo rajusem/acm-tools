@@ -168,15 +168,23 @@ get_resource_field() {
 # Non-interactive / CI: set ACM_TOOLS_YES=true or pass --yes / --force-import.
 confirm() {
     local message="${1:-Continue?}"
+    local response
     if [[ "${ACM_TOOLS_YES:-}" == "true" ]]; then
         log_info "$message [yes]"
         return 0
     fi
-    if [[ ! -t 0 ]]; then
-        log_error "$message — non-interactive stdin; pass --yes or --force-import"
-        return 1
+    if [[ -t 0 ]]; then
+        read -rp "$(echo -e "${YELLOW}$message [y/N]: ${NC}")" response
+    else
+        # Non-interactive stdin: honor piped input (the `echo "y" | ...` idiom that
+        # rs-e2e and the documented recovery commands rely on), but fail loudly on
+        # empty/EOF stdin so CI can't silently proceed or hang. Pass --yes /
+        # --force-import (ACM_TOOLS_YES=true) for unattended runs.
+        if ! read -r response; then
+            log_error "$message — non-interactive stdin with no input; pass --yes or --force-import"
+            return 1
+        fi
     fi
-    read -rp "$(echo -e "${YELLOW}$message [y/N]: ${NC}")" response
     [[ "$response" =~ ^[Yy]$ ]]
 }
 

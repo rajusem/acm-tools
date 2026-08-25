@@ -57,7 +57,11 @@ spec:
       volumes:
         - name: containerdisk
           containerDisk:
-            image: quay.io/containerdisks/fedora:latest
+            # Pinned by digest for determinism: the underestimation window depends on the guest
+            # baseline RAM/CPU footprint, which a moving :latest tag can shift out from under the
+            # fixture. This digest is Fedora 44 (quay.io/containerdisks/fedora:latest as of
+            # 2026-08-25). Re-validate the load math if you bump it.
+            image: quay.io/containerdisks/fedora@sha256:1217dcc8c58dbc3ca08e0323929b86f609506121adb01d0fd892232f2c0544f6
         - name: cloudinitdisk
           cloudInitNoCloud:
             userData: |

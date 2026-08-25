@@ -66,7 +66,13 @@ spec:
       volumes:
         - name: containerdisk
           containerDisk:
-            image: quay.io/containerdisks/fedora:latest
+            # Pinned by digest for determinism: this fixture lives in a ~65 MiB-over-threshold /
+            # ~110 MiB-headroom window (see notes above), and the guest baseline RAM footprint that
+            # sets that window is a function of the base image — a moving :latest tag can push the
+            # fill out of the underest window or into OOM. This digest is Fedora 44
+            # (quay.io/containerdisks/fedora:latest as of 2026-08-25). If you bump it, re-validate
+            # that guest usage still lands ~3.70 GiB and adjust the 3400 MiB fill target if needed.
+            image: quay.io/containerdisks/fedora@sha256:1217dcc8c58dbc3ca08e0323929b86f609506121adb01d0fd892232f2c0544f6
         - name: cloudinitdisk
           cloudInitNoCloud:
             userData: |

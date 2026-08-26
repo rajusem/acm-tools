@@ -453,6 +453,97 @@ bin/install-custom-acm uninstall
 
 ---
 
+## MCH Stuck Installing — OLM CSV Upgrade Deadlock
+
+**Symptom**: MCH stuck in `Installing` for hours or days. `oc get csv -n open-cluster-management` shows the current CSV in `Replacing` phase and a newer CSV in `Pending` with reason `OperatorConditionNotUpgradeable`.
+
+**Root cause**: The MCH operator sets `OperatorCondition.Upgradeable=False` (reason: `AlreadyPerformingUpgrade`) when MCH is mid-install or a component is unhealthy. If OLM simultaneously picks up a newer version from the catalog, the old CSV enters `Replacing` (effectively dead) while the new CSV can't activate because OLM respects the `Upgradeable=False` gate. Result: neither CSV is active, MCH has no running reconciler, and the deadlock persists until the condition is manually cleared.
+
+**Diagnosis**:
+```bash
+# Check CSV states — look for Replacing + Pending pair
+oc --context=hub get csv -n open-cluster-management --no-headers
+
+# Check the OperatorCondition gate
+oc --context=hub get operatorcondition -n open-cluster-management -o json | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for item in data.get('items', []):
+    name = item['metadata']['name']
+    for c in item.get('status', {}).get('conditions', []):
+        if c.get('type') == 'Upgradeable':
+            print(f'{name}: Upgradeable={c[\"status\"]} reason={c.get(\"reason\",\"\")} msg={c.get(\"message\",\"\")[:80]}')
+"
+# Look for: Upgradeable=False reason=AlreadyPerformingUpgrade
+
+# Find the underlying MCH component blocker
+oc --context=hub get mch multiclusterhub -n open-cluster-management \
+  -o jsonpath='{.status.components}' | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for k, v in d.items():
+    if v.get('status') != 'True':
+        print(f'{k}: {v.get(\"message\",\"\")[:80]}')
+"
+```
+
+**Fix**:
+
+1. **Resolve the underlying component blocker first** (e.g., disable an unused component — see [submariner-addon CrashLoopBackOff](#submariner-addon-crashloopbackoff-missing-webhook-tls-cert)).
+
+2. **Patch the OperatorCondition to break the deadlock** (all fields are required):
+   ```bash
+   oc --context=hub patch operatorcondition <replacing-csv-name> \
+     -n open-cluster-management --type=merge \
+     -p '{"spec":{"conditions":[{"type":"Upgradeable","status":"True",
+       "lastTransitionTime":"2026-01-01T00:00:00Z",
+       "reason":"ManualOverride",
+       "message":"Manually cleared to unblock CSV upgrade deadlock"}]}}'
+   ```
+
+3. **Watch the new CSV activate** (Pending → Installing → Succeeded within ~60s):
+   ```bash
+   watch oc --context=hub get csv -n open-cluster-management --no-headers
+   ```
+
+Once the new CSV is `Succeeded`, the new operator pods start and MCH reconciliation resumes.
+
+---
+
+## submariner-addon CrashLoopBackOff (Missing Webhook TLS Cert)
+
+**Symptom**: `submariner-addon` pod in `CrashLoopBackOff`. Logs show:
+```
+Error: open /tmp/k8s-webhook-server/serving-certs/tls.crt: no such file or directory
+```
+The deployment shows `ProgressDeadlineExceeded` and MCH component status reports `False` for `submariner-addon`, keeping MCH stuck in `Installing`.
+
+**Root cause**: The submariner-addon binary unconditionally starts a webhook server and expects a TLS cert at `/tmp/k8s-webhook-server/serving-certs/tls.crt` (controller-runtime default). The pod spec has no cert Secret mounted and no `ValidatingWebhookConfiguration` exists — so neither cert-manager nor OpenShift service-CA ever provisions one. This is a bug in affected ACM dev builds.
+
+**Diagnosis**:
+```bash
+# Confirm the crash reason
+oc --context=hub logs -n open-cluster-management deployment/submariner-addon --tail=10
+
+# Confirm no webhook config or cert Secret exists for submariner
+oc --context=hub get validatingwebhookconfiguration | grep submariner
+oc --context=hub get secret -n open-cluster-management | grep -i "submariner.*cert"
+```
+
+**Fix** (if Submariner is not used — check first):
+```bash
+oc --context=hub patch mch multiclusterhub -n open-cluster-management --type=merge \
+  -p '{"spec":{"overrides":{"components":[{"name":"submariner-addon","enabled":false}]}}}'
+```
+
+MCH removes the deployment and, with no other component blockers, reaches `Running`.
+
+**Note**: Do not disable if you use Submariner for cross-cluster networking. If you need it, the cert provisioning mechanism (a cert-manager `Certificate` or OpenShift service-CA `Service` annotation) is missing from the deployment spec — file a bug against `stolostron/submariner-addon`.
+
+**See also**: [MCH Stuck Installing — OLM CSV Upgrade Deadlock](#mch-stuck-installing--olm-csv-upgrade-deadlock) — this crash commonly co-occurs with the deadlock because a long-stuck MCH triggers OLM to attempt an upgrade.
+
+---
+
 ## Never use `oc delete ip` (InstallPlan vs IPAddress)
 
 **Symptom**: After a typed `oc delete ip --all` (intending OLM InstallPlans), cluster networking breaks — `IPAddress` objects from `networking.k8s.io` are deleted cluster-wide. Hub API / console can become unreachable for hours.

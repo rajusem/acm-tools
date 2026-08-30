@@ -2,14 +2,21 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: simple-memory-workload
+  # DO NOT "fix" this literal. "namespace: offline-workload" is both the file selector
+  # AND the sed source key in rs-e2e deploy_namespace_workloads (~line 1088-1089). The
+  # actual deployed namespace comes from RS_NS_WORKLOAD_NS (default offline-workload).
+  # If you rename this literal, zero CronJobs deploy and phase 17 fails with 0/5.
   namespace: offline-workload
   labels:
     app: simple-memory
     workload-type: memory
 spec:
   schedule: "*/5 * * * *"
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 1
+  # 0/0: do not retain completed/failed pods. kube_pod_container_resource_requests has no
+  # pod-phase filter, so retained Succeeded/Failed pods inflate acm_rs:namespace:memory_request
+  # (observed 896Mi = 2x the 448Mi running sum). Zero history keeps the denominator deterministic.
+  successfulJobsHistoryLimit: 0
+  failedJobsHistoryLimit: 0
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
@@ -19,10 +26,26 @@ spec:
             app: simple-memory
         spec:
           restartPolicy: OnFailure
+          volumes:
+            # tmpfs mounted at /tmp so the dd target is real RAM (shmem, on the anon LRU),
+            # not disk-backed page cache. container_memory_working_set_bytes excludes
+            # inactive_file, so a dd to disk-backed /tmp reads as ~0 usage (was ratio 0.006).
+            - name: mem-hold
+              emptyDir:
+                medium: Memory
+                sizeLimit: 448Mi
           containers:
           - name: memory-worker
             image: busybox:latest
             imagePullPolicy: IfNotPresent
+            volumeMounts:
+            - name: mem-hold
+              mountPath: /tmp
+            # Fixture math: 400Mi tmpfs hold x 1.10 (recommendationPercentage=110, see MCOA
+            # internal/analytics/rightsizing/rulebuilder.go) / 256Mi namespace request sum
+            # (128Mi here + 4 x 32Mi siblings) => ratio ~1.72-1.89, vs the >1.2 "underestimated"
+            # threshold in bin/rs-e2e classify_recommendation(). Tolerates rp in ~[103,130].
+            # 400Mi < 448Mi sizeLimit < 512Mi limit: overrun gives ENOSPC, not an OOM kill.
             resources:
               requests:
                 cpu: "50m"
@@ -35,8 +58,8 @@ spec:
             - -c
             - |
               echo "Starting memory workload at $(date)"
-              # Allocate and use memory for 15 minutes
-              MEM_SIZE=256
+              # Allocate and use memory for 15 minutes (tmpfs = resident, counts in working_set)
+              MEM_SIZE=400
               dd if=/dev/zero of=/tmp/memory_stress bs=1M count=$MEM_SIZE 2>/dev/null
               echo "Memory allocated: ${MEM_SIZE}MB"
               sleep 900

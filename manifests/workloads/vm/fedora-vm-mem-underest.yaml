@@ -30,6 +30,36 @@ metadata:
     vm-type: stress-test
 spec:
   running: true
+  dataVolumeTemplates:
+    # containerDisk cannot be used here: virt-handler fails to write VMI status with
+    # "Checked value must be of type integer with format int32 in
+    #  status.volumeStatus[].containerDiskVolume.checksum", so the VMI never leaves
+    # Scheduled even though the guest boots. Observed on CNV 4.22.0 / OCP 5.0.0-ec.6.
+    #
+    # source.registry (not sourceRef/DataSource) is deliberate:
+    #   - keeps the digest pin, so the guest baseline stays deterministic
+    #   - avoids serialising behind other clones of the shared golden-image PVC
+    #     (measured: 3 concurrent DataSource clones took 140s/157s/294s; two
+    #      registry imports finished in under 140s with no queue)
+    #   - removes the dependency on golden-image import having completed
+    - metadata:
+        name: mem-underest-vm-root
+      spec:
+        source:
+          registry:
+            # Digest pin (do not switch to a :latest tag or a DataSource): this fixture
+            # lives in a ~65 MiB-over-threshold / ~110 MiB-headroom window (see notes
+            # above), and the guest baseline RAM footprint that sets that window is a
+            # function of the base image — a moving tag can push the fill out of the
+            # underest window or into OOM. This digest is Fedora 44
+            # (quay.io/containerdisks/fedora:latest as of 2026-08-25). If you bump it,
+            # re-validate that guest usage still lands ~3.70 GiB and adjust the 3400 MiB
+            # fill target if needed.
+            url: "docker://quay.io/containerdisks/fedora@sha256:1217dcc8c58dbc3ca08e0323929b86f609506121adb01d0fd892232f2c0544f6"
+        storage:
+          resources:
+            requests:
+              storage: 30Gi
   template:
     metadata:
       labels:
@@ -37,6 +67,7 @@ spec:
         app: mem-underest-vm
         type: fedora
     spec:
+      evictionStrategy: None
       domain:
         cpu:
           cores: 1
@@ -44,7 +75,7 @@ spec:
           guest: 4Gi
         devices:
           disks:
-            - name: containerdisk
+            - name: rootdisk
               disk:
                 bus: virtio
             - name: cloudinitdisk
@@ -64,15 +95,9 @@ spec:
         - name: default
           pod: {}
       volumes:
-        - name: containerdisk
-          containerDisk:
-            # Pinned by digest for determinism: this fixture lives in a ~65 MiB-over-threshold /
-            # ~110 MiB-headroom window (see notes above), and the guest baseline RAM footprint that
-            # sets that window is a function of the base image — a moving :latest tag can push the
-            # fill out of the underest window or into OOM. This digest is Fedora 44
-            # (quay.io/containerdisks/fedora:latest as of 2026-08-25). If you bump it, re-validate
-            # that guest usage still lands ~3.70 GiB and adjust the 3400 MiB fill target if needed.
-            image: quay.io/containerdisks/fedora@sha256:1217dcc8c58dbc3ca08e0323929b86f609506121adb01d0fd892232f2c0544f6
+        - name: rootdisk
+          dataVolume:
+            name: mem-underest-vm-root
         - name: cloudinitdisk
           cloudInitNoCloud:
             userData: |

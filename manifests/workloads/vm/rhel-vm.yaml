@@ -9,6 +9,26 @@ metadata:
     vm-type: test
 spec:
   running: true
+  dataVolumeTemplates:
+    # containerDisk cannot be used here: virt-handler fails to write VMI status with
+    # "Checked value must be of type integer with format int32 in
+    #  status.volumeStatus[].containerDiskVolume.checksum", so the VMI never leaves
+    # Scheduled even though the guest boots. Observed on CNV 4.22.0 / OCP 5.0.0-ec.6.
+    #
+    # DataSource (not source.registry) because registry.redhat.io needs pull
+    # credentials that CDI would have to be given separately. This is the only VM
+    # cloning from the rhel10 golden image, so it does not queue behind siblings.
+    - metadata:
+        name: rhel-vm1-root
+      spec:
+        sourceRef:
+          kind: DataSource
+          name: rhel10
+          namespace: openshift-virtualization-os-images
+        storage:
+          resources:
+            requests:
+              storage: 30Gi
   template:
     metadata:
       labels:
@@ -16,10 +36,11 @@ spec:
         app: rhel-vm
         type: rhel
     spec:
+      evictionStrategy: None
       domain:
         devices:
           disks:
-            - name: containerdisk
+            - name: rootdisk
               disk:
                 bus: virtio
             - name: cloudinitdisk
@@ -39,31 +60,49 @@ spec:
         - name: default
           pod: {}
       volumes:
-        - name: containerdisk
-          containerDisk:
-            image: registry.redhat.io/rhel10/rhel-guest-image:latest
+        - name: rootdisk
+          dataVolume:
+            name: rhel-vm1-root
         - name: cloudinitdisk
+          # NOTE: cloudInitNoCloud.userData has a hard 2048-byte limit (KubeVirt rejects the VM
+          # otherwise — only the Service would apply). The SSH key substituted for the placeholder
+          # below can be ~750 bytes, so keep userData minimal: explanatory notes live HERE as YAML
+          # comments, NOT inside the userData block scalar (where they would count toward the limit).
+          # Fixture rationale: NO `packages:` (dnf) — on an unentitled RHEL guest a package install
+          # stalls and the memory fill never runs, leaving the VM idle at ~516Mi => overestimated.
+          # Measured on vm-spoke 2026-08-30 with the old dnf-based fixture: ratio 0.131.
+          # openssh-server is preinstalled in the RHEL guest image; python3 is guaranteed present
+          # (cloud-init depends on it). memhold.service holds ~2900MiB of anonymous guest memory:
+          # 2900MiB + ~516Mi idle baseline => 1.1 * 3416/4096 ~= 0.92 (ideal). Gate [0.86,1.14]
+          # holds while the idle baseline stays in ~[302, 990]Mi; re-measure the baseline after any
+          # guest image update before blaming the fixture.
+          # Default password is for testing only.
           cloudInitNoCloud:
             userData: |
               #cloud-config
-              # WARNING: Default password is for testing only. Change before production use!
               user: rhel
               password: password
               chpasswd: { expire: False }
               ssh_pwauth: true
               ssh_authorized_keys:
                 - "__RS_VM_SSH_PUBLIC_KEY__"
-              packages:
-                - stress-ng
-                - openssh-server
+              write_files:
+                - path: /etc/systemd/system/memhold.service
+                  content: |
+                    [Unit]
+                    StartLimitIntervalSec=0
+                    [Service]
+                    Type=simple
+                    Restart=on-failure
+                    RestartSec=30
+                    ExecStart=/usr/bin/python3 -c "import time; a=bytearray(2900*1024*1024); time.sleep(10**9)"
+                    [Install]
+                    WantedBy=multi-user.target
               runcmd:
-                - mkdir -p /var/run/sshd
                 - ssh-keygen -A || true
                 - nohup /usr/sbin/sshd > /dev/null 2>&1 &
-                - sleep 3
-                - pgrep -f "/usr/sbin/sshd" && echo "sshd started successfully" || echo "sshd may not be running"
-                - nohup stress-ng --vm 1 --vm-bytes 3300M --vm-keep -t 0 > /dev/null 2>&1 &
-                - sleep 5 && pgrep stress-ng && echo STRESS_NG_RUNNING > /etc/vm_status || echo STRESS_NG_FAILED > /etc/vm_status
+                - systemctl daemon-reload
+                - systemctl enable --now memhold.service
 ---
 apiVersion: v1
 kind: Service

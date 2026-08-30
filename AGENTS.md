@@ -22,6 +22,7 @@ acm-tools/
   README.md              # User-facing documentation (tool usage, phases, examples)
   docs/                  # Documentation
     TROUBLESHOOTING.md   # Right-sizing migration troubleshooting learnings
+    SNO-VIRTUALIZATION.md # Enabling OpenShift Virtualization on an AWS SNO cluster
   config.sh              # Shared configuration (registry, contexts, repos, timeouts)
   image-override.json    # Image override entries (edit to add/remove images)
   lib/common.sh          # Shared library (logging, helpers, constants)
@@ -47,6 +48,7 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 | `rs-collect-must-gather` | Collect diagnostic data for right-sizing issues |
 | `cluster-diagnose` | Automated cluster health diagnostic (16 checks, issues + fix commands) |
 | `add-managed-cluster` | Import/re-import managed clusters (klusterlet cleanup, pull secret sync) |
+| `sno-virt` | Enable/validate OpenShift Virtualization on an AWS SNO cluster (EC2 nested virt) |
 
 ## Configuration
 

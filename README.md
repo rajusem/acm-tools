@@ -184,6 +184,29 @@ Before importing, the script checks if the spoke already has a klusterlet instal
 
 The `remove` command performs a **detach** — it removes ACM's management but leaves the spoke cluster intact. The klusterlet agent on the spoke may need manual removal if the spoke is unreachable.
 
+### sno-virt
+
+Enable and validate Red Hat OpenShift Virtualization on a single-node OpenShift (SNO) cluster running on AWS.
+
+Standard EC2 instances do not expose Intel VT-x, so `/dev/kvm` is absent and OpenShift Virtualization cannot start VMs. On nested-virt-capable families (C7i/M7i/R7i/C8i/M8i/R8i and their variants) the capability can be switched on per instance via `ec2:ModifyInstanceCpuOptions`. Hive has no field for it, so it must be applied after installation — and again for every cluster claimed from the pool.
+
+```bash
+bin/sno-virt status --cluster <cluster-ns>       # AWS, Hive, node and operator state
+bin/sno-virt check-node --spoke-context current  # vmx flag, /dev/kvm, kvm modules
+bin/sno-virt enable --cluster <cluster-ns>       # hibernate -> enable nested virt -> resume
+bin/sno-virt install --spoke-context current     # operator + HyperConverged
+bin/sno-virt smoke-test --spoke-context current  # boot a RHEL 9 VM to prove KVM works
+bin/sno-virt cleanup --spoke-context current     # remove the smoke-test namespace
+```
+
+`enable` stops the cluster — a SNO cluster has one node, so it is fully down until the resume completes. It uses Hive's `powerState` rather than `aws ec2 stop-instances` so Hive stays authoritative over the node lifecycle. It requires AWS CLI 2.36+ (for `--nested-virtualization`) and an IAM principal with `ec2:ModifyInstanceCpuOptions`.
+
+When `--cluster` is supplied, every spoke-side command cross-checks the spoke context's API URL against the ClusterDeployment's `status.apiURL` and refuses to act on a mismatch — it is easy to leave a kubeconfig pointed at a different spoke.
+
+> OpenShift Virtualization on non-metal AWS instances is **not** a Red Hat supported configuration. Red Hat supports bare-metal instances (`c5n.metal`, `m5.metal`). Use this for lab and test clusters only.
+
+See `docs/SNO-VIRTUALIZATION.md` for requirements, the full procedure, and troubleshooting.
+
 ### image-override
 
 Apply or revert custom image overrides on a hub cluster.
@@ -459,6 +482,7 @@ acm-tools/
   CLAUDE.md                # Claude Code include (@AGENTS.md)
   docs/                    # Documentation
     TROUBLESHOOTING.md     # Right-sizing migration troubleshooting learnings
+    SNO-VIRTUALIZATION.md  # Enabling OpenShift Virtualization on an AWS SNO cluster
   config.sh                # Shared configuration (contexts, container engine)
   image-override.json      # Image override entries (edit to add/remove images)
   lib/common.sh            # Shared library (logging, helpers, constants)

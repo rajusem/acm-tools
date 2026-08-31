@@ -242,6 +242,35 @@ resolve_mce_catalog_source() {
     echo "$best_cat"
 }
 
+# Resolve best catalog source for an ACM channel.
+# Prefers: current subscription source > acm-dev-catalog > redhat-operators
+resolve_acm_catalog_source() {
+    local channel="$1" current_source="${2:-}"
+    local rows best_csv
+
+    rows=$(list_package_catalog_rows "advanced-cluster-management" | awk -F'\t' -v c="$channel" '$2==c')
+    if [[ -z "$rows" ]]; then
+        log_warn "ACM channel '$channel' not found in any catalog" >&2
+        return 1
+    fi
+
+    for prefer in "$current_source" acm-dev-catalog redhat-operators; do
+        [[ -z "$prefer" ]] && continue
+        best_csv=$(echo "$rows" | awk -F'\t' -v p="$prefer" '$1==p {print $3; exit}')
+        if [[ -n "$best_csv" ]]; then
+            log_info "Resolved ACM catalog: $prefer (channel $channel -> $best_csv)" >&2
+            echo "$prefer"
+            return 0
+        fi
+    done
+
+    local best_cat
+    best_cat=$(echo "$rows" | head -1 | cut -f1)
+    best_csv=$(echo "$rows" | head -1 | cut -f3)
+    log_info "Resolved ACM catalog: $best_cat (channel $channel -> $best_csv)" >&2
+    echo "$best_cat"
+}
+
 get_catalog_csv_for_channel() {
     local package="$1" channel="$2" source="${3:-}"
     local rows
@@ -421,29 +450,35 @@ patch_mce_subscription() {
 }
 
 patch_acm_subscription() {
-    local sub_name="$1"
-    local current installed
+    local sub_name="$1" acm_source="${2:-}"
+    local current installed current_src need_patch=false
 
     current=$(get_resource_field "$OLM_SUB" "$sub_name" "$ACM_NAMESPACE" '{.spec.channel}' || echo "")
+    current_src=$(get_resource_field "$OLM_SUB" "$sub_name" "$ACM_NAMESPACE" '{.spec.source}' || echo "")
     installed=$(get_resource_field "$OLM_SUB" "$sub_name" "$ACM_NAMESPACE" '{.status.installedCSV}' || echo "")
 
-    if [[ "$current" == "$ACM_CHANNEL" ]]; then
-        log_info "ACM already on channel $ACM_CHANNEL (csv: ${installed:-<pending>})"
+    [[ "$current" != "$ACM_CHANNEL" ]] && need_patch=true
+    [[ -n "$acm_source" && "$current_src" != "$acm_source" ]] && need_patch=true
+
+    if [[ "$need_patch" != "true" ]]; then
+        log_info "ACM already on channel $ACM_CHANNEL source=$current_src (csv: ${installed:-<pending>})"
         return 0
     fi
 
-    log_substep "Patching ACM $OLM_SUB: ${current:-<none>} -> $ACM_CHANNEL"
+    log_substep "Patching ACM $OLM_SUB: channel ${current:-<none>} -> $ACM_CHANNEL, source ${current_src:-<none>} -> ${acm_source:-$current_src}"
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] oc patch $OLM_SUB $sub_name channel=$ACM_CHANNEL"
+        log_info "[dry-run] oc patch $OLM_SUB $sub_name channel=$ACM_CHANNEL source=${acm_source:-$current_src}"
         return 0
     fi
 
-    $KUBE_CLI patch "$OLM_SUB" "$sub_name" -n "$ACM_NAMESPACE" --type=merge -p "{
-        \"spec\": {
-            \"channel\": \"$ACM_CHANNEL\",
-            \"installPlanApproval\": \"Automatic\"
-        }
-    }"
+    local patch_json="{\"spec\":{\"channel\":\"$ACM_CHANNEL\",\"installPlanApproval\":\"Automatic\""
+    if [[ -n "$acm_source" ]]; then
+        patch_json+=",\"source\":\"$acm_source\",\"sourceNamespace\":\"$MCE_SOURCE_NS\""
+    fi
+    patch_json+="}}"
+
+    $KUBE_CLI patch "$OLM_SUB" "$sub_name" -n "$ACM_NAMESPACE" --type=merge -p "$patch_json"
+    log_success "ACM subscription patched"
 }
 
 # Wait until installedCSV is Succeeded AND matches expected_csv from the catalog.
@@ -668,12 +703,45 @@ do_upgrade() {
     mch_phase=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" '{.status.phase}' || echo "")
     [[ "$mch_phase" == "MCHpaused" ]] && { log_error "MCH is paused"; exit 1; }
 
-    local acm_src previous_acm_csv target_acm_csv
+    local acm_src previous_acm_csv target_acm_csv acm_resolved_src
     acm_src=$(get_resource_field "$OLM_SUB" "$acm_sub" "$ACM_NAMESPACE" '{.spec.source}' || echo "")
     previous_acm_csv=$(get_resource_field "$OLM_SUB" "$acm_sub" "$ACM_NAMESPACE" '{.status.installedCSV}' || echo "")
-    target_acm_csv=$(get_catalog_csv_for_channel "advanced-cluster-management" "$ACM_CHANNEL" "$acm_src")
 
-    patch_acm_subscription "$acm_sub"
+    # Check if the target channel exists in the current source; if not, find one that has it
+    target_acm_csv=$(get_catalog_csv_for_channel "advanced-cluster-management" "$ACM_CHANNEL" "$acm_src")
+    if [[ -n "$target_acm_csv" ]]; then
+        acm_resolved_src="$acm_src"
+    else
+        # Guard against transient CatalogSource unavailability: when the current
+        # catalog's registry pod is restarting or not READY, package-server drops
+        # its PackageManifest rows. Treat a non-READY catalog as "transiently
+        # invisible" and keep the current source rather than switching.
+        local acm_cs_state
+        acm_cs_state=$($KUBE_CLI get catalogsource "$acm_src" -n "$MCE_SOURCE_NS" \
+            -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "")
+        if [[ -n "$acm_src" && "$acm_cs_state" != "READY" ]]; then
+            log_warn "CatalogSource $acm_src is not READY (state: ${acm_cs_state:-unknown}) — keeping current source"
+            acm_resolved_src="$acm_src"
+        else
+            # Catalog is READY but genuinely doesn't carry the target channel —
+            # resolve an alternative catalog.
+            acm_resolved_src=$(resolve_acm_catalog_source "$ACM_CHANNEL" "$acm_src") || acm_resolved_src=""
+            if [[ -n "$acm_resolved_src" ]]; then
+                target_acm_csv=$(get_catalog_csv_for_channel "advanced-cluster-management" "$ACM_CHANNEL" "$acm_resolved_src")
+                log_info "ACM channel $ACM_CHANNEL not in $acm_src — using $acm_resolved_src"
+            else
+                # Mirror MCE path: fail fast with remediation hints instead of
+                # patching a channel no catalog carries (leaves sub unresolvable).
+                log_error "ACM channel '$ACM_CHANNEL' not available in any catalog"
+                log_info "Create the dev catalog first:"
+                log_info "  install-custom-acm --catalog-source --version ${TARGET_VERSION}"
+                log_info "Or: $(basename "$0") apply-mce-catalog (also creates acm-dev-catalog)"
+                exit 1
+            fi
+        fi
+    fi
+
+    patch_acm_subscription "$acm_sub" "$acm_resolved_src"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         fix_mce_subscription || true

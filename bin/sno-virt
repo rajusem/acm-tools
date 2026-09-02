@@ -10,13 +10,15 @@
 #   sno-virt install                 # Install the OpenShift Virtualization operator
 #   sno-virt smoke-test              # Boot a RHEL 9 VM to prove KVM works
 #   sno-virt cleanup                 # Delete the smoke-test namespace
+#   sno-virt setup                   # enable -> check-node -> install -> smoke-test
 #
 # AWS EC2 instances do not expose Intel VT-x by default, so KVM is unavailable
 # and OpenShift Virtualization cannot start VMs. On nested-virt-capable families
 # (C7i/M7i/R7i/C8i/M8i/R8i and their variants) the capability can be switched on
 # per instance, but Hive has no field for it — hence this tool.
 #
-# See docs/SNO-VIRTUALIZATION.md for the full procedure and background.
+# See the sno-virt section of README.md for prerequisites, the IAM policy,
+# limitations and troubleshooting.
 #
 # NOTE: OpenShift Virtualization on non-metal AWS instances is NOT a Red Hat
 # supported configuration. Lab and test use only.
@@ -39,6 +41,10 @@ TIMEOUT_POWER_STATE="${TIMEOUT_POWER_STATE:-900}"
 TIMEOUT_CNV_CSV="${TIMEOUT_CNV_CSV:-900}"
 TIMEOUT_HCO_READY="${TIMEOUT_HCO_READY:-1200}"
 TIMEOUT_VM_READY="${TIMEOUT_VM_READY:-1800}"
+TIMEOUT_NODE_READY="${TIMEOUT_NODE_READY:-900}"
+TIMEOUT_DATASOURCE_READY="${TIMEOUT_DATASOURCE_READY:-1800}"
+SKIP_SMOKE_TEST=false
+KEEP_VM=false
 
 usage() {
     cat <<'USAGE'
@@ -52,6 +58,9 @@ Commands:
   install       Install the OpenShift Virtualization operator and HyperConverged
   smoke-test    Create a RHEL 9 VM and wait for it to reach Running
   cleanup       Delete the smoke-test namespace
+  setup         Run the whole path in order: enable -> check-node -> install ->
+                smoke-test -> cleanup -> status. Every step is re-runnable, so
+                a failed setup can simply be run again.
 
 Options:
   --cluster NS        Hive cluster namespace, same as the cluster name.
@@ -65,11 +74,15 @@ Options:
   --region NAME       AWS region (default: us-west-2)
   --smoke-ns NS       Namespace for smoke-test (default: virt-smoke-test)
   --yes               Do not prompt for confirmation
+  --skip-smoke-test   setup only: stop after 'install', do not boot a VM
+  --keep-vm           setup only: run the smoke test but keep the VM and its
+                      namespace instead of deleting them afterwards
   -h, --help          Show this help
 
 Environment overrides:
   SNO_VIRT_CLUSTER_NS, SNO_VIRT_SPOKE_CONTEXT, SNO_VIRT_AWS_PROFILE,
-  SNO_VIRT_AWS_REGION, SNO_VIRT_SMOKE_NS, ACM_TOOLS_YES
+  SNO_VIRT_AWS_REGION, SNO_VIRT_SMOKE_NS, ACM_TOOLS_YES, TIMEOUT_NODE_READY,
+  TIMEOUT_DATASOURCE_READY
 
 Examples:
   sno-virt status --cluster obsint-sno-m7i-4xlarge-5-bpnzd
@@ -77,6 +90,8 @@ Examples:
   sno-virt enable --cluster obsint-sno-m7i-4xlarge-5-bpnzd --yes
   sno-virt install --spoke-context current
   sno-virt smoke-test --spoke-context current
+  sno-virt setup --cluster obsint-sno-m7i-4xlarge-5-bpnzd \
+      --hub-context hub --spoke-context vm-spoke --yes
 USAGE
 }
 
@@ -84,7 +99,7 @@ USAGE
 COMMAND=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        status|check-node|enable|install|smoke-test|cleanup)
+        status|check-node|enable|install|smoke-test|cleanup|setup)
             [[ -n "$COMMAND" ]] && { log_error "Only one command at a time (got '$COMMAND' and '$1')"; exit 1; }
             COMMAND="$1"; shift ;;
         --cluster)        CLUSTER_NS="${2:-}"; [[ -z "$CLUSTER_NS" ]] && { log_error "--cluster requires a namespace"; exit 1; }; shift 2 ;;
@@ -94,6 +109,8 @@ while [[ $# -gt 0 ]]; do
         --region)         AWS_REGION_NAME="${2:-}";  shift 2 ;;
         --smoke-ns)       SMOKE_NS="${2:-}";         shift 2 ;;
         --yes)            export ACM_TOOLS_YES=true; shift ;;
+        --skip-smoke-test) SKIP_SMOKE_TEST=true; shift ;;
+        --keep-vm)        KEEP_VM=true; shift ;;
         -h|--help)        usage; exit 0 ;;
         *) log_error "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -183,7 +200,7 @@ require_aws_auth() {
                     --query 'Arn' --output text 2>&1)"; then
         log_error "AWS profile '$AWS_PROFILE_NAME' is not usable:"
         echo "$arn" >&2
-        log_info "Create it from the cluster's own credentials — see docs/SNO-VIRTUALIZATION.md"
+        log_info "Create it from the cluster's own credentials — see the sno-virt section of README.md"
         exit 1
     fi
     log_substep "AWS identity: $arn"
@@ -296,7 +313,7 @@ cmd_status() {
     fi
 
     log_step "OpenShift Virtualization"
-    if ! resource_exists namespace "$CNV_NS"; then
+    if ! spoke get namespace "$CNV_NS" &>/dev/null; then
         log_warn "Namespace $CNV_NS not found — run 'sno-virt install'"
         print_separator
         return 0
@@ -416,7 +433,7 @@ cmd_enable() {
             --nested-virtualization enabled >/dev/null; then
         log_error "ModifyInstanceCpuOptions failed."
         log_info  "If this is UnauthorizedOperation, the IAM principal needs ec2:ModifyInstanceCpuOptions."
-        log_info  "See docs/SNO-VIRTUALIZATION.md for the policy."
+        log_info  "See the sno-virt section of README.md for the policy."
         log_warn  "The cluster is still hibernating — resume it with:"
         log_warn  "  $KUBE_CLI --context=$HUB_CTX patch clusterdeployment $CLUSTER_NS -n $CLUSTER_NS --type=merge -p '{\"spec\":{\"powerState\":\"Running\"}}'"
         exit 1
@@ -563,20 +580,33 @@ EOF
     log_info "Validate with: sno-virt smoke-test --spoke-context $SPOKE_CTX"
 }
 
+# HyperConverged reports Available long before the golden images finish
+# importing, so a smoke test started right after `install` would always find the
+# DataSource not Ready. Wait for it rather than failing.
+wait_for_datasource_ready() {
+    local name="$1" ns="openshift-virtualization-os-images"
+    local waited=0 ready="" progress=""
+    log_substep "waiting for DataSource $name to be Ready (timeout ${TIMEOUT_DATASOURCE_READY}s)"
+    while (( waited < TIMEOUT_DATASOURCE_READY )); do
+        ready="$(spoke get datasource "$name" -n "$ns" \
+                   -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)"
+        [[ "$ready" == "True" ]] && { log_success "DataSource $name: Ready"; return 0; }
+        progress="$(spoke get dv -n "$ns" --no-headers 2>/dev/null \
+                      | awk -v n="^${name}-" '$1 ~ n {p=$2" "$3} END {print p}' || true)"
+        log_substep "import: ${progress:-pending} (${waited}s)"
+        sleep 30; waited=$((waited + 30))
+    done
+    log_error "DataSource $name did not become Ready in ${TIMEOUT_DATASOURCE_READY}s (last: ${ready:-<not found>})"
+    log_info  "Check the golden image import with:"
+    log_info  "  $KUBE_CLI get datasource,dv -n $ns"
+    exit 1
+}
+
 cmd_smoke_test() {
     assert_spoke_is_cluster
     log_step "Booting a RHEL 9 smoke-test VM in $SMOKE_NS (context: $SPOKE_CTX)"
 
-    local ds_ready
-    ds_ready="$(spoke get datasource rhel9 -n openshift-virtualization-os-images \
-                  -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)"
-    if [[ "$ds_ready" != "True" ]]; then
-        log_error "DataSource rhel9 is not Ready (got: ${ds_ready:-<not found>})"
-        log_info  "Golden images may still be importing. Check:"
-        log_info  "  $KUBE_CLI get datasource -n openshift-virtualization-os-images"
-        exit 1
-    fi
-    log_substep "DataSource rhel9: Ready"
+    wait_for_datasource_ready rhel9
 
     spoke create namespace "$SMOKE_NS" >/dev/null 2>&1 || log_substep "namespace $SMOKE_NS already exists"
 
@@ -660,6 +690,7 @@ EOF
 }
 
 cmd_cleanup() {
+    assert_spoke_is_cluster
     if ! spoke get namespace "$SMOKE_NS" &>/dev/null; then
         log_info "Namespace $SMOKE_NS not present — nothing to clean up"
         return 0
@@ -670,6 +701,69 @@ cmd_cleanup() {
     log_success "Deletion started (runs in the background)"
 }
 
+# --- Full setup --------------------------------------------------------------
+# After a Hive resume the API server answers before the node is schedulable,
+# which would break the `oc debug node` that check-node relies on.
+wait_for_node_ready() {
+    local waited=0 ready=""
+    log_substep "waiting for the node to be Ready (timeout ${TIMEOUT_NODE_READY}s)"
+    while (( waited < TIMEOUT_NODE_READY )); do
+        ready="$(spoke get nodes -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+        [[ "$ready" == "True" ]] && { log_success "node Ready"; return 0; }
+        sleep 15; waited=$((waited + 15))
+    done
+    log_error "Node did not become Ready in ${TIMEOUT_NODE_READY}s (last: ${ready:-unreachable})"
+    exit 1
+}
+
+# Run the whole path end to end. Every underlying command is re-runnable
+# (enable exits early when nested virt is on, install/smoke-test use apply),
+# so a setup that fails partway can just be run again.
+cmd_setup() {
+    resolve_cluster_ns
+
+    log_step "Full OpenShift Virtualization setup for $CLUSTER_NS"
+    log_substep "hub:   $HUB_CTX"
+    log_substep "spoke: $SPOKE_CTX"
+    if [[ "$SKIP_SMOKE_TEST" == "true" ]]; then
+        log_substep "smoke test: skipped (--skip-smoke-test)"
+    elif [[ "$KEEP_VM" == "true" ]]; then
+        log_substep "smoke test: run, VM kept (--keep-vm)"
+    else
+        log_substep "smoke test: run, then $SMOKE_NS deleted"
+    fi
+
+    # Only tear down a smoke-test namespace that this run created.
+    local ns_preexisting=false
+    if [[ "$SKIP_SMOKE_TEST" != "true" ]] && spoke get namespace "$SMOKE_NS" &>/dev/null; then
+        ns_preexisting=true
+        log_warn "$SMOKE_NS already exists — it will be reused and NOT deleted"
+    fi
+
+    echo ""; cmd_enable
+    echo ""; log_step "Waiting for the spoke to settle"; wait_for_node_ready
+    echo ""; cmd_check_node
+    echo ""; cmd_install
+
+    if [[ "$SKIP_SMOKE_TEST" != "true" ]]; then
+        echo ""; cmd_smoke_test
+        if [[ "$KEEP_VM" == "true" || "$ns_preexisting" == "true" ]]; then
+            log_info "Keeping $SMOKE_NS — delete it with:"
+            log_info "  sno-virt cleanup --spoke-context $SPOKE_CTX --smoke-ns $SMOKE_NS"
+        else
+            echo ""
+            log_step "Removing the smoke-test VM"
+            local prev_yes="${ACM_TOOLS_YES:-}"
+            export ACM_TOOLS_YES=true
+            cmd_cleanup
+            if [[ -n "$prev_yes" ]]; then export ACM_TOOLS_YES="$prev_yes"; else unset ACM_TOOLS_YES; fi
+        fi
+    fi
+
+    echo ""; cmd_status
+    log_success "Setup complete for $CLUSTER_NS"
+}
+
 # --- Dispatch ----------------------------------------------------------------
 case "$COMMAND" in
     status)     cmd_status ;;
@@ -678,5 +772,6 @@ case "$COMMAND" in
     install)    cmd_install ;;
     smoke-test) cmd_smoke_test ;;
     cleanup)    cmd_cleanup ;;
+    setup)      cmd_setup ;;
     *)          log_error "Unknown command: $COMMAND"; usage; exit 1 ;;
 esac

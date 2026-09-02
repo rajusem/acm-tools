@@ -190,6 +190,31 @@ Enable and validate Red Hat OpenShift Virtualization on a single-node OpenShift 
 
 Standard EC2 instances do not expose Intel VT-x, so `/dev/kvm` is absent and OpenShift Virtualization cannot start VMs. On nested-virt-capable families (C7i/M7i/R7i/C8i/M8i/R8i and their variants) the capability can be switched on per instance via `ec2:ModifyInstanceCpuOptions`. Hive has no field for it, so it must be applied after installation — and again for every cluster claimed from the pool.
 
+`setup` runs the whole path unattended and is the normal way to use this tool:
+
+```bash
+bin/sno-virt setup --cluster <cluster-ns> \
+    --hub-context <hub-ctx> --spoke-context <spoke-ctx> --yes
+```
+
+It chains `enable` -> `check-node` -> `install` -> `smoke-test` -> `cleanup` -> `status`,
+waiting for the node to report `Ready` after the resume before it runs anything spoke-side.
+Every underlying step is re-runnable — `enable` exits early once nested virt is on, and
+`install` and `smoke-test` use `oc apply` — so a `setup` that fails partway can simply be
+run again and picks up where it stopped.
+
+`smoke-test` waits for the `rhel9` DataSource to become Ready before it creates the VM.
+HyperConverged reports `Available` well before the golden images finish importing, so a
+smoke test run straight after `install` would otherwise always fail. Tune the wait with
+`TIMEOUT_DATASOURCE_READY` (default 1800s).
+
+By default the smoke-test VM and its namespace are deleted once the VM has proved KVM
+works. A smoke-test namespace that already existed before `setup` ran is reused and never
+deleted. Use `--skip-smoke-test` to stop after `install`, or `--keep-vm` to leave the VM
+running.
+
+The individual steps remain available:
+
 ```bash
 bin/sno-virt status --cluster <cluster-ns>       # AWS, Hive, node and operator state
 bin/sno-virt check-node --spoke-context current  # vmx flag, /dev/kvm, kvm modules
@@ -205,7 +230,58 @@ When `--cluster` is supplied, every spoke-side command cross-checks the spoke co
 
 > OpenShift Virtualization on non-metal AWS instances is **not** a Red Hat supported configuration. Red Hat supports bare-metal instances (`c5n.metal`, `m5.metal`). Use this for lab and test clusters only.
 
-See `docs/SNO-VIRTUALIZATION.md` for requirements, the full procedure, and troubleshooting.
+**Prerequisites**
+
+- AWS CLI **2.36.0 or newer** — older versions have no `--nested-virtualization` and make `--core-count` / `--threads-per-core` mandatory.
+- An IAM principal with **`ec2:ModifyInstanceCpuOptions`**. This is not part of the standard install permissions and usually has to be requested:
+
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": "ec2:ModifyInstanceCpuOptions",
+        "Resource": "arn:aws:ec2:us-west-2:<account-id>:instance/*"
+      }
+    ]
+  }
+  ```
+
+- The cluster must already run on a nested-virt-capable instance type. Set it in the ClusterPool's install-config: `controlPlane.platform.aws.type: m7i.4xlarge` and `rootVolume.size: 200` (120 GB minimum, plus ~10 GiB virtualization overhead and room for VM disks). On OCP 5.0 `networking.networkType` must be `OVNKubernetes` — `OpenShiftSDN` was removed and provisioning fails in seconds.
+
+A local AWS profile can be built from the cluster's own credentials:
+
+```bash
+NS=<cluster-namespace>
+aws configure set aws_access_key_id \
+  "$(oc get secret ${NS}-aws-creds -n $NS -o jsonpath='{.data.aws_access_key_id}' | base64 -d)" \
+  --profile redhat
+aws configure set aws_secret_access_key \
+  "$(oc get secret ${NS}-aws-creds -n $NS -o jsonpath='{.data.aws_secret_access_key}' | base64 -d)" \
+  --profile redhat
+aws configure set region us-west-2 --profile redhat
+aws sts get-caller-identity --profile redhat
+```
+
+**Limitations**
+
+- **Nested virtualization is per-instance and invisible to Hive.** Every cluster claimed from a pool needs `enable` run against it individually. If the node is replaced the setting reverts to `None` and VMs stop starting, with no explanatory error at the Kubernetes layer.
+- **SNO restrictions.** No high availability, no pod disruption budgets, no live migration, and no VMs with an eviction strategy configured — hence `evictionStrategy: None` on the smoke-test VM.
+- **AWS networking.** SR-IOV and bridge CNI (including VLAN) are unavailable. Use OVN-Kubernetes secondary overlay networks for layer-2 needs.
+- **CPU headroom.** Roughly 6 of 16 vCPU go to virtualization overhead on SNO. Memory is comfortable; CPU is tight.
+- Hosted control planes for OpenShift Virtualization are not supported on AWS.
+
+**Troubleshooting**
+
+| Symptom | Cause and fix |
+|---|---|
+| `UnauthorizedOperation ... ec2:ModifyInstanceCpuOptions` | IAM policy gap, not a state problem — `--dry-run` fails identically. Add the policy above. `enable` prints the resume command so the cluster is never left hibernating. |
+| `Unknown options: --nested-virtualization` | AWS CLI older than 2.36. `brew upgrade awscli`. |
+| `DataSource rhel9 is not Ready` | Golden images are still importing. `setup` waits for this; raise `TIMEOUT_DATASOURCE_READY` if the import is slow. Watch it with `oc get dv -n openshift-virtualization-os-images`. |
+| `AuthFailure ... DescribeInstanceTypes, StatusCode: 401` | The pool's `credentialsSecretRef` is invalid or expired. Fails at `create manifests`, before any AWS resources exist. |
+| `networkType OpenShiftSDN is not supported` | OpenShiftSDN was removed in OCP 5.0. Fix both the pool template and the `ClusterDeployment`'s own copy. |
+| Cluster suddenly unreachable | Something hibernated it. Check `oc get clusterdeployment $NS -n $NS -o jsonpath='spec={.spec.powerState} status={.status.powerState}'`, and `.metadata.managedFields` for `manager=action` (console-driven) or `hibernateAfter` (timer). Hibernation is non-destructive — namespaces, VMs, DataVolumes, the operator and the `NestedVirtualization` attribute all survive. |
 
 ### image-override
 
@@ -482,7 +558,6 @@ acm-tools/
   CLAUDE.md                # Claude Code include (@AGENTS.md)
   docs/                    # Documentation
     TROUBLESHOOTING.md     # Right-sizing migration troubleshooting learnings
-    SNO-VIRTUALIZATION.md  # Enabling OpenShift Virtualization on an AWS SNO cluster
   config.sh                # Shared configuration (contexts, container engine)
   image-override.json      # Image override entries (edit to add/remove images)
   lib/common.sh            # Shared library (logging, helpers, constants)

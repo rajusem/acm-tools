@@ -23,3 +23,9 @@ Thumbs.db
 .idea/
 .vscode/
 *.code-workspace
+
+# Logs
+*.log
+
+# Local MCP server config
+.mcp.json

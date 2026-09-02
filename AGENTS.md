@@ -22,7 +22,6 @@ acm-tools/
   README.md              # User-facing documentation (tool usage, phases, examples)
   docs/                  # Documentation
     TROUBLESHOOTING.md   # Right-sizing migration troubleshooting learnings
-    SNO-VIRTUALIZATION.md # Enabling OpenShift Virtualization on an AWS SNO cluster
   config.sh              # Shared configuration (registry, contexts, repos, timeouts)
   image-override.json    # Image override entries (edit to add/remove images)
   lib/common.sh          # Shared library (logging, helpers, constants)

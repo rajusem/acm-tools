@@ -193,9 +193,12 @@ Standard EC2 instances do not expose Intel VT-x, so `/dev/kvm` is absent and Ope
 `setup` runs the whole path unattended and is the normal way to use this tool:
 
 ```bash
-bin/sno-virt setup --cluster <cluster-ns> \
-    --hub-context <hub-ctx> --spoke-context <spoke-ctx> --yes
+bin/sno-virt setup --cluster <cluster-ns> --hub-context <hub-ctx> --yes
 ```
+
+`--cluster` is all the addressing it needs. The spoke's admin kubeconfig is read from
+the hub, so there is no separate spoke login and `--spoke-context` is only for overriding
+it. See **Spoke access** below.
 
 It chains `enable` -> `check-node` -> `install` -> `smoke-test` -> `cleanup` -> `status`,
 waiting for the node to report `Ready` after the resume before it runs anything spoke-side.
@@ -224,7 +227,7 @@ bin/sno-virt smoke-test --spoke-context current  # boot a RHEL 9 VM to prove KVM
 bin/sno-virt cleanup --spoke-context current     # remove the smoke-test namespace
 ```
 
-`enable` stops the cluster — a SNO cluster has one node, so it is fully down until the resume completes. It uses Hive's `powerState` rather than `aws ec2 stop-instances` so Hive stays authoritative over the node lifecycle. It requires AWS CLI 2.36+ (for `--nested-virtualization`) and an IAM principal with `ec2:ModifyInstanceCpuOptions`.
+`enable` stops the cluster — a SNO cluster has one node, so it is fully down until the resume completes. It uses Hive's `powerState` rather than `aws ec2 stop-instances` so Hive stays authoritative over the node lifecycle. It requires AWS CLI 2.36+ (for `--nested-virtualization`) and an IAM principal with `ec2:ModifyInstanceCpuOptions`. It dry-runs `ModifyInstanceCpuOptions` before the hibernate, so a missing permission aborts while the cluster is still up rather than leaving it hibernating.
 
 When `--cluster` is supplied, every spoke-side command cross-checks the spoke context's API URL against the ClusterDeployment's `status.apiURL` and refuses to act on a mismatch — it is easy to leave a kubeconfig pointed at a different spoke.
 
@@ -233,6 +236,7 @@ When `--cluster` is supplied, every spoke-side command cross-checks the spoke co
 **Prerequisites**
 
 - AWS CLI **2.36.0 or newer** — older versions have no `--nested-virtualization` and make `--core-count` / `--threads-per-core` mandatory.
+- **Access to the hub** that owns the ClusterDeployment, with permission to read secrets in the cluster's namespace. The AWS credentials, the region and the spoke's admin kubeconfig are all read from there, so no local AWS profile and no spoke login are required. See **Spoke access** and **AWS credentials** below.
 - An IAM principal with **`ec2:ModifyInstanceCpuOptions`**. This is not part of the standard install permissions and usually has to be requested:
 
   ```json
@@ -250,18 +254,53 @@ When `--cluster` is supplied, every spoke-side command cross-checks the spoke co
 
 - The cluster must already run on a nested-virt-capable instance type. Set it in the ClusterPool's install-config: `controlPlane.platform.aws.type: m7i.4xlarge` and `rootVolume.size: 200` (120 GB minimum, plus ~10 GiB virtualization overhead and room for VM disks). On OCP 5.0 `networking.networkType` must be `OVNKubernetes` — `OpenShiftSDN` was removed and provisioning fails in seconds.
 
-A local AWS profile can be built from the cluster's own credentials:
+**Spoke access**
+
+Hive stores the cluster's admin kubeconfig in a secret the ClusterDeployment names
+(`spec.clusterMetadata.adminKubeconfigSecretRef.name`). With `--cluster`, `sno-virt`
+reads it from the hub and uses it for every spoke-side call, so no spoke context has to
+exist in your kubeconfig.
+
+The kubeconfig is fetched once into a shell variable and handed to each `oc` invocation
+through a process substitution — it is never written to disk. Because it comes from the
+cluster's own ClusterDeployment it cannot point at the wrong spoke, which removes the
+whole class of wrong-cluster mistakes the API-URL cross-check exists to catch.
+
+Resolution order is `--spoke-context` / `SNO_VIRT_SPOKE_CONTEXT` (explicit wins), then
+the hub's admin kubeconfig when `--cluster` is given, then `VM_SPOKE_CONTEXT`. Use
+`--spoke-context current` to act on whatever context is active, which is still the
+quickest way to run the spoke-only commands against a cluster you are already logged in
+to. `status` prints which source was used.
+
+**AWS credentials**
+
+No `aws configure` step is needed. `sno-virt` reads the region and the IAM keys straight
+off the ClusterDeployment on the hub, so hub access is the only prerequisite:
+
+| Value | Source on the hub |
+|-------|-------------------|
+| Region | `clusterdeployment.spec.platform.aws.region` |
+| Access key / secret | the secret named by `clusterdeployment.spec.platform.aws.credentialsSecretRef.name` |
+| EC2 instance | `clusterdeployment.spec.clusterMetadata.infraID` -> tag `<infraID>-master-0` |
+
+Credentials are exported only inside the subshell running each `aws` call — never written
+to disk and never logged. `status` prints which source was used.
+
+Resolution order is `--profile` / `SNO_VIRT_AWS_PROFILE` (explicit wins), then the hub
+secret, then the AWS CLI's own default chain. Use `--profile` when the hub secret is
+missing, when it is an STS/AssumeRole setup with no static keys, or when you need a
+different IAM principal:
+
+```bash
+bin/sno-virt status --cluster <cluster-ns> --profile my-profile
+```
+
+To inspect what the hub holds:
 
 ```bash
 NS=<cluster-namespace>
-aws configure set aws_access_key_id \
-  "$(oc get secret ${NS}-aws-creds -n $NS -o jsonpath='{.data.aws_access_key_id}' | base64 -d)" \
-  --profile redhat
-aws configure set aws_secret_access_key \
-  "$(oc get secret ${NS}-aws-creds -n $NS -o jsonpath='{.data.aws_secret_access_key}' | base64 -d)" \
-  --profile redhat
-aws configure set region us-west-2 --profile redhat
-aws sts get-caller-identity --profile redhat
+oc get clusterdeployment $NS -n $NS \
+  -o jsonpath='{.spec.platform.aws.region}{"\n"}{.spec.platform.aws.credentialsSecretRef.name}{"\n"}'
 ```
 
 **Limitations**

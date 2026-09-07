@@ -17,6 +17,11 @@
 # (C7i/M7i/R7i/C8i/M8i/R8i and their variants) the capability can be switched on
 # per instance, but Hive has no field for it — hence this tool.
 #
+# AWS credentials, region and the spoke's admin kubeconfig are all read from the
+# ClusterDeployment on the hub, so `--cluster` plus hub access is normally the
+# only prerequisite — no `aws configure` and no spoke login. Pass --profile or
+# --spoke-context to override either.
+#
 # See the sno-virt section of README.md for prerequisites, the IAM policy,
 # limitations and troubleshooting.
 #
@@ -30,10 +35,14 @@ source "$SCRIPT_DIR/../lib/common.sh"
 
 # --- Defaults (override via env or flags) ------------------------------------
 HUB_CTX="${HUB_CONTEXT:-hub}"
-SPOKE_CTX="${SNO_VIRT_SPOKE_CONTEXT:-${VM_SPOKE_CONTEXT:-vm-spoke}}"
+SPOKE_CTX="${SNO_VIRT_SPOKE_CONTEXT:-}"
+SPOKE_CTX_FALLBACK="${VM_SPOKE_CONTEXT:-vm-spoke}"
+SPOKE_CTX_EXPLICIT=false
+[[ -n "$SPOKE_CTX" ]] && SPOKE_CTX_EXPLICIT=true
 CLUSTER_NS="${SNO_VIRT_CLUSTER_NS:-}"
-AWS_PROFILE_NAME="${SNO_VIRT_AWS_PROFILE:-redhat}"
-AWS_REGION_NAME="${SNO_VIRT_AWS_REGION:-us-west-2}"
+AWS_PROFILE_NAME="${SNO_VIRT_AWS_PROFILE:-}"
+AWS_REGION_NAME="${SNO_VIRT_AWS_REGION:-}"
+AWS_REGION_FALLBACK="us-west-2"
 SMOKE_NS="${SNO_VIRT_SMOKE_NS:-virt-smoke-test}"
 CNV_NS="openshift-cnv"
 AWS_CLI_MIN="2.36"
@@ -68,10 +77,14 @@ Options:
                       where it cross-checks the spoke context against the hub.
                       Defaults to $SNO_VIRT_CLUSTER_NS.
   --hub-context CTX   Hub kube context (default: $HUB_CONTEXT)
-  --spoke-context CTX Spoke kube context (default: $VM_SPOKE_CONTEXT).
-                      Use "current" to act on the current kubeconfig context.
-  --profile NAME      AWS CLI profile (default: redhat)
-  --region NAME       AWS region (default: us-west-2)
+  --spoke-context CTX Spoke kube context. Only needed without --cluster, or to
+                      override the admin kubeconfig taken from the hub. Use
+                      "current" for the active kubeconfig context.
+  --profile NAME      AWS CLI profile to use instead of the cluster's own
+                      credentials. Only needed when the hub secret is missing
+                      or you want a different IAM principal.
+  --region NAME       AWS region (default: the ClusterDeployment's region,
+                      falling back to us-west-2)
   --smoke-ns NS       Namespace for smoke-test (default: virt-smoke-test)
   --yes               Do not prompt for confirmation
   --skip-smoke-test   setup only: stop after 'install', do not boot a VM
@@ -85,13 +98,12 @@ Environment overrides:
   TIMEOUT_DATASOURCE_READY
 
 Examples:
+  sno-virt setup --cluster obsint-sno-m7i-4xlarge-5-bpnzd --yes
   sno-virt status --cluster obsint-sno-m7i-4xlarge-5-bpnzd
-  sno-virt check-node --spoke-context current
+  sno-virt check-node --cluster obsint-sno-m7i-4xlarge-5-bpnzd
   sno-virt enable --cluster obsint-sno-m7i-4xlarge-5-bpnzd --yes
   sno-virt install --spoke-context current
   sno-virt smoke-test --spoke-context current
-  sno-virt setup --cluster obsint-sno-m7i-4xlarge-5-bpnzd \
-      --hub-context hub --spoke-context vm-spoke --yes
 USAGE
 }
 
@@ -104,7 +116,7 @@ while [[ $# -gt 0 ]]; do
             COMMAND="$1"; shift ;;
         --cluster)        CLUSTER_NS="${2:-}"; [[ -z "$CLUSTER_NS" ]] && { log_error "--cluster requires a namespace"; exit 1; }; shift 2 ;;
         --hub-context)    HUB_CTX="${2:-}";    [[ -z "$HUB_CTX" ]]    && { log_error "--hub-context requires a value"; exit 1; }; shift 2 ;;
-        --spoke-context)  SPOKE_CTX="${2:-}";  [[ -z "$SPOKE_CTX" ]]  && { log_error "--spoke-context requires a value"; exit 1; }; shift 2 ;;
+        --spoke-context)  SPOKE_CTX="${2:-}";  [[ -z "$SPOKE_CTX" ]]  && { log_error "--spoke-context requires a value"; exit 1; }; SPOKE_CTX_EXPLICIT=true; shift 2 ;;
         --profile)        AWS_PROFILE_NAME="${2:-}"; shift 2 ;;
         --region)         AWS_REGION_NAME="${2:-}";  shift 2 ;;
         --smoke-ns)       SMOKE_NS="${2:-}";         shift 2 ;;
@@ -133,9 +145,64 @@ restore_context() {
 trap restore_context EXIT
 
 # --- Context helpers ---------------------------------------------------------
+# Spoke access, like the AWS credentials, comes from the hub by default: Hive
+# stores the cluster's admin kubeconfig in a secret the ClusterDeployment names,
+# so --cluster alone is enough and no spoke login is needed.
+#
+# Precedence: --spoke-context / SNO_VIRT_SPOKE_CONTEXT (explicit wins) -> the
+# hub's admin kubeconfig when --cluster is given -> VM_SPOKE_CONTEXT.
+#
+# The kubeconfig is fetched once and kept in a variable. Each call feeds it to
+# the CLI through a process substitution, so the credentials it carries are
+# never written to disk.
+SPOKE_KUBECONFIG=""
+SPOKE_SOURCE=""
+SPOKE_SOURCE_DETAIL=""
+
+resolve_spoke_access() {
+    [[ -n "$SPOKE_SOURCE" ]] && return 0
+
+    if [[ "$SPOKE_CTX_EXPLICIT" == "true" ]]; then
+        SPOKE_SOURCE="context '$SPOKE_CTX'"
+        SPOKE_SOURCE_DETAIL="$SPOKE_SOURCE"
+        return 0
+    fi
+
+    if [[ -n "$CLUSTER_NS" ]]; then
+        local secret
+        secret="$(hub_field '{.spec.clusterMetadata.adminKubeconfigSecretRef.name}')"
+        if [[ -n "$secret" ]]; then
+            SPOKE_KUBECONFIG="$(hub get secret "$secret" -n "$CLUSTER_NS" \
+                                  -o jsonpath='{.data.kubeconfig}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+        fi
+        if [[ -n "$SPOKE_KUBECONFIG" ]]; then
+            SPOKE_SOURCE="hub admin kubeconfig"
+            SPOKE_SOURCE_DETAIL="hub admin kubeconfig ($CLUSTER_NS/$secret)"
+            return 0
+        fi
+        log_warn "No admin kubeconfig readable on the hub${secret:+ (secret $secret)}"
+        log_info "Falling back to context '$SPOKE_CTX_FALLBACK' — pass --spoke-context to choose another."
+    fi
+
+    SPOKE_CTX="$SPOKE_CTX_FALLBACK"
+    SPOKE_SOURCE="context '$SPOKE_CTX'"
+    SPOKE_SOURCE_DETAIL="$SPOKE_SOURCE"
+}
+
+# How to address this spoke on a follow-up command line.
+spoke_hint() {
+    if [[ -n "$SPOKE_KUBECONFIG" ]]; then
+        echo "--cluster $CLUSTER_NS"
+    else
+        echo "--spoke-context $SPOKE_CTX"
+    fi
+}
+
 # Spoke context "current" means: use whatever kubeconfig context is active.
 spoke() {
-    if [[ "$SPOKE_CTX" == "current" ]]; then
+    if [[ -n "$SPOKE_KUBECONFIG" ]]; then
+        $KUBE_CLI --kubeconfig=<(printf '%s' "$SPOKE_KUBECONFIG") --request-timeout=30s "$@"
+    elif [[ "$SPOKE_CTX" == "current" ]]; then
         $KUBE_CLI --request-timeout=30s "$@"
     else
         $KUBE_CLI --context="$SPOKE_CTX" --request-timeout=30s "$@"
@@ -146,13 +213,98 @@ hub() {
     $KUBE_CLI --context="$HUB_CTX" --request-timeout=30s "$@"
 }
 
+# --- AWS credentials ---------------------------------------------------------
+# Prefer the cluster's own credentials over a locally configured profile: Hive
+# stores the IAM keys the installer used in a secret the ClusterDeployment names,
+# so hub access is the only prerequisite and `aws configure` is not needed.
+#
+# Precedence: --profile / SNO_VIRT_AWS_PROFILE (explicit wins) -> hub secret ->
+# the aws CLI's own default chain (env vars, ~/.aws, instance role).
+#
+# Keys live in shell variables and are exported only inside the subshell that
+# runs each aws call. They are never written to disk and never logged.
+AWS_KEY_ID=""
+AWS_SECRET_KEY=""
+AWS_CREDS_SOURCE=""
+
+# Resolve region and credentials from the ClusterDeployment. Safe to call more
+# than once; only the first call does any work. Requires CLUSTER_NS to be set,
+# so callers must run resolve_cluster_ns first.
+resolve_aws_settings() {
+    [[ -n "$AWS_CREDS_SOURCE" ]] && return 0
+
+    # Region: an explicit flag or env var wins, then the ClusterDeployment, then
+    # the historical default.
+    if [[ -z "$AWS_REGION_NAME" ]]; then
+        AWS_REGION_NAME="$(hub_field '{.spec.platform.aws.region}')"
+        [[ -n "$AWS_REGION_NAME" ]] && log_substep "region from ClusterDeployment: $AWS_REGION_NAME"
+    fi
+    if [[ -z "$AWS_REGION_NAME" ]]; then
+        AWS_REGION_NAME="$AWS_REGION_FALLBACK"
+        log_warn "No region on the ClusterDeployment — defaulting to $AWS_REGION_NAME"
+    fi
+
+    if [[ -n "$AWS_PROFILE_NAME" ]]; then
+        AWS_CREDS_SOURCE="profile '$AWS_PROFILE_NAME'"
+        return 0
+    fi
+
+    local secret
+    secret="$(hub_field '{.spec.platform.aws.credentialsSecretRef.name}')"
+    if [[ -n "$secret" ]]; then
+        AWS_KEY_ID="$(hub get secret "$secret" -n "$CLUSTER_NS" \
+                        -o jsonpath='{.data.aws_access_key_id}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+        AWS_SECRET_KEY="$(hub get secret "$secret" -n "$CLUSTER_NS" \
+                        -o jsonpath='{.data.aws_secret_access_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$AWS_KEY_ID" && -n "$AWS_SECRET_KEY" ]]; then
+        AWS_CREDS_SOURCE="hub secret $CLUSTER_NS/$secret"
+        return 0
+    fi
+
+    # Nothing usable on the hub. Do not fail here — the CLI's default chain may
+    # still work, and require_aws_auth reports the real error if it does not.
+    AWS_KEY_ID=""
+    AWS_SECRET_KEY=""
+    AWS_CREDS_SOURCE="aws CLI default chain"
+    if [[ -n "$secret" ]]; then
+        log_warn "Secret '$secret' in $CLUSTER_NS is unreadable or lacks aws_access_key_id/aws_secret_access_key"
+    else
+        log_warn "ClusterDeployment has no spec.platform.aws.credentialsSecretRef"
+    fi
+    log_info "Falling back to the aws CLI default chain. Pass --profile NAME to pick a local profile."
+}
+
+# Run an aws command with whichever credentials resolve_aws_settings picked.
+# The subshell keeps exported keys out of the parent environment, and unsetting
+# AWS_PROFILE/AWS_SESSION_TOKEN stops a stale value in the caller's shell from
+# overriding the cluster keys.
+aws_run() {
+    if [[ -n "$AWS_KEY_ID" ]]; then
+        (
+            unset AWS_PROFILE AWS_SESSION_TOKEN
+            export AWS_ACCESS_KEY_ID="$AWS_KEY_ID"
+            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_KEY"
+            aws "$@"
+        )
+    elif [[ -n "$AWS_PROFILE_NAME" ]]; then
+        aws --profile "$AWS_PROFILE_NAME" "$@"
+    else
+        aws "$@"
+    fi
+}
+
 aws_ec2() {
-    aws ec2 --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" "$@"
+    aws_run ec2 --region "$AWS_REGION_NAME" "$@"
 }
 
 # API server URL the spoke context points at.
 spoke_api_url() {
-    if [[ "$SPOKE_CTX" == "current" ]]; then
+    if [[ -n "$SPOKE_KUBECONFIG" ]]; then
+        $KUBE_CLI --kubeconfig=<(printf '%s' "$SPOKE_KUBECONFIG") config view --minify \
+            -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true
+    elif [[ "$SPOKE_CTX" == "current" ]]; then
         $KUBE_CLI config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true
     else
         $KUBE_CLI config view --minify --context="$SPOKE_CTX" \
@@ -164,6 +316,9 @@ spoke_api_url() {
 # pointed at a different spoke and read or mutate the wrong one. Returns 1 on
 # mismatch so callers can decide whether to warn or abort.
 spoke_matches_cluster() {
+    # A kubeconfig taken from this cluster's own ClusterDeployment cannot point
+    # anywhere else.
+    [[ -n "$SPOKE_KUBECONFIG" ]] && return 0
     local expected actual
     expected="$(hub_field '{.status.apiURL}')"
     actual="$(spoke_api_url)"
@@ -195,15 +350,18 @@ require_aws_cli() {
 }
 
 require_aws_auth() {
+    resolve_aws_settings
     local arn
-    if ! arn="$(aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" \
-                    --query 'Arn' --output text 2>&1)"; then
-        log_error "AWS profile '$AWS_PROFILE_NAME' is not usable:"
+    if ! arn="$(aws_run sts get-caller-identity --query 'Arn' --output text 2>&1)"; then
+        log_error "AWS credentials from $AWS_CREDS_SOURCE are not usable:"
         echo "$arn" >&2
-        log_info "Create it from the cluster's own credentials — see the sno-virt section of README.md"
+        if [[ "$AWS_CREDS_SOURCE" == "aws CLI default chain" ]]; then
+            log_info "No credentials were found on the hub. Pass --profile NAME, or see"
+            log_info "the sno-virt section of README.md to build a profile by hand."
+        fi
         exit 1
     fi
-    log_substep "AWS identity: $arn"
+    log_substep "AWS identity: $arn (via $AWS_CREDS_SOURCE)"
 }
 
 # Resolve the Hive cluster namespace. A ClusterDeployment lives in a namespace
@@ -245,13 +403,16 @@ cmd_status() {
     resolve_cluster_ns
     require_aws_cli
     require_aws_auth
+    resolve_spoke_access
 
     print_separator
     echo -e "${BOLD}SNO Virtualization Status${NC}"
     print_separator
     echo -e "${BOLD}Cluster:${NC}  $CLUSTER_NS"
     echo -e "${BOLD}Hub ctx:${NC}  $HUB_CTX"
-    echo -e "${BOLD}Region:${NC}   $AWS_REGION_NAME (profile: $AWS_PROFILE_NAME)"
+    echo -e "${BOLD}Region:${NC}   $AWS_REGION_NAME"
+    echo -e "${BOLD}AWS creds:${NC} $AWS_CREDS_SOURCE"
+    echo -e "${BOLD}Spoke:${NC}    $SPOKE_SOURCE_DETAIL"
     echo ""
 
     log_step "Hive (hub)"
@@ -290,7 +451,7 @@ cmd_status() {
 
     log_step "Spoke node"
     if ! spoke_matches_cluster; then
-        log_error "Spoke context '$SPOKE_CTX' points at a DIFFERENT cluster:"
+        log_error "Spoke ($SPOKE_SOURCE) points at a DIFFERENT cluster:"
         log_error "  expected: $(hub_field '{.status.apiURL}')"
         log_error "  actual:   $(spoke_api_url)"
         log_info  "Skipping node and operator checks. Log in to $CLUSTER_NS, or pass --spoke-context."
@@ -300,7 +461,7 @@ cmd_status() {
     local node kvm
     node="$(spoke get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     if [[ -z "$node" ]]; then
-        log_warn "Cannot reach the spoke (context: $SPOKE_CTX). Skipping node and operator checks."
+        log_warn "Cannot reach the spoke ($SPOKE_SOURCE). Skipping node and operator checks."
         print_separator
         return 0
     fi
@@ -341,11 +502,11 @@ cmd_status() {
 
 cmd_check_node() {
     assert_spoke_is_cluster
-    log_step "Checking KVM on the spoke node (context: $SPOKE_CTX)"
+    log_step "Checking KVM on the spoke node ($SPOKE_SOURCE)"
     local node
     node="$(spoke get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     if [[ -z "$node" ]]; then
-        log_error "Cannot reach the spoke cluster (context: $SPOKE_CTX)"
+        log_error "Cannot reach the spoke cluster ($SPOKE_SOURCE)"
         exit 1
     fi
     log_substep "node: $node"
@@ -402,6 +563,23 @@ cmd_enable() {
     if [[ "$nested" == "enabled" ]]; then
         log_success "Nested virtualization is already enabled on $instance_id — nothing to do"
         return 0
+    fi
+
+    # Check the IAM permission before the hibernate. Without this the failure
+    # only surfaces after the cluster is already down, leaving it hibernating
+    # while the operator resumes it by hand.
+    local dry
+    if ! dry="$(aws_ec2 modify-instance-cpu-options --instance-id "$instance_id" \
+                    --nested-virtualization enabled --dry-run 2>&1)"; then
+        if [[ "$dry" == *DryRunOperation* ]]; then
+            log_substep "ec2:ModifyInstanceCpuOptions permitted (dry run)"
+        else
+            log_error "Dry run of ModifyInstanceCpuOptions failed — not touching the cluster:"
+            echo "$dry" >&2
+            log_info "If this is UnauthorizedOperation, the IAM principal needs ec2:ModifyInstanceCpuOptions."
+            log_info "See the sno-virt section of README.md for the policy."
+            exit 1
+        fi
     fi
 
     log_warn "This stops the cluster. A SNO cluster has one node, so the whole"
@@ -463,26 +641,27 @@ wait_for_power_state() {
 
 # When --cluster is supplied, refuse to mutate a spoke that is not that cluster.
 assert_spoke_is_cluster() {
-    [[ -z "$CLUSTER_NS" ]] && return 0
+    resolve_spoke_access
+    [[ -z "$CLUSTER_NS" ]] && { log_substep "spoke: $SPOKE_SOURCE"; return 0; }
     resolve_cluster_ns
     if ! spoke_matches_cluster; then
-        log_error "Spoke context '$SPOKE_CTX' does not point at cluster '$CLUSTER_NS'"
+        log_error "Spoke ($SPOKE_SOURCE) does not point at cluster '$CLUSTER_NS'"
         log_error "  expected: $(hub_field '{.status.apiURL}')"
         log_error "  actual:   $(spoke_api_url)"
         exit 1
     fi
-    log_substep "spoke context verified against $CLUSTER_NS"
+    log_substep "spoke: $SPOKE_SOURCE_DETAIL (verified against $CLUSTER_NS)"
 }
 
 cmd_install() {
     assert_spoke_is_cluster
-    log_step "Installing OpenShift Virtualization (context: $SPOKE_CTX)"
+    log_step "Installing OpenShift Virtualization ($SPOKE_SOURCE)"
 
     # Refuse to install where KVM is unavailable — the operator would deploy but
     # no VM could ever start.
     local kvmdev
     kvmdev="$(spoke get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-    [[ -z "$kvmdev" ]] && { log_error "Cannot reach the spoke cluster (context: $SPOKE_CTX)"; exit 1; }
+    [[ -z "$kvmdev" ]] && { log_error "Cannot reach the spoke cluster ($SPOKE_SOURCE)"; exit 1; }
 
     local channel csv
     channel="$(spoke get packagemanifest kubevirt-hyperconverged -n openshift-marketplace \
@@ -577,7 +756,7 @@ EOF
         log_info  "Check nested virtualization with: sno-virt check-node"
         exit 1
     fi
-    log_info "Validate with: sno-virt smoke-test --spoke-context $SPOKE_CTX"
+    log_info "Validate with: sno-virt smoke-test $(spoke_hint)"
 }
 
 # HyperConverged reports Available long before the golden images finish
@@ -604,7 +783,7 @@ wait_for_datasource_ready() {
 
 cmd_smoke_test() {
     assert_spoke_is_cluster
-    log_step "Booting a RHEL 9 smoke-test VM in $SMOKE_NS (context: $SPOKE_CTX)"
+    log_step "Booting a RHEL 9 smoke-test VM in $SMOKE_NS ($SPOKE_SOURCE)"
 
     wait_for_datasource_ready rhel9
 
@@ -686,7 +865,7 @@ EOF
     ip="$(spoke get vmi rhel9-smoke -n "$SMOKE_NS" -o jsonpath='{.status.interfaces[0].ipAddress}' 2>/dev/null || true)"
     log_success "VM is Running (IP: ${ip:-<pending>})"
     log_success "KVM works end to end on this cluster"
-    log_info "Clean up with: sno-virt cleanup --spoke-context $SPOKE_CTX"
+    log_info "Clean up with: sno-virt cleanup $(spoke_hint)"
 }
 
 cmd_cleanup() {
@@ -721,10 +900,11 @@ wait_for_node_ready() {
 # so a setup that fails partway can just be run again.
 cmd_setup() {
     resolve_cluster_ns
+    resolve_spoke_access
 
     log_step "Full OpenShift Virtualization setup for $CLUSTER_NS"
     log_substep "hub:   $HUB_CTX"
-    log_substep "spoke: $SPOKE_CTX"
+    log_substep "spoke: $SPOKE_SOURCE"
     if [[ "$SKIP_SMOKE_TEST" == "true" ]]; then
         log_substep "smoke test: skipped (--skip-smoke-test)"
     elif [[ "$KEEP_VM" == "true" ]]; then
@@ -749,7 +929,7 @@ cmd_setup() {
         echo ""; cmd_smoke_test
         if [[ "$KEEP_VM" == "true" || "$ns_preexisting" == "true" ]]; then
             log_info "Keeping $SMOKE_NS — delete it with:"
-            log_info "  sno-virt cleanup --spoke-context $SPOKE_CTX --smoke-ns $SMOKE_NS"
+            log_info "  sno-virt cleanup $(spoke_hint) --smoke-ns $SMOKE_NS"
         else
             echo ""
             log_step "Removing the smoke-test VM"

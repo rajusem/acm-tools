@@ -196,9 +196,11 @@ Standard EC2 instances do not expose Intel VT-x, so `/dev/kvm` is absent and Ope
 bin/sno-virt setup --cluster <cluster-ns> --hub-context <hub-ctx> --yes
 ```
 
-`--cluster` is all the addressing it needs. The spoke's admin kubeconfig is read from
-the hub, so there is no separate spoke login and `--spoke-context` is only for overriding
-it. See **Spoke access** below.
+`--cluster` is all the addressing it needs, but it only means something on the hub that
+manages that cluster — be logged in to that hub (Collective for the Red Hat lab clusters)
+and point `--hub-context` at it. The AWS credentials and the spoke's admin kubeconfig are
+both read from there, so there is no separate spoke login and `--spoke-context` is only
+for overriding it. See **Prerequisites** and **Spoke access** below.
 
 It chains `enable` -> `check-node` -> `install` -> `smoke-test` -> `cleanup` -> `status`,
 waiting for the node to report `Ready` after the resume before it runs anything spoke-side.
@@ -235,8 +237,31 @@ When `--cluster` is supplied, every spoke-side command cross-checks the spoke co
 
 **Prerequisites**
 
+- **Access to the hub that manages the cluster — mandatory.** You must be logged in to the
+  same hub whose Hive `ClusterDeployment` created and manages the target cluster; for the
+  Red Hat lab clusters that is **Collective**. `sno-virt` resolves everything it needs
+  through that ClusterDeployment — the AWS region, the installer's IAM credentials, the
+  EC2 instance (via `infraID`) and the spoke's admin kubeconfig — so there is no offline
+  or hub-less mode. Point at it with `--hub-context` (default: `$HUB_CONTEXT`):
+
+  ```bash
+  oc login --web https://api.collective.aws.red-chesterfield.com:6443   # your hub
+  bin/sno-virt status --cluster <cluster-ns> --hub-context "$(oc config current-context)"
+  ```
+
+  You need permission to `get clusterdeployment` and `get secret` in the cluster's
+  namespace — on Hive, that namespace has the same name as the cluster. A hub that does
+  not own this cluster will not have the ClusterDeployment and every command fails at
+  the first step.
+
+  Without `--cluster` only the spoke-only commands run (`check-node`, `install`,
+  `smoke-test`, `cleanup`), and only against whatever `--spoke-context` points at.
+  `status`, `enable` and `setup` always require `--cluster` and therefore the hub.
+
+  No local AWS profile and no spoke login are required. See **Spoke access** and
+  **AWS credentials** below.
+
 - AWS CLI **2.36.0 or newer** — older versions have no `--nested-virtualization` and make `--core-count` / `--threads-per-core` mandatory.
-- **Access to the hub** that owns the ClusterDeployment, with permission to read secrets in the cluster's namespace. The AWS credentials, the region and the spoke's admin kubeconfig are all read from there, so no local AWS profile and no spoke login are required. See **Spoke access** and **AWS credentials** below.
 - An IAM principal with **`ec2:ModifyInstanceCpuOptions`**. This is not part of the standard install permissions and usually has to be requested:
 
   ```json

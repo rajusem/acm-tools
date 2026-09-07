@@ -735,7 +735,6 @@ do_upgrade() {
                 log_error "ACM channel '$ACM_CHANNEL' not available in any catalog"
                 log_info "Create the dev catalog first:"
                 log_info "  install-custom-acm --catalog-source --version ${TARGET_VERSION}"
-                log_info "Or: $(basename "$0") apply-mce-catalog (also creates acm-dev-catalog)"
                 exit 1
             fi
         fi

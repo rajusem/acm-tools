@@ -242,11 +242,24 @@ When `--cluster` is supplied, every spoke-side command cross-checks the spoke co
   Red Hat lab clusters that is **Collective**. `sno-virt` resolves everything it needs
   through that ClusterDeployment — the AWS region, the installer's IAM credentials, the
   EC2 instance (via `infraID`) and the spoke's admin kubeconfig — so there is no offline
-  or hub-less mode. Point at it with `--hub-context` (default: `$HUB_CONTEXT`):
+  or hub-less mode.
+
+  Since that is the only cluster connection needed, logging in is usually enough:
 
   ```bash
   oc login --web https://api.collective.aws.red-chesterfield.com:6443   # your hub
-  bin/sno-virt status --cluster <cluster-ns> --hub-context "$(oc config current-context)"
+  bin/sno-virt status --cluster <cluster-ns>
+  ```
+
+  `--hub-context` accepts a context name, `current` for the active context, or the hub's
+  API server URL. It resolves in that order of preference: the flag or `HUB_CONTEXT`,
+  then a context literally named `hub`, then whatever context is active. So an existing
+  `hub` context still wins when you have one, and a plain `oc login` works when you do
+  not.
+
+  ```bash
+  bin/sno-virt status --cluster <cluster-ns> --hub-context current
+  bin/sno-virt status --cluster <cluster-ns> --hub-context https://api.my-hub.example.com:6443
   ```
 
   You need permission to `get clusterdeployment` and `get secret` in the cluster's

@@ -31,10 +31,19 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Read HUB_CONTEXT before common.sh sources config.sh, which defaults it to
+# "hub" unconditionally. Without this the default is indistinguishable from a
+# deliberate choice and the current-context fallback could never run.
+HUB_CONTEXT_PRESET="${HUB_CONTEXT:-}"
+
 source "$SCRIPT_DIR/../lib/common.sh"
 
 # --- Defaults (override via env or flags) ------------------------------------
-HUB_CTX="${HUB_CONTEXT:-hub}"
+HUB_CTX="$HUB_CONTEXT_PRESET"
+HUB_CTX_FALLBACK="${HUB_CONTEXT:-hub}"
+HUB_CTX_EXPLICIT=false
+[[ -n "$HUB_CTX" ]] && HUB_CTX_EXPLICIT=true
 SPOKE_CTX="${SNO_VIRT_SPOKE_CONTEXT:-}"
 SPOKE_CTX_FALLBACK="${VM_SPOKE_CONTEXT:-vm-spoke}"
 SPOKE_CTX_EXPLICIT=false
@@ -76,7 +85,10 @@ Options:
                       Required for 'status' and 'enable'. Optional elsewhere,
                       where it cross-checks the spoke context against the hub.
                       Defaults to $SNO_VIRT_CLUSTER_NS.
-  --hub-context CTX   Hub kube context (default: $HUB_CONTEXT)
+  --hub-context CTX   Hub kube context. Accepts a context name, "current" for
+                      the active one, or the hub's API server URL. Defaults to
+                      $HUB_CONTEXT, then the context named "hub", then whatever
+                      context is currently active.
   --spoke-context CTX Spoke kube context. Only needed without --cluster, or to
                       override the admin kubeconfig taken from the hub. Use
                       "current" for the active kubeconfig context.
@@ -115,7 +127,7 @@ while [[ $# -gt 0 ]]; do
             [[ -n "$COMMAND" ]] && { log_error "Only one command at a time (got '$COMMAND' and '$1')"; exit 1; }
             COMMAND="$1"; shift ;;
         --cluster)        CLUSTER_NS="${2:-}"; [[ -z "$CLUSTER_NS" ]] && { log_error "--cluster requires a namespace"; exit 1; }; shift 2 ;;
-        --hub-context)    HUB_CTX="${2:-}";    [[ -z "$HUB_CTX" ]]    && { log_error "--hub-context requires a value"; exit 1; }; shift 2 ;;
+        --hub-context)    HUB_CTX="${2:-}";    [[ -z "$HUB_CTX" ]]    && { log_error "--hub-context requires a value"; exit 1; }; HUB_CTX_EXPLICIT=true; shift 2 ;;
         --spoke-context)  SPOKE_CTX="${2:-}";  [[ -z "$SPOKE_CTX" ]]  && { log_error "--spoke-context requires a value"; exit 1; }; SPOKE_CTX_EXPLICIT=true; shift 2 ;;
         --profile)        AWS_PROFILE_NAME="${2:-}"; shift 2 ;;
         --region)         AWS_REGION_NAME="${2:-}";  shift 2 ;;
@@ -207,6 +219,82 @@ spoke() {
     else
         $KUBE_CLI --context="$SPOKE_CTX" --request-timeout=30s "$@"
     fi
+}
+
+# --- Hub context -------------------------------------------------------------
+# sno-virt needs exactly one connection: the hub that owns the ClusterDeployment.
+# Everything else — AWS credentials, region, EC2 instance, the spoke kubeconfig —
+# is read from there. So whatever `oc login` left current is normally the right
+# answer, and naming a context is only needed when the active one is not the hub.
+#
+# Resolution: --hub-context / HUB_CONTEXT (explicit wins) -> the context named
+# "hub" if it exists -> the current kubeconfig context.
+#
+# An explicit value may be a context name, the literal "current", or the hub's
+# API server URL — `oc login <url>` puts the URL in front of you, so accepting it
+# saves a lookup.
+HUB_SOURCE=""
+
+# Map an API server URL to the context that points at it. Echoes nothing when
+# no context matches.
+context_for_server() {
+    local want="${1%/}"
+    $KUBE_CLI config view -o json 2>/dev/null | python3 -c '
+import json,sys
+want = sys.argv[1].rstrip("/")
+cfg = json.load(sys.stdin)
+clusters = {c["name"]: c.get("cluster", {}).get("server", "").rstrip("/") for c in cfg.get("clusters") or []}
+for ctx in cfg.get("contexts") or []:
+    if clusters.get(ctx.get("context", {}).get("cluster")) == want:
+        print(ctx["name"]); break
+' "$want" 2>/dev/null || true
+}
+
+# grep -q would exit early and SIGPIPE the producer, which under `set -o pipefail`
+# surfaces as exit 141 regardless of whether the context matched.
+context_exists() {
+    $KUBE_CLI config get-contexts -o name 2>/dev/null | grep -Fx "$1" >/dev/null
+}
+
+current_context() {
+    $KUBE_CLI config current-context 2>/dev/null || true
+}
+
+resolve_hub_context() {
+    [[ -n "$HUB_SOURCE" ]] && return 0
+
+    if [[ "$HUB_CTX_EXPLICIT" == "true" ]]; then
+        if [[ "$HUB_CTX" == "current" ]]; then
+            HUB_CTX="$(current_context)"
+            [[ -z "$HUB_CTX" ]] && { log_error "No current kubeconfig context — run '$KUBE_CLI login' first"; exit 1; }
+            HUB_SOURCE="current context '$HUB_CTX'"
+            return 0
+        fi
+        # A server URL is not a context name; translate it before failing.
+        if [[ "$HUB_CTX" == https://* || "$HUB_CTX" == http://* ]]; then
+            local mapped
+            mapped="$(context_for_server "$HUB_CTX")"
+            if [[ -z "$mapped" ]]; then
+                log_error "No kubeconfig context points at $HUB_CTX"
+                log_info  "Log in to it first: $KUBE_CLI login $HUB_CTX"
+                exit 1
+            fi
+            log_substep "resolved $HUB_CTX to context '$mapped'"
+            HUB_CTX="$mapped"
+        fi
+        HUB_SOURCE="context '$HUB_CTX'"
+        return 0
+    fi
+
+    if context_exists "$HUB_CTX_FALLBACK"; then
+        HUB_CTX="$HUB_CTX_FALLBACK"
+        HUB_SOURCE="context '$HUB_CTX'"
+        return 0
+    fi
+
+    HUB_CTX="$(current_context)"
+    [[ -z "$HUB_CTX" ]] && { log_error "No current kubeconfig context — run '$KUBE_CLI login' first"; exit 1; }
+    HUB_SOURCE="current context '$HUB_CTX'"
 }
 
 hub() {
@@ -369,13 +457,16 @@ require_aws_auth() {
 resolve_cluster_ns() {
     if [[ -n "$CLUSTER_NS" ]]; then
         if ! hub get clusterdeployment "$CLUSTER_NS" -n "$CLUSTER_NS" &>/dev/null; then
-            log_error "No ClusterDeployment '$CLUSTER_NS' in namespace '$CLUSTER_NS' on context '$HUB_CTX'"
+            log_error "No ClusterDeployment '$CLUSTER_NS' in namespace '$CLUSTER_NS' on $HUB_SOURCE"
+            log_info  "--hub-context must name the hub that manages this cluster. Available contexts:"
+            $KUBE_CLI config get-contexts -o name 2>/dev/null | sed 's/^/    /' >&2
+            log_info  "Or pass --hub-context current to use the active one ($(current_context))."
             exit 1
         fi
         return 0
     fi
     log_error "No cluster specified. Pass --cluster <namespace> or set SNO_VIRT_CLUSTER_NS."
-    log_info  "Find it with: $KUBE_CLI --context=$HUB_CTX get clusterclaim -A"
+    log_info  "Find it with: $KUBE_CLI --context=$HUB_CTX get clusterdeployment -A"
     exit 1
 }
 
@@ -409,7 +500,7 @@ cmd_status() {
     echo -e "${BOLD}SNO Virtualization Status${NC}"
     print_separator
     echo -e "${BOLD}Cluster:${NC}  $CLUSTER_NS"
-    echo -e "${BOLD}Hub ctx:${NC}  $HUB_CTX"
+    echo -e "${BOLD}Hub:${NC}      $HUB_SOURCE"
     echo -e "${BOLD}Region:${NC}   $AWS_REGION_NAME"
     echo -e "${BOLD}AWS creds:${NC} $AWS_CREDS_SOURCE"
     echo -e "${BOLD}Spoke:${NC}    $SPOKE_SOURCE_DETAIL"
@@ -945,6 +1036,8 @@ cmd_setup() {
 }
 
 # --- Dispatch ----------------------------------------------------------------
+resolve_hub_context
+
 case "$COMMAND" in
     status)     cmd_status ;;
     check-node) cmd_check_node ;;

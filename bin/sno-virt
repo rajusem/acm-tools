@@ -41,7 +41,7 @@ source "$SCRIPT_DIR/../lib/common.sh"
 
 # --- Defaults (override via env or flags) ------------------------------------
 HUB_CTX="$HUB_CONTEXT_PRESET"
-HUB_CTX_FALLBACK="${HUB_CONTEXT:-hub}"
+SNO_VIRT_HUB_DEFAULT="${SNO_VIRT_HUB:-https://api.collective.aws.red-chesterfield.com:6443}"
 HUB_CTX_EXPLICIT=false
 [[ -n "$HUB_CTX" ]] && HUB_CTX_EXPLICIT=true
 SPOKE_CTX="${SNO_VIRT_SPOKE_CONTEXT:-}"
@@ -87,8 +87,8 @@ Options:
                       Defaults to $SNO_VIRT_CLUSTER_NS.
   --hub-context CTX   Hub kube context. Accepts a context name, "current" for
                       the active one, or the hub's API server URL. Defaults to
-                      $HUB_CONTEXT, then the context named "hub", then whatever
-                      context is currently active.
+                      $SNO_VIRT_HUB, which is the Collective hub unless you
+                      override it.
   --spoke-context CTX Spoke kube context. Only needed without --cluster, or to
                       override the admin kubeconfig taken from the hub. Use
                       "current" for the active kubeconfig context.
@@ -105,7 +105,7 @@ Options:
   -h, --help          Show this help
 
 Environment overrides:
-  SNO_VIRT_CLUSTER_NS, SNO_VIRT_SPOKE_CONTEXT, SNO_VIRT_AWS_PROFILE,
+  SNO_VIRT_HUB, SNO_VIRT_CLUSTER_NS, SNO_VIRT_SPOKE_CONTEXT, SNO_VIRT_AWS_PROFILE,
   SNO_VIRT_AWS_REGION, SNO_VIRT_SMOKE_NS, ACM_TOOLS_YES, TIMEOUT_NODE_READY,
   TIMEOUT_DATASOURCE_READY
 
@@ -286,15 +286,29 @@ resolve_hub_context() {
         return 0
     fi
 
-    if context_exists "$HUB_CTX_FALLBACK"; then
-        HUB_CTX="$HUB_CTX_FALLBACK"
-        HUB_SOURCE="context '$HUB_CTX'"
-        return 0
+    # Default to the hub that owns these clusters rather than to whatever context
+    # happens to be active. Picking the wrong hub is not a harmless mistake: the
+    # ClusterDeployment simply is not there, and the failure looks like a missing
+    # cluster rather than a missing login.
+    local mapped=""
+    if [[ "$SNO_VIRT_HUB_DEFAULT" == https://* || "$SNO_VIRT_HUB_DEFAULT" == http://* ]]; then
+        mapped="$(context_for_server "$SNO_VIRT_HUB_DEFAULT")"
+        if [[ -z "$mapped" ]]; then
+            log_error "Not logged in to the default hub: $SNO_VIRT_HUB_DEFAULT"
+            log_info  "Log in with: $KUBE_CLI login --web $SNO_VIRT_HUB_DEFAULT"
+            log_info  "Or target another hub with --hub-context <name|current|url>,"
+            log_info  "or change the default by exporting SNO_VIRT_HUB."
+            exit 1
+        fi
+    elif context_exists "$SNO_VIRT_HUB_DEFAULT"; then
+        mapped="$SNO_VIRT_HUB_DEFAULT"
+    else
+        log_error "Default hub context '$SNO_VIRT_HUB_DEFAULT' is not in your kubeconfig"
+        log_info  "Pass --hub-context <name|current|url>, or export SNO_VIRT_HUB."
+        exit 1
     fi
-
-    HUB_CTX="$(current_context)"
-    [[ -z "$HUB_CTX" ]] && { log_error "No current kubeconfig context — run '$KUBE_CLI login' first"; exit 1; }
-    HUB_SOURCE="current context '$HUB_CTX'"
+    HUB_CTX="$mapped"
+    HUB_SOURCE="default hub $SNO_VIRT_HUB_DEFAULT (context '$HUB_CTX')"
 }
 
 hub() {

@@ -244,22 +244,27 @@ When `--cluster` is supplied, every spoke-side command cross-checks the spoke co
   EC2 instance (via `infraID`) and the spoke's admin kubeconfig — so there is no offline
   or hub-less mode.
 
-  Since that is the only cluster connection needed, logging in is usually enough:
+  `sno-virt` defaults to Collective, so logging in is all that is needed:
 
   ```bash
-  oc login --web https://api.collective.aws.red-chesterfield.com:6443   # your hub
+  oc login --web https://api.collective.aws.red-chesterfield.com:6443
   bin/sno-virt status --cluster <cluster-ns>
   ```
 
-  `--hub-context` accepts a context name, `current` for the active context, or the hub's
-  API server URL. It resolves in that order of preference: the flag or `HUB_CONTEXT`,
-  then a context literally named `hub`, then whatever context is active. So an existing
-  `hub` context still wins when you have one, and a plain `oc login` works when you do
-  not.
+  The default lives in `config.sh` as `SNO_VIRT_HUB` and is deliberately separate from
+  the generic `HUB_CONTEXT` the other tools use — those target whichever hub you are
+  testing, while every cluster `sno-virt` manages is claimed from a pool on Collective.
+  If you are not logged in to it, the run stops and says so rather than quietly using
+  another context; targeting the wrong hub only shows up as a missing ClusterDeployment,
+  which reads like a missing cluster instead of a missing login.
+
+  Override per run with `--hub-context`, which takes a context name, `current` for the
+  active context, or an API server URL. Override the default itself with `SNO_VIRT_HUB`:
 
   ```bash
   bin/sno-virt status --cluster <cluster-ns> --hub-context current
   bin/sno-virt status --cluster <cluster-ns> --hub-context https://api.my-hub.example.com:6443
+  export SNO_VIRT_HUB=https://api.my-hub.example.com:6443     # change the default
   ```
 
   You need permission to `get clusterdeployment` and `get secret` in the cluster's

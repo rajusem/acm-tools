@@ -13,6 +13,12 @@ export MCOA_IMAGE_NAME="${MCOA_IMAGE_NAME:-multicluster-observability-addon}"
 
 # --- Cluster Contexts ---
 export HUB_CONTEXT="${HUB_CONTEXT:-hub}"
+
+# Hub that owns the SNO ClusterDeployments sno-virt operates on. Every cluster
+# it manages is claimed from a pool here, so this is the default rather than the
+# generic HUB_CONTEXT, which points at whatever hub the other tools target.
+# Accepts an API server URL or a kubeconfig context name.
+export SNO_VIRT_HUB="${SNO_VIRT_HUB:-https://api.collective.aws.red-chesterfield.com:6443}"
 export NAMESPACE_SPOKE_CONTEXT="${NAMESPACE_SPOKE_CONTEXT:-namespace-spoke}"
 export VM_SPOKE_CONTEXT="${VM_SPOKE_CONTEXT:-vm-spoke}"
 

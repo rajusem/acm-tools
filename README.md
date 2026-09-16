@@ -184,6 +184,187 @@ Before importing, the script checks if the spoke already has a klusterlet instal
 
 The `remove` command performs a **detach** — it removes ACM's management but leaves the spoke cluster intact. The klusterlet agent on the spoke may need manual removal if the spoke is unreachable.
 
+### sno-virt
+
+Enable and validate Red Hat OpenShift Virtualization on a single-node OpenShift (SNO) cluster running on AWS.
+
+Standard EC2 instances do not expose Intel VT-x, so `/dev/kvm` is absent and OpenShift Virtualization cannot start VMs. On nested-virt-capable families (C7i/M7i/R7i/C8i/M8i/R8i and their variants) the capability can be switched on per instance via `ec2:ModifyInstanceCpuOptions`. Hive has no field for it, so it must be applied after installation — and again for every cluster claimed from the pool.
+
+`setup` runs the whole path unattended and is the normal way to use this tool:
+
+```bash
+bin/sno-virt setup --cluster <cluster-ns> --hub-context <hub-ctx> --yes
+```
+
+`--cluster` is all the addressing it needs, but it only means something on the hub that
+manages that cluster — be logged in to that hub (Collective for the Red Hat lab clusters)
+and point `--hub-context` at it. The AWS credentials and the spoke's admin kubeconfig are
+both read from there, so there is no separate spoke login and `--spoke-context` is only
+for overriding it. See **Prerequisites** and **Spoke access** below.
+
+It chains `enable` -> `check-node` -> `install` -> `smoke-test` -> `cleanup` -> `status`,
+waiting for the node to report `Ready` after the resume before it runs anything spoke-side.
+Every underlying step is re-runnable — `enable` exits early once nested virt is on, and
+`install` and `smoke-test` use `oc apply` — so a `setup` that fails partway can simply be
+run again and picks up where it stopped.
+
+`smoke-test` waits for the `rhel9` DataSource to become Ready before it creates the VM.
+HyperConverged reports `Available` well before the golden images finish importing, so a
+smoke test run straight after `install` would otherwise always fail. Tune the wait with
+`TIMEOUT_DATASOURCE_READY` (default 1800s).
+
+By default the smoke-test VM and its namespace are deleted once the VM has proved KVM
+works. A smoke-test namespace that already existed before `setup` ran is reused and never
+deleted. Use `--skip-smoke-test` to stop after `install`, or `--keep-vm` to leave the VM
+running.
+
+The individual steps remain available:
+
+```bash
+bin/sno-virt status --cluster <cluster-ns>       # AWS, Hive, node and operator state
+bin/sno-virt check-node --spoke-context current  # vmx flag, /dev/kvm, kvm modules
+bin/sno-virt enable --cluster <cluster-ns>       # hibernate -> enable nested virt -> resume
+bin/sno-virt install --spoke-context current     # operator + HyperConverged
+bin/sno-virt smoke-test --spoke-context current  # boot a RHEL 9 VM to prove KVM works
+bin/sno-virt cleanup --spoke-context current     # remove the smoke-test namespace
+```
+
+`enable` stops the cluster — a SNO cluster has one node, so it is fully down until the resume completes. It uses Hive's `powerState` rather than `aws ec2 stop-instances` so Hive stays authoritative over the node lifecycle. It requires AWS CLI 2.36+ (for `--nested-virtualization`) and an IAM principal with `ec2:ModifyInstanceCpuOptions`. It dry-runs `ModifyInstanceCpuOptions` before the hibernate, so a missing permission aborts while the cluster is still up rather than leaving it hibernating.
+
+When `--cluster` is supplied, every spoke-side command cross-checks the spoke context's API URL against the ClusterDeployment's `status.apiURL` and refuses to act on a mismatch — it is easy to leave a kubeconfig pointed at a different spoke.
+
+> OpenShift Virtualization on non-metal AWS instances is **not** a Red Hat supported configuration. Red Hat supports bare-metal instances (`c5n.metal`, `m5.metal`). Use this for lab and test clusters only.
+
+**Prerequisites**
+
+- **Access to the hub that manages the cluster — mandatory.** You must be logged in to the
+  same hub whose Hive `ClusterDeployment` created and manages the target cluster; for the
+  Red Hat lab clusters that is **Collective**. `sno-virt` resolves everything it needs
+  through that ClusterDeployment — the AWS region, the installer's IAM credentials, the
+  EC2 instance (via `infraID`) and the spoke's admin kubeconfig — so there is no offline
+  or hub-less mode.
+
+  `sno-virt` defaults to Collective, so logging in is all that is needed:
+
+  ```bash
+  oc login --web https://api.collective.aws.red-chesterfield.com:6443
+  bin/sno-virt status --cluster <cluster-ns>
+  ```
+
+  The default lives in `config.sh` as `SNO_VIRT_HUB` and is deliberately separate from
+  the generic `HUB_CONTEXT` the other tools use — those target whichever hub you are
+  testing, while every cluster `sno-virt` manages is claimed from a pool on Collective.
+  If you are not logged in to it, the run stops and says so rather than quietly using
+  another context; targeting the wrong hub only shows up as a missing ClusterDeployment,
+  which reads like a missing cluster instead of a missing login.
+
+  Override per run with `--hub-context`, which takes a context name, `current` for the
+  active context, or an API server URL. Override the default itself with `SNO_VIRT_HUB`:
+
+  ```bash
+  bin/sno-virt status --cluster <cluster-ns> --hub-context current
+  bin/sno-virt status --cluster <cluster-ns> --hub-context https://api.my-hub.example.com:6443
+  export SNO_VIRT_HUB=https://api.my-hub.example.com:6443     # change the default
+  ```
+
+  You need permission to `get clusterdeployment` and `get secret` in the cluster's
+  namespace — on Hive, that namespace has the same name as the cluster. A hub that does
+  not own this cluster will not have the ClusterDeployment and every command fails at
+  the first step.
+
+  Without `--cluster` only the spoke-only commands run (`check-node`, `install`,
+  `smoke-test`, `cleanup`), and only against whatever `--spoke-context` points at.
+  `status`, `enable` and `setup` always require `--cluster` and therefore the hub.
+
+  No local AWS profile and no spoke login are required. See **Spoke access** and
+  **AWS credentials** below.
+
+- AWS CLI **2.36.0 or newer** — older versions have no `--nested-virtualization` and make `--core-count` / `--threads-per-core` mandatory.
+- An IAM principal with **`ec2:ModifyInstanceCpuOptions`**. This is not part of the standard install permissions and usually has to be requested:
+
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": "ec2:ModifyInstanceCpuOptions",
+        "Resource": "arn:aws:ec2:us-west-2:<account-id>:instance/*"
+      }
+    ]
+  }
+  ```
+
+- The cluster must already run on a nested-virt-capable instance type. Set it in the ClusterPool's install-config: `controlPlane.platform.aws.type: m7i.4xlarge` and `rootVolume.size: 200` (120 GB minimum, plus ~10 GiB virtualization overhead and room for VM disks). On OCP 5.0 `networking.networkType` must be `OVNKubernetes` — `OpenShiftSDN` was removed and provisioning fails in seconds.
+
+**Spoke access**
+
+Hive stores the cluster's admin kubeconfig in a secret the ClusterDeployment names
+(`spec.clusterMetadata.adminKubeconfigSecretRef.name`). With `--cluster`, `sno-virt`
+reads it from the hub and uses it for every spoke-side call, so no spoke context has to
+exist in your kubeconfig.
+
+The kubeconfig is fetched once into a shell variable and handed to each `oc` invocation
+through a process substitution — it is never written to disk. Because it comes from the
+cluster's own ClusterDeployment it cannot point at the wrong spoke, which removes the
+whole class of wrong-cluster mistakes the API-URL cross-check exists to catch.
+
+Resolution order is `--spoke-context` / `SNO_VIRT_SPOKE_CONTEXT` (explicit wins), then
+the hub's admin kubeconfig when `--cluster` is given, then `VM_SPOKE_CONTEXT`. Use
+`--spoke-context current` to act on whatever context is active, which is still the
+quickest way to run the spoke-only commands against a cluster you are already logged in
+to. `status` prints which source was used.
+
+**AWS credentials**
+
+No `aws configure` step is needed. `sno-virt` reads the region and the IAM keys straight
+off the ClusterDeployment on the hub, so hub access is the only prerequisite:
+
+| Value | Source on the hub |
+|-------|-------------------|
+| Region | `clusterdeployment.spec.platform.aws.region` |
+| Access key / secret | the secret named by `clusterdeployment.spec.platform.aws.credentialsSecretRef.name` |
+| EC2 instance | `clusterdeployment.spec.clusterMetadata.infraID` -> tag `<infraID>-master-0` |
+
+Credentials are exported only inside the subshell running each `aws` call — never written
+to disk and never logged. `status` prints which source was used.
+
+Resolution order is `--profile` / `SNO_VIRT_AWS_PROFILE` (explicit wins), then the hub
+secret, then the AWS CLI's own default chain. Use `--profile` when the hub secret is
+missing, when it is an STS/AssumeRole setup with no static keys, or when you need a
+different IAM principal:
+
+```bash
+bin/sno-virt status --cluster <cluster-ns> --profile my-profile
+```
+
+To inspect what the hub holds:
+
+```bash
+NS=<cluster-namespace>
+oc get clusterdeployment $NS -n $NS \
+  -o jsonpath='{.spec.platform.aws.region}{"\n"}{.spec.platform.aws.credentialsSecretRef.name}{"\n"}'
+```
+
+**Limitations**
+
+- **Nested virtualization is per-instance and invisible to Hive.** Every cluster claimed from a pool needs `enable` run against it individually. If the node is replaced the setting reverts to `None` and VMs stop starting, with no explanatory error at the Kubernetes layer.
+- **SNO restrictions.** No high availability, no pod disruption budgets, no live migration, and no VMs with an eviction strategy configured — hence `evictionStrategy: None` on the smoke-test VM.
+- **AWS networking.** SR-IOV and bridge CNI (including VLAN) are unavailable. Use OVN-Kubernetes secondary overlay networks for layer-2 needs.
+- **CPU headroom.** Roughly 6 of 16 vCPU go to virtualization overhead on SNO. Memory is comfortable; CPU is tight.
+- Hosted control planes for OpenShift Virtualization are not supported on AWS.
+
+**Troubleshooting**
+
+| Symptom | Cause and fix |
+|---|---|
+| `UnauthorizedOperation ... ec2:ModifyInstanceCpuOptions` | IAM policy gap, not a state problem — `--dry-run` fails identically. Add the policy above. `enable` prints the resume command so the cluster is never left hibernating. |
+| `Unknown options: --nested-virtualization` | AWS CLI older than 2.36. `brew upgrade awscli`. |
+| `DataSource rhel9 is not Ready` | Golden images are still importing. `setup` waits for this; raise `TIMEOUT_DATASOURCE_READY` if the import is slow. Watch it with `oc get dv -n openshift-virtualization-os-images`. |
+| `AuthFailure ... DescribeInstanceTypes, StatusCode: 401` | The pool's `credentialsSecretRef` is invalid or expired. Fails at `create manifests`, before any AWS resources exist. |
+| `networkType OpenShiftSDN is not supported` | OpenShiftSDN was removed in OCP 5.0. Fix both the pool template and the `ClusterDeployment`'s own copy. |
+| Cluster suddenly unreachable | Something hibernated it. Check `oc get clusterdeployment $NS -n $NS -o jsonpath='spec={.spec.powerState} status={.status.powerState}'`, and `.metadata.managedFields` for `manager=action` (console-driven) or `hibernateAfter` (timer). Hibernation is non-destructive — namespaces, VMs, DataVolumes, the operator and the `NestedVirtualization` attribute all survive. |
+
 ### image-override
 
 Apply or revert custom image overrides on a hub cluster.

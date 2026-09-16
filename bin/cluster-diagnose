@@ -717,7 +717,9 @@ check_rs_thanos_data() {
 print_summary() {
     local total_fail=0 total_warn=0
 
-    for sev in "${ISSUE_SEVERITIES[@]}"; do
+    # bash 3.2 (macOS) treats "${arr[@]}" on an empty array as unbound under `set -u`,
+    # so a clean run with zero issues would abort here. Guard like line 747 does.
+    for sev in ${ISSUE_SEVERITIES[@]+"${ISSUE_SEVERITIES[@]}"}; do
         [[ "$sev" == "FAIL" ]] && ((total_fail++)) || true
         [[ "$sev" == "WARN" ]] && ((total_warn++)) || true
     done

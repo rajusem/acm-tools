@@ -1,0 +1,1064 @@
+#!/bin/bash
+# =============================================================================
+# sno-virt — Enable and validate OpenShift Virtualization on an AWS SNO cluster
+# =============================================================================
+#
+# Usage:
+#   sno-virt status                  # Full state: AWS, Hive, node, operator
+#   sno-virt check-node              # Spoke-side: vmx, /dev/kvm, kvm modules
+#   sno-virt enable                  # Turn on EC2 nested virtualization (downtime)
+#   sno-virt install                 # Install the OpenShift Virtualization operator
+#   sno-virt smoke-test              # Boot a RHEL 9 VM to prove KVM works
+#   sno-virt cleanup                 # Delete the smoke-test namespace
+#   sno-virt setup                   # enable -> check-node -> install -> smoke-test
+#
+# AWS EC2 instances do not expose Intel VT-x by default, so KVM is unavailable
+# and OpenShift Virtualization cannot start VMs. On nested-virt-capable families
+# (C7i/M7i/R7i/C8i/M8i/R8i and their variants) the capability can be switched on
+# per instance, but Hive has no field for it — hence this tool.
+#
+# AWS credentials, region and the spoke's admin kubeconfig are all read from the
+# ClusterDeployment on the hub, so `--cluster` plus hub access is normally the
+# only prerequisite — no `aws configure` and no spoke login. Pass --profile or
+# --spoke-context to override either.
+#
+# See the sno-virt section of README.md for prerequisites, the IAM policy,
+# limitations and troubleshooting.
+#
+# NOTE: OpenShift Virtualization on non-metal AWS instances is NOT a Red Hat
+# supported configuration. Lab and test use only.
+# =============================================================================
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Read HUB_CONTEXT before common.sh sources config.sh, which defaults it to
+# "hub" unconditionally. Without this the default is indistinguishable from a
+# deliberate choice and the current-context fallback could never run.
+HUB_CONTEXT_PRESET="${HUB_CONTEXT:-}"
+
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# --- Defaults (override via env or flags) ------------------------------------
+HUB_CTX="$HUB_CONTEXT_PRESET"
+SNO_VIRT_HUB_DEFAULT="${SNO_VIRT_HUB:-https://api.collective.aws.red-chesterfield.com:6443}"
+HUB_CTX_EXPLICIT=false
+[[ -n "$HUB_CTX" ]] && HUB_CTX_EXPLICIT=true
+SPOKE_CTX="${SNO_VIRT_SPOKE_CONTEXT:-}"
+SPOKE_CTX_FALLBACK="${VM_SPOKE_CONTEXT:-vm-spoke}"
+SPOKE_CTX_EXPLICIT=false
+[[ -n "$SPOKE_CTX" ]] && SPOKE_CTX_EXPLICIT=true
+CLUSTER_NS="${SNO_VIRT_CLUSTER_NS:-}"
+AWS_PROFILE_NAME="${SNO_VIRT_AWS_PROFILE:-}"
+AWS_REGION_NAME="${SNO_VIRT_AWS_REGION:-}"
+AWS_REGION_FALLBACK="us-west-2"
+SMOKE_NS="${SNO_VIRT_SMOKE_NS:-virt-smoke-test}"
+CNV_NS="openshift-cnv"
+AWS_CLI_MIN="2.36"
+TIMEOUT_POWER_STATE="${TIMEOUT_POWER_STATE:-900}"
+TIMEOUT_CNV_CSV="${TIMEOUT_CNV_CSV:-900}"
+TIMEOUT_HCO_READY="${TIMEOUT_HCO_READY:-1200}"
+TIMEOUT_VM_READY="${TIMEOUT_VM_READY:-1800}"
+TIMEOUT_NODE_READY="${TIMEOUT_NODE_READY:-900}"
+TIMEOUT_DATASOURCE_READY="${TIMEOUT_DATASOURCE_READY:-1800}"
+SKIP_SMOKE_TEST=false
+KEEP_VM=false
+
+usage() {
+    cat <<'USAGE'
+Usage: sno-virt <command> [options]
+
+Commands:
+  status        Show AWS nested-virt state, Hive power state, node KVM device,
+                and OpenShift Virtualization health in one view
+  check-node    Spoke-side proof: vmx flag, /dev/kvm, kvm modules, kvm device
+  enable        Enable EC2 nested virtualization (hibernate -> modify -> resume)
+  install       Install the OpenShift Virtualization operator and HyperConverged
+  smoke-test    Create a RHEL 9 VM and wait for it to reach Running
+  cleanup       Delete the smoke-test namespace
+  setup         Run the whole path in order: enable -> check-node -> install ->
+                smoke-test -> cleanup -> status. Every step is re-runnable, so
+                a failed setup can simply be run again.
+
+Options:
+  --cluster NS        Hive cluster namespace, same as the cluster name.
+                      Required for 'status' and 'enable'. Optional elsewhere,
+                      where it cross-checks the spoke context against the hub.
+                      Defaults to $SNO_VIRT_CLUSTER_NS.
+  --hub-context CTX   Hub kube context. Accepts a context name, "current" for
+                      the active one, or the hub's API server URL. Defaults to
+                      $SNO_VIRT_HUB, which is the Collective hub unless you
+                      override it.
+  --spoke-context CTX Spoke kube context. Only needed without --cluster, or to
+                      override the admin kubeconfig taken from the hub. Use
+                      "current" for the active kubeconfig context.
+  --profile NAME      AWS CLI profile to use instead of the cluster's own
+                      credentials. Only needed when the hub secret is missing
+                      or you want a different IAM principal.
+  --region NAME       AWS region (default: the ClusterDeployment's region,
+                      falling back to us-west-2)
+  --smoke-ns NS       Namespace for smoke-test (default: virt-smoke-test)
+  --yes               Do not prompt for confirmation
+  --skip-smoke-test   setup only: stop after 'install', do not boot a VM
+  --keep-vm           setup only: run the smoke test but keep the VM and its
+                      namespace instead of deleting them afterwards
+  -h, --help          Show this help
+
+Environment overrides:
+  SNO_VIRT_HUB, SNO_VIRT_CLUSTER_NS, SNO_VIRT_SPOKE_CONTEXT, SNO_VIRT_AWS_PROFILE,
+  SNO_VIRT_AWS_REGION, SNO_VIRT_SMOKE_NS, ACM_TOOLS_YES, TIMEOUT_NODE_READY,
+  TIMEOUT_DATASOURCE_READY
+
+Examples:
+  sno-virt setup --cluster obsint-sno-m7i-4xlarge-5-bpnzd --yes
+  sno-virt status --cluster obsint-sno-m7i-4xlarge-5-bpnzd
+  sno-virt check-node --cluster obsint-sno-m7i-4xlarge-5-bpnzd
+  sno-virt enable --cluster obsint-sno-m7i-4xlarge-5-bpnzd --yes
+  sno-virt install --spoke-context current
+  sno-virt smoke-test --spoke-context current
+USAGE
+}
+
+# --- Argument parsing --------------------------------------------------------
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        status|check-node|enable|install|smoke-test|cleanup|setup)
+            [[ -n "$COMMAND" ]] && { log_error "Only one command at a time (got '$COMMAND' and '$1')"; exit 1; }
+            COMMAND="$1"; shift ;;
+        --cluster)        CLUSTER_NS="${2:-}"; [[ -z "$CLUSTER_NS" ]] && { log_error "--cluster requires a namespace"; exit 1; }; shift 2 ;;
+        --hub-context)    HUB_CTX="${2:-}";    [[ -z "$HUB_CTX" ]]    && { log_error "--hub-context requires a value"; exit 1; }; HUB_CTX_EXPLICIT=true; shift 2 ;;
+        --spoke-context)  SPOKE_CTX="${2:-}";  [[ -z "$SPOKE_CTX" ]]  && { log_error "--spoke-context requires a value"; exit 1; }; SPOKE_CTX_EXPLICIT=true; shift 2 ;;
+        --profile)        AWS_PROFILE_NAME="${2:-}"; shift 2 ;;
+        --region)         AWS_REGION_NAME="${2:-}";  shift 2 ;;
+        --smoke-ns)       SMOKE_NS="${2:-}";         shift 2 ;;
+        --yes)            export ACM_TOOLS_YES=true; shift ;;
+        --skip-smoke-test) SKIP_SMOKE_TEST=true; shift ;;
+        --keep-vm)        KEEP_VM=true; shift ;;
+        -h|--help)        usage; exit 0 ;;
+        *) log_error "Unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+[[ -z "$COMMAND" ]] && { usage; exit 1; }
+
+# --help must work without a cluster; everything else needs a CLI.
+ensure_cli
+
+# Restore the caller's context on exit (we never switch, but be defensive).
+ORIGINAL_CONTEXT="$($KUBE_CLI config current-context 2>/dev/null || echo "")"
+restore_context() {
+    [[ -n "$ORIGINAL_CONTEXT" ]] || return 0
+    local now
+    now="$($KUBE_CLI config current-context 2>/dev/null || echo "")"
+    [[ "$now" == "$ORIGINAL_CONTEXT" ]] && return 0
+    $KUBE_CLI config use-context "$ORIGINAL_CONTEXT" >/dev/null 2>&1 || true
+}
+trap restore_context EXIT
+
+# --- Context helpers ---------------------------------------------------------
+# Spoke access, like the AWS credentials, comes from the hub by default: Hive
+# stores the cluster's admin kubeconfig in a secret the ClusterDeployment names,
+# so --cluster alone is enough and no spoke login is needed.
+#
+# Precedence: --spoke-context / SNO_VIRT_SPOKE_CONTEXT (explicit wins) -> the
+# hub's admin kubeconfig when --cluster is given -> VM_SPOKE_CONTEXT.
+#
+# The kubeconfig is fetched once and kept in a variable. Each call feeds it to
+# the CLI through a process substitution, so the credentials it carries are
+# never written to disk.
+SPOKE_KUBECONFIG=""
+SPOKE_SOURCE=""
+SPOKE_SOURCE_DETAIL=""
+
+resolve_spoke_access() {
+    [[ -n "$SPOKE_SOURCE" ]] && return 0
+
+    if [[ "$SPOKE_CTX_EXPLICIT" == "true" ]]; then
+        SPOKE_SOURCE="context '$SPOKE_CTX'"
+        SPOKE_SOURCE_DETAIL="$SPOKE_SOURCE"
+        return 0
+    fi
+
+    if [[ -n "$CLUSTER_NS" ]]; then
+        local secret
+        secret="$(hub_field '{.spec.clusterMetadata.adminKubeconfigSecretRef.name}')"
+        if [[ -n "$secret" ]]; then
+            SPOKE_KUBECONFIG="$(hub get secret "$secret" -n "$CLUSTER_NS" \
+                                  -o jsonpath='{.data.kubeconfig}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+        fi
+        if [[ -n "$SPOKE_KUBECONFIG" ]]; then
+            SPOKE_SOURCE="hub admin kubeconfig"
+            SPOKE_SOURCE_DETAIL="hub admin kubeconfig ($CLUSTER_NS/$secret)"
+            return 0
+        fi
+        log_warn "No admin kubeconfig readable on the hub${secret:+ (secret $secret)}"
+        log_info "Falling back to context '$SPOKE_CTX_FALLBACK' — pass --spoke-context to choose another."
+    fi
+
+    SPOKE_CTX="$SPOKE_CTX_FALLBACK"
+    SPOKE_SOURCE="context '$SPOKE_CTX'"
+    SPOKE_SOURCE_DETAIL="$SPOKE_SOURCE"
+}
+
+# How to address this spoke on a follow-up command line.
+spoke_hint() {
+    if [[ -n "$SPOKE_KUBECONFIG" ]]; then
+        echo "--cluster $CLUSTER_NS"
+    else
+        echo "--spoke-context $SPOKE_CTX"
+    fi
+}
+
+# Spoke context "current" means: use whatever kubeconfig context is active.
+spoke() {
+    if [[ -n "$SPOKE_KUBECONFIG" ]]; then
+        $KUBE_CLI --kubeconfig=<(printf '%s' "$SPOKE_KUBECONFIG") --request-timeout=30s "$@"
+    elif [[ "$SPOKE_CTX" == "current" ]]; then
+        $KUBE_CLI --request-timeout=30s "$@"
+    else
+        $KUBE_CLI --context="$SPOKE_CTX" --request-timeout=30s "$@"
+    fi
+}
+
+# --- Hub context -------------------------------------------------------------
+# sno-virt needs exactly one connection: the hub that owns the ClusterDeployment.
+# Everything else — AWS credentials, region, EC2 instance, the spoke kubeconfig —
+# is read from there. So whatever `oc login` left current is normally the right
+# answer, and naming a context is only needed when the active one is not the hub.
+#
+# Resolution: --hub-context / HUB_CONTEXT (explicit wins) -> the context named
+# "hub" if it exists -> the current kubeconfig context.
+#
+# An explicit value may be a context name, the literal "current", or the hub's
+# API server URL — `oc login <url>` puts the URL in front of you, so accepting it
+# saves a lookup.
+HUB_SOURCE=""
+
+# Map an API server URL to the context that points at it. Echoes nothing when
+# no context matches.
+context_for_server() {
+    local want="${1%/}"
+    $KUBE_CLI config view -o json 2>/dev/null | python3 -c '
+import json,sys
+want = sys.argv[1].rstrip("/")
+cfg = json.load(sys.stdin)
+clusters = {c["name"]: c.get("cluster", {}).get("server", "").rstrip("/") for c in cfg.get("clusters") or []}
+for ctx in cfg.get("contexts") or []:
+    if clusters.get(ctx.get("context", {}).get("cluster")) == want:
+        print(ctx["name"]); break
+' "$want" 2>/dev/null || true
+}
+
+# grep -q would exit early and SIGPIPE the producer, which under `set -o pipefail`
+# surfaces as exit 141 regardless of whether the context matched.
+context_exists() {
+    $KUBE_CLI config get-contexts -o name 2>/dev/null | grep -Fx "$1" >/dev/null
+}
+
+current_context() {
+    $KUBE_CLI config current-context 2>/dev/null || true
+}
+
+resolve_hub_context() {
+    [[ -n "$HUB_SOURCE" ]] && return 0
+
+    if [[ "$HUB_CTX_EXPLICIT" == "true" ]]; then
+        if [[ "$HUB_CTX" == "current" ]]; then
+            HUB_CTX="$(current_context)"
+            [[ -z "$HUB_CTX" ]] && { log_error "No current kubeconfig context — run '$KUBE_CLI login' first"; exit 1; }
+            HUB_SOURCE="current context '$HUB_CTX'"
+            return 0
+        fi
+        # A server URL is not a context name; translate it before failing.
+        if [[ "$HUB_CTX" == https://* || "$HUB_CTX" == http://* ]]; then
+            local mapped
+            mapped="$(context_for_server "$HUB_CTX")"
+            if [[ -z "$mapped" ]]; then
+                log_error "No kubeconfig context points at $HUB_CTX"
+                log_info  "Log in to it first: $KUBE_CLI login $HUB_CTX"
+                exit 1
+            fi
+            log_substep "resolved $HUB_CTX to context '$mapped'"
+            HUB_CTX="$mapped"
+        fi
+        HUB_SOURCE="context '$HUB_CTX'"
+        return 0
+    fi
+
+    # Default to the hub that owns these clusters rather than to whatever context
+    # happens to be active. Picking the wrong hub is not a harmless mistake: the
+    # ClusterDeployment simply is not there, and the failure looks like a missing
+    # cluster rather than a missing login.
+    local mapped=""
+    if [[ "$SNO_VIRT_HUB_DEFAULT" == https://* || "$SNO_VIRT_HUB_DEFAULT" == http://* ]]; then
+        mapped="$(context_for_server "$SNO_VIRT_HUB_DEFAULT")"
+        if [[ -z "$mapped" ]]; then
+            log_error "Not logged in to the default hub: $SNO_VIRT_HUB_DEFAULT"
+            log_info  "Log in with: $KUBE_CLI login --web $SNO_VIRT_HUB_DEFAULT"
+            log_info  "Or target another hub with --hub-context <name|current|url>,"
+            log_info  "or change the default by exporting SNO_VIRT_HUB."
+            exit 1
+        fi
+    elif context_exists "$SNO_VIRT_HUB_DEFAULT"; then
+        mapped="$SNO_VIRT_HUB_DEFAULT"
+    else
+        log_error "Default hub context '$SNO_VIRT_HUB_DEFAULT' is not in your kubeconfig"
+        log_info  "Pass --hub-context <name|current|url>, or export SNO_VIRT_HUB."
+        exit 1
+    fi
+    HUB_CTX="$mapped"
+    HUB_SOURCE="default hub $SNO_VIRT_HUB_DEFAULT (context '$HUB_CTX')"
+}
+
+hub() {
+    $KUBE_CLI --context="$HUB_CTX" --request-timeout=30s "$@"
+}
+
+# --- AWS credentials ---------------------------------------------------------
+# Prefer the cluster's own credentials over a locally configured profile: Hive
+# stores the IAM keys the installer used in a secret the ClusterDeployment names,
+# so hub access is the only prerequisite and `aws configure` is not needed.
+#
+# Precedence: --profile / SNO_VIRT_AWS_PROFILE (explicit wins) -> hub secret ->
+# the aws CLI's own default chain (env vars, ~/.aws, instance role).
+#
+# Keys live in shell variables and are exported only inside the subshell that
+# runs each aws call. They are never written to disk and never logged.
+AWS_KEY_ID=""
+AWS_SECRET_KEY=""
+AWS_CREDS_SOURCE=""
+
+# Resolve region and credentials from the ClusterDeployment. Safe to call more
+# than once; only the first call does any work. Requires CLUSTER_NS to be set,
+# so callers must run resolve_cluster_ns first.
+resolve_aws_settings() {
+    [[ -n "$AWS_CREDS_SOURCE" ]] && return 0
+
+    # Region: an explicit flag or env var wins, then the ClusterDeployment, then
+    # the historical default.
+    if [[ -z "$AWS_REGION_NAME" ]]; then
+        AWS_REGION_NAME="$(hub_field '{.spec.platform.aws.region}')"
+        [[ -n "$AWS_REGION_NAME" ]] && log_substep "region from ClusterDeployment: $AWS_REGION_NAME"
+    fi
+    if [[ -z "$AWS_REGION_NAME" ]]; then
+        AWS_REGION_NAME="$AWS_REGION_FALLBACK"
+        log_warn "No region on the ClusterDeployment — defaulting to $AWS_REGION_NAME"
+    fi
+
+    if [[ -n "$AWS_PROFILE_NAME" ]]; then
+        AWS_CREDS_SOURCE="profile '$AWS_PROFILE_NAME'"
+        return 0
+    fi
+
+    local secret
+    secret="$(hub_field '{.spec.platform.aws.credentialsSecretRef.name}')"
+    if [[ -n "$secret" ]]; then
+        AWS_KEY_ID="$(hub get secret "$secret" -n "$CLUSTER_NS" \
+                        -o jsonpath='{.data.aws_access_key_id}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+        AWS_SECRET_KEY="$(hub get secret "$secret" -n "$CLUSTER_NS" \
+                        -o jsonpath='{.data.aws_secret_access_key}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$AWS_KEY_ID" && -n "$AWS_SECRET_KEY" ]]; then
+        AWS_CREDS_SOURCE="hub secret $CLUSTER_NS/$secret"
+        return 0
+    fi
+
+    # Nothing usable on the hub. Do not fail here — the CLI's default chain may
+    # still work, and require_aws_auth reports the real error if it does not.
+    AWS_KEY_ID=""
+    AWS_SECRET_KEY=""
+    AWS_CREDS_SOURCE="aws CLI default chain"
+    if [[ -n "$secret" ]]; then
+        log_warn "Secret '$secret' in $CLUSTER_NS is unreadable or lacks aws_access_key_id/aws_secret_access_key"
+    else
+        log_warn "ClusterDeployment has no spec.platform.aws.credentialsSecretRef"
+    fi
+    log_info "Falling back to the aws CLI default chain. Pass --profile NAME to pick a local profile."
+}
+
+# Run an aws command with whichever credentials resolve_aws_settings picked.
+# The subshell keeps exported keys out of the parent environment, and unsetting
+# AWS_PROFILE/AWS_SESSION_TOKEN stops a stale value in the caller's shell from
+# overriding the cluster keys.
+aws_run() {
+    if [[ -n "$AWS_KEY_ID" ]]; then
+        (
+            unset AWS_PROFILE AWS_SESSION_TOKEN
+            export AWS_ACCESS_KEY_ID="$AWS_KEY_ID"
+            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_KEY"
+            aws "$@"
+        )
+    elif [[ -n "$AWS_PROFILE_NAME" ]]; then
+        aws --profile "$AWS_PROFILE_NAME" "$@"
+    else
+        aws "$@"
+    fi
+}
+
+aws_ec2() {
+    aws_run ec2 --region "$AWS_REGION_NAME" "$@"
+}
+
+# API server URL the spoke context points at.
+spoke_api_url() {
+    if [[ -n "$SPOKE_KUBECONFIG" ]]; then
+        $KUBE_CLI --kubeconfig=<(printf '%s' "$SPOKE_KUBECONFIG") config view --minify \
+            -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true
+    elif [[ "$SPOKE_CTX" == "current" ]]; then
+        $KUBE_CLI config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true
+    else
+        $KUBE_CLI config view --minify --context="$SPOKE_CTX" \
+            -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || true
+    fi
+}
+
+# Guard against acting on the wrong cluster: it is easy to leave a kubeconfig
+# pointed at a different spoke and read or mutate the wrong one. Returns 1 on
+# mismatch so callers can decide whether to warn or abort.
+spoke_matches_cluster() {
+    # A kubeconfig taken from this cluster's own ClusterDeployment cannot point
+    # anywhere else.
+    [[ -n "$SPOKE_KUBECONFIG" ]] && return 0
+    local expected actual
+    expected="$(hub_field '{.status.apiURL}')"
+    actual="$(spoke_api_url)"
+    [[ -z "$expected" || -z "$actual" ]] && return 0   # cannot tell — do not block
+    [[ "${expected%/}" == "${actual%/}" ]]
+}
+
+# --- Preconditions -----------------------------------------------------------
+require_aws_cli() {
+    if ! command -v aws &>/dev/null; then
+        log_error "aws CLI not found in PATH. Install it, then re-run."
+        exit 1
+    fi
+    local version major minor
+    version="$(aws --version 2>&1 | sed -n 's|^aws-cli/\([0-9.]*\).*|\1|p')"
+    major="$(echo "$version" | cut -d. -f1)"
+    minor="$(echo "$version" | cut -d. -f2)"
+    if [[ -z "$major" || -z "$minor" ]]; then
+        log_warn "Could not parse aws CLI version from '$(aws --version 2>&1)'; continuing"
+        return 0
+    fi
+    # --nested-virtualization landed in 2.36; older clients reject the flag.
+    if (( major < 2 )) || { (( major == 2 )) && (( minor < 36 )); }; then
+        log_error "aws CLI $version is too old — need >= $AWS_CLI_MIN for --nested-virtualization"
+        log_info  "Upgrade with: brew upgrade awscli"
+        exit 1
+    fi
+    log_substep "aws CLI $version (>= $AWS_CLI_MIN)"
+}
+
+require_aws_auth() {
+    resolve_aws_settings
+    local arn
+    if ! arn="$(aws_run sts get-caller-identity --query 'Arn' --output text 2>&1)"; then
+        log_error "AWS credentials from $AWS_CREDS_SOURCE are not usable:"
+        echo "$arn" >&2
+        if [[ "$AWS_CREDS_SOURCE" == "aws CLI default chain" ]]; then
+            log_info "No credentials were found on the hub. Pass --profile NAME, or see"
+            log_info "the sno-virt section of README.md to build a profile by hand."
+        fi
+        exit 1
+    fi
+    log_substep "AWS identity: $arn (via $AWS_CREDS_SOURCE)"
+}
+
+# Resolve the Hive cluster namespace. A ClusterDeployment lives in a namespace
+# named after itself, so namespace == cluster name.
+resolve_cluster_ns() {
+    if [[ -n "$CLUSTER_NS" ]]; then
+        if ! hub get clusterdeployment "$CLUSTER_NS" -n "$CLUSTER_NS" &>/dev/null; then
+            log_error "No ClusterDeployment '$CLUSTER_NS' in namespace '$CLUSTER_NS' on $HUB_SOURCE"
+            log_info  "--hub-context must name the hub that manages this cluster. Available contexts:"
+            $KUBE_CLI config get-contexts -o name 2>/dev/null | sed 's/^/    /' >&2
+            log_info  "Or pass --hub-context current to use the active one ($(current_context))."
+            exit 1
+        fi
+        return 0
+    fi
+    log_error "No cluster specified. Pass --cluster <namespace> or set SNO_VIRT_CLUSTER_NS."
+    log_info  "Find it with: $KUBE_CLI --context=$HUB_CTX get clusterdeployment -A"
+    exit 1
+}
+
+hub_field() {
+    hub get clusterdeployment "$CLUSTER_NS" -n "$CLUSTER_NS" -o jsonpath="$1" 2>/dev/null || true
+}
+
+# Look up the SNO master EC2 instance from the cluster's Hive infraID.
+resolve_instance_id() {
+    local infra_id="$1" id
+    id="$(aws_ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${infra_id}-master-0" \
+                      "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || true)"
+    id="$(echo "$id" | tr -d '[:space:]')"
+    if [[ -z "$id" || "$id" == "None" ]]; then
+        log_error "No EC2 instance tagged ${infra_id}-master-0 in $AWS_REGION_NAME" >&2
+        return 1
+    fi
+    echo "$id"
+}
+
+# --- Commands ----------------------------------------------------------------
+cmd_status() {
+    resolve_cluster_ns
+    require_aws_cli
+    require_aws_auth
+    resolve_spoke_access
+
+    print_separator
+    echo -e "${BOLD}SNO Virtualization Status${NC}"
+    print_separator
+    echo -e "${BOLD}Cluster:${NC}  $CLUSTER_NS"
+    echo -e "${BOLD}Hub:${NC}      $HUB_SOURCE"
+    echo -e "${BOLD}Region:${NC}   $AWS_REGION_NAME"
+    echo -e "${BOLD}AWS creds:${NC} $AWS_CREDS_SOURCE"
+    echo -e "${BOLD}Spoke:${NC}    $SPOKE_SOURCE_DETAIL"
+    echo ""
+
+    log_step "Hive (hub)"
+    local installed power infra_id
+    installed="$(hub_field '{.spec.installed}')"
+    power="$(hub_field '{.status.powerState}')"
+    infra_id="$(hub_field '{.spec.clusterMetadata.infraID}')"
+    log_substep "installed:  ${installed:-<unknown>}"
+    log_substep "powerState: ${power:-<unknown>}"
+    log_substep "infraID:    ${infra_id:-<unknown>}"
+    if [[ "$power" != "Running" ]]; then
+        log_warn "Cluster is not Running — spoke checks below will fail until it resumes"
+    fi
+
+    log_step "AWS EC2"
+    if [[ -z "$infra_id" ]]; then
+        log_warn "No infraID on the ClusterDeployment — cannot locate the instance"
+    else
+        local instance_id
+        if instance_id="$(resolve_instance_id "$infra_id")"; then
+            local state nested itype cores threads
+            read -r state nested itype cores threads <<<"$(aws_ec2 describe-instances \
+                --instance-ids "$instance_id" \
+                --query 'Reservations[0].Instances[0].[State.Name,CpuOptions.NestedVirtualization,InstanceType,CpuOptions.CoreCount,CpuOptions.ThreadsPerCore]' \
+                --output text 2>/dev/null || echo "? ? ? ? ?")"
+            log_substep "instance:   $instance_id ($itype)"
+            log_substep "state:      $state"
+            log_substep "cpu:        ${cores} cores x ${threads} threads"
+            if [[ "$nested" == "enabled" ]]; then
+                log_success "nested virtualization: enabled"
+            else
+                log_error "nested virtualization: ${nested:-None} — run 'sno-virt enable'"
+            fi
+        fi
+    fi
+
+    log_step "Spoke node"
+    if ! spoke_matches_cluster; then
+        log_error "Spoke ($SPOKE_SOURCE) points at a DIFFERENT cluster:"
+        log_error "  expected: $(hub_field '{.status.apiURL}')"
+        log_error "  actual:   $(spoke_api_url)"
+        log_info  "Skipping node and operator checks. Log in to $CLUSTER_NS, or pass --spoke-context."
+        print_separator
+        return 0
+    fi
+    local node kvm
+    node="$(spoke get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [[ -z "$node" ]]; then
+        log_warn "Cannot reach the spoke ($SPOKE_SOURCE). Skipping node and operator checks."
+        print_separator
+        return 0
+    fi
+    kvm="$(spoke get node -o jsonpath='{.items[0].status.allocatable.devices\.kubevirt\.io/kvm}' 2>/dev/null || true)"
+    log_substep "node:       $node"
+    if [[ -n "$kvm" ]]; then
+        log_success "devices.kubevirt.io/kvm: $kvm"
+    else
+        log_warn "devices.kubevirt.io/kvm: not advertised (operator not installed, or no KVM)"
+    fi
+
+    log_step "OpenShift Virtualization"
+    if ! spoke get namespace "$CNV_NS" &>/dev/null; then
+        log_warn "Namespace $CNV_NS not found — run 'sno-virt install'"
+        print_separator
+        return 0
+    fi
+    local csv hco
+    csv="$(spoke get csv -n "$CNV_NS" --no-headers 2>/dev/null | awk '/kubevirt-hyperconverged-operator/ {print $1" "$NF}' || true)"
+    log_substep "csv:        ${csv:-<none>}"
+    hco="$(spoke get hco kubevirt-hyperconverged -n "$CNV_NS" \
+             -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' 2>/dev/null || true)"
+    if [[ -n "$hco" ]]; then
+        if [[ "$hco" == *"Available=True"* && "$hco" == *"Degraded=False"* ]]; then
+            log_success "hco: $hco"
+        else
+            log_warn "hco: $hco"
+        fi
+    else
+        log_warn "hco: HyperConverged not found"
+    fi
+
+    local vms
+    vms="$(spoke get vmi -A --no-headers 2>/dev/null | wc -l | tr -d ' ' || true)"
+    log_substep "running VMs: ${vms:-0}"
+    print_separator
+}
+
+cmd_check_node() {
+    assert_spoke_is_cluster
+    log_step "Checking KVM on the spoke node ($SPOKE_SOURCE)"
+    local node
+    node="$(spoke get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [[ -z "$node" ]]; then
+        log_error "Cannot reach the spoke cluster ($SPOKE_SOURCE)"
+        exit 1
+    fi
+    log_substep "node: $node"
+
+    local out
+    out="$(spoke debug "node/$node" --quiet -- chroot /host sh -c \
+        'echo "VMX:$(grep -o -m1 vmx /proc/cpuinfo || echo MISSING)"; \
+         echo "KVMDEV:$(ls /dev/kvm 2>/dev/null || echo MISSING)"; \
+         echo "MODS:$(lsmod | grep "^kvm" | awk "{print \$1}" | tr "\n" "," || echo MISSING)"' \
+        2>/dev/null || true)"
+
+    local vmx kvmdev mods
+    vmx="$(echo "$out"    | sed -n 's/^VMX://p')"
+    kvmdev="$(echo "$out" | sed -n 's/^KVMDEV://p')"
+    mods="$(echo "$out"   | sed -n 's/^MODS://p')"
+
+    local failed=0
+    if [[ "$vmx" == "vmx" ]]; then log_success "CPU exposes vmx"
+    else log_error "CPU does NOT expose vmx — nested virtualization is off"; failed=1; fi
+
+    if [[ "$kvmdev" == "/dev/kvm" ]]; then log_success "/dev/kvm present"
+    else log_error "/dev/kvm missing"; failed=1; fi
+
+    if [[ "$mods" == *kvm* ]]; then log_success "kvm modules loaded: ${mods%,}"
+    else log_error "kvm modules not loaded"; failed=1; fi
+
+    local kvm
+    kvm="$(spoke get node -o jsonpath='{.items[0].status.allocatable.devices\.kubevirt\.io/kvm}' 2>/dev/null || true)"
+    if [[ -n "$kvm" ]]; then
+        log_success "node advertises devices.kubevirt.io/kvm: $kvm"
+    else
+        log_warn "node does not advertise devices.kubevirt.io/kvm (expected until the operator is installed)"
+    fi
+
+    if (( failed )); then
+        log_error "KVM is not usable on this node. Run 'sno-virt enable' first."
+        exit 1
+    fi
+    log_success "Node is ready for OpenShift Virtualization"
+}
+
+cmd_enable() {
+    resolve_cluster_ns
+    require_aws_cli
+    require_aws_auth
+
+    local infra_id instance_id nested
+    infra_id="$(hub_field '{.spec.clusterMetadata.infraID}')"
+    [[ -z "$infra_id" ]] && { log_error "ClusterDeployment has no infraID — is it installed?"; exit 1; }
+    instance_id="$(resolve_instance_id "$infra_id")" || exit 1
+
+    nested="$(aws_ec2 describe-instances --instance-ids "$instance_id" \
+        --query 'Reservations[0].Instances[0].CpuOptions.NestedVirtualization' --output text 2>/dev/null || true)"
+    if [[ "$nested" == "enabled" ]]; then
+        log_success "Nested virtualization is already enabled on $instance_id — nothing to do"
+        return 0
+    fi
+
+    # Check the IAM permission before the hibernate. Without this the failure
+    # only surfaces after the cluster is already down, leaving it hibernating
+    # while the operator resumes it by hand.
+    local dry
+    if ! dry="$(aws_ec2 modify-instance-cpu-options --instance-id "$instance_id" \
+                    --nested-virtualization enabled --dry-run 2>&1)"; then
+        if [[ "$dry" == *DryRunOperation* ]]; then
+            log_substep "ec2:ModifyInstanceCpuOptions permitted (dry run)"
+        else
+            log_error "Dry run of ModifyInstanceCpuOptions failed — not touching the cluster:"
+            echo "$dry" >&2
+            log_info "If this is UnauthorizedOperation, the IAM principal needs ec2:ModifyInstanceCpuOptions."
+            log_info "See the sno-virt section of README.md for the policy."
+            exit 1
+        fi
+    fi
+
+    log_warn "This stops the cluster. A SNO cluster has one node, so the whole"
+    log_warn "cluster is DOWN until the resume completes (typically 10-20 minutes)."
+    echo ""
+    log_info "Cluster:  $CLUSTER_NS"
+    log_info "Instance: $instance_id ($AWS_REGION_NAME)"
+    echo ""
+    confirm "Hibernate, enable nested virtualization, and resume?" || { log_info "Aborted"; exit 0; }
+
+    log_step "Hibernating via Hive"
+    hub patch clusterdeployment "$CLUSTER_NS" -n "$CLUSTER_NS" --type=merge \
+        -p '{"spec":{"powerState":"Hibernating"}}' >/dev/null
+    wait_for_power_state Hibernating
+
+    log_step "Waiting for the EC2 instance to stop"
+    local waited=0 state=""
+    while (( waited < TIMEOUT_POWER_STATE )); do
+        state="$(aws_ec2 describe-instances --instance-ids "$instance_id" \
+                   --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)"
+        [[ "$state" == "stopped" ]] && break
+        sleep 15; waited=$((waited + 15))
+    done
+    [[ "$state" == "stopped" ]] || { log_error "Instance did not reach 'stopped' (last: ${state:-unknown})"; exit 1; }
+    log_success "Instance stopped"
+
+    log_step "Enabling nested virtualization"
+    if ! aws_ec2 modify-instance-cpu-options --instance-id "$instance_id" \
+            --nested-virtualization enabled >/dev/null; then
+        log_error "ModifyInstanceCpuOptions failed."
+        log_info  "If this is UnauthorizedOperation, the IAM principal needs ec2:ModifyInstanceCpuOptions."
+        log_info  "See the sno-virt section of README.md for the policy."
+        log_warn  "The cluster is still hibernating — resume it with:"
+        log_warn  "  $KUBE_CLI --context=$HUB_CTX patch clusterdeployment $CLUSTER_NS -n $CLUSTER_NS --type=merge -p '{\"spec\":{\"powerState\":\"Running\"}}'"
+        exit 1
+    fi
+    log_success "Nested virtualization enabled on $instance_id"
+
+    log_step "Resuming the cluster"
+    hub patch clusterdeployment "$CLUSTER_NS" -n "$CLUSTER_NS" --type=merge \
+        -p '{"spec":{"powerState":"Running"}}' >/dev/null
+    wait_for_power_state Running
+
+    log_success "Cluster is Running with nested virtualization enabled"
+    log_info "Verify with: sno-virt check-node --spoke-context <ctx>"
+}
+
+wait_for_power_state() {
+    local want="$1" waited=0 state=""
+    log_substep "waiting for powerState=$want (timeout ${TIMEOUT_POWER_STATE}s)"
+    while (( waited < TIMEOUT_POWER_STATE )); do
+        state="$(hub_field '{.status.powerState}')"
+        [[ "$state" == "$want" ]] && { log_success "powerState=$want"; return 0; }
+        sleep 15; waited=$((waited + 15))
+    done
+    log_error "Timed out waiting for powerState=$want (last: ${state:-unknown})"
+    exit 1
+}
+
+# When --cluster is supplied, refuse to mutate a spoke that is not that cluster.
+assert_spoke_is_cluster() {
+    resolve_spoke_access
+    [[ -z "$CLUSTER_NS" ]] && { log_substep "spoke: $SPOKE_SOURCE"; return 0; }
+    resolve_cluster_ns
+    if ! spoke_matches_cluster; then
+        log_error "Spoke ($SPOKE_SOURCE) does not point at cluster '$CLUSTER_NS'"
+        log_error "  expected: $(hub_field '{.status.apiURL}')"
+        log_error "  actual:   $(spoke_api_url)"
+        exit 1
+    fi
+    log_substep "spoke: $SPOKE_SOURCE_DETAIL (verified against $CLUSTER_NS)"
+}
+
+cmd_install() {
+    assert_spoke_is_cluster
+    log_step "Installing OpenShift Virtualization ($SPOKE_SOURCE)"
+
+    # Refuse to install where KVM is unavailable — the operator would deploy but
+    # no VM could ever start.
+    local kvmdev
+    kvmdev="$(spoke get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    [[ -z "$kvmdev" ]] && { log_error "Cannot reach the spoke cluster ($SPOKE_SOURCE)"; exit 1; }
+
+    local channel csv
+    channel="$(spoke get packagemanifest kubevirt-hyperconverged -n openshift-marketplace \
+                 -o jsonpath='{.status.defaultChannel}' 2>/dev/null || true)"
+    csv="$(spoke get packagemanifest kubevirt-hyperconverged -n openshift-marketplace \
+             -o jsonpath='{.status.channels[0].currentCSV}' 2>/dev/null || true)"
+    if [[ -z "$channel" ]]; then
+        log_error "packagemanifest kubevirt-hyperconverged not found — is the redhat-operators catalog healthy?"
+        exit 1
+    fi
+    log_substep "channel: $channel"
+    log_substep "version: ${csv:-<unknown>}"
+
+    log_substep "creating Namespace, OperatorGroup and Subscription"
+    spoke apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $CNV_NS
+  labels:
+    openshift.io/cluster-monitoring: "true"
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: kubevirt-hyperconverged-group
+  namespace: $CNV_NS
+spec:
+  targetNamespaces:
+  - $CNV_NS
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: hco-operatorhub
+  namespace: $CNV_NS
+spec:
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  name: kubevirt-hyperconverged
+  channel: "$channel"
+EOF
+    log_success "Subscription created"
+
+    log_step "Waiting for the ClusterServiceVersion to succeed"
+    local waited=0 phase=""
+    while (( waited < TIMEOUT_CNV_CSV )); do
+        phase="$(spoke get csv -n "$CNV_NS" --no-headers 2>/dev/null \
+                   | awk '/kubevirt-hyperconverged-operator/ {print $NF}' | head -1 || true)"
+        [[ "$phase" == "Succeeded" ]] && break
+        [[ "$phase" == "Failed" ]] && { log_error "CSV failed"; spoke get csv -n "$CNV_NS"; exit 1; }
+        sleep 15; waited=$((waited + 15))
+    done
+    [[ "$phase" == "Succeeded" ]] || { log_error "CSV did not reach Succeeded (last: ${phase:-none})"; exit 1; }
+    log_success "Operator installed"
+
+    log_step "Creating the HyperConverged resource"
+    spoke apply -f - <<EOF >/dev/null
+apiVersion: hco.kubevirt.io/v1beta1
+kind: HyperConverged
+metadata:
+  name: kubevirt-hyperconverged
+  namespace: $CNV_NS
+spec: {}
+EOF
+
+    log_step "Waiting for HyperConverged to become available"
+    log_substep "SSPDegraded on missing CRDs is normal early in the rollout"
+    waited=0
+    local conds=""
+    while (( waited < TIMEOUT_HCO_READY )); do
+        conds="$(spoke get hco kubevirt-hyperconverged -n "$CNV_NS" \
+                   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}' 2>/dev/null || true)"
+        if [[ "$conds" == *"Available=True"* && "$conds" == *"Progressing=False"* && "$conds" == *"Degraded=False"* ]]; then
+            break
+        fi
+        sleep 20; waited=$((waited + 20))
+    done
+    if [[ "$conds" != *"Available=True"* ]]; then
+        log_error "HyperConverged did not become available in ${TIMEOUT_HCO_READY}s"
+        log_info  "Last conditions: ${conds:-<none>}"
+        exit 1
+    fi
+    log_success "HyperConverged ready: $conds"
+
+    local kvm
+    kvm="$(spoke get node -o jsonpath='{.items[0].status.allocatable.devices\.kubevirt\.io/kvm}' 2>/dev/null || true)"
+    if [[ -n "$kvm" ]]; then
+        log_success "Node advertises devices.kubevirt.io/kvm: $kvm"
+    else
+        log_error "Node does NOT advertise devices.kubevirt.io/kvm — VMs will not schedule"
+        log_info  "Check nested virtualization with: sno-virt check-node"
+        exit 1
+    fi
+    log_info "Validate with: sno-virt smoke-test $(spoke_hint)"
+}
+
+# HyperConverged reports Available long before the golden images finish
+# importing, so a smoke test started right after `install` would always find the
+# DataSource not Ready. Wait for it rather than failing.
+wait_for_datasource_ready() {
+    local name="$1" ns="openshift-virtualization-os-images"
+    local waited=0 ready="" progress=""
+    log_substep "waiting for DataSource $name to be Ready (timeout ${TIMEOUT_DATASOURCE_READY}s)"
+    while (( waited < TIMEOUT_DATASOURCE_READY )); do
+        ready="$(spoke get datasource "$name" -n "$ns" \
+                   -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}' 2>/dev/null || true)"
+        [[ "$ready" == "True" ]] && { log_success "DataSource $name: Ready"; return 0; }
+        progress="$(spoke get dv -n "$ns" --no-headers 2>/dev/null \
+                      | awk -v n="^${name}-" '$1 ~ n {p=$2" "$3} END {print p}' || true)"
+        log_substep "import: ${progress:-pending} (${waited}s)"
+        sleep 30; waited=$((waited + 30))
+    done
+    log_error "DataSource $name did not become Ready in ${TIMEOUT_DATASOURCE_READY}s (last: ${ready:-<not found>})"
+    log_info  "Check the golden image import with:"
+    log_info  "  $KUBE_CLI get datasource,dv -n $ns"
+    exit 1
+}
+
+cmd_smoke_test() {
+    assert_spoke_is_cluster
+    log_step "Booting a RHEL 9 smoke-test VM in $SMOKE_NS ($SPOKE_SOURCE)"
+
+    wait_for_datasource_ready rhel9
+
+    spoke create namespace "$SMOKE_NS" >/dev/null 2>&1 || log_substep "namespace $SMOKE_NS already exists"
+
+    # evictionStrategy: None is required on SNO — RWO storage and no second node
+    # mean the VM can never be live-migrated.
+    spoke apply -n "$SMOKE_NS" -f - <<'EOF' >/dev/null
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: rhel9-smoke
+spec:
+  runStrategy: Always
+  instancetype:
+    kind: virtualmachineclusterinstancetype
+    name: u1.medium
+  preference:
+    kind: virtualmachineclusterpreference
+    name: rhel.9
+  dataVolumeTemplates:
+  - metadata:
+      name: rhel9-smoke-root
+    spec:
+      sourceRef:
+        kind: DataSource
+        name: rhel9
+        namespace: openshift-virtualization-os-images
+      storage:
+        resources:
+          requests:
+            storage: 30Gi
+  template:
+    spec:
+      evictionStrategy: None
+      domain:
+        devices:
+          disks:
+          - name: rootdisk
+            disk:
+              bus: virtio
+          interfaces:
+          - name: default
+            masquerade: {}
+      networks:
+      - name: default
+        pod: {}
+      volumes:
+      - name: rootdisk
+        dataVolume:
+          name: rhel9-smoke-root
+EOF
+    log_success "VirtualMachine rhel9-smoke created"
+
+    log_step "Waiting for the VM to reach Running (timeout ${TIMEOUT_VM_READY}s)"
+    log_substep "the 30Gi disk clone usually dominates this wait"
+    local waited=0 phase="" dv=""
+    while (( waited < TIMEOUT_VM_READY )); do
+        phase="$(spoke get vmi rhel9-smoke -n "$SMOKE_NS" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        dv="$(spoke get dv rhel9-smoke-root -n "$SMOKE_NS" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        [[ "$phase" == "Running" ]] && break
+        if [[ "$phase" == "Failed" ]]; then
+            log_error "VMI failed"
+            spoke get vmi rhel9-smoke -n "$SMOKE_NS" \
+                -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}' || true
+            exit 1
+        fi
+        log_substep "dv=${dv:-pending} vmi=${phase:-pending} (${waited}s)"
+        sleep 30; waited=$((waited + 30))
+    done
+
+    if [[ "$phase" != "Running" ]]; then
+        log_error "VM did not reach Running in ${TIMEOUT_VM_READY}s (last: ${phase:-none}, dv=${dv:-none})"
+        spoke get vm,vmi,dv -n "$SMOKE_NS" || true
+        exit 1
+    fi
+
+    local ip
+    ip="$(spoke get vmi rhel9-smoke -n "$SMOKE_NS" -o jsonpath='{.status.interfaces[0].ipAddress}' 2>/dev/null || true)"
+    log_success "VM is Running (IP: ${ip:-<pending>})"
+    log_success "KVM works end to end on this cluster"
+    log_info "Clean up with: sno-virt cleanup $(spoke_hint)"
+}
+
+cmd_cleanup() {
+    assert_spoke_is_cluster
+    if ! spoke get namespace "$SMOKE_NS" &>/dev/null; then
+        log_info "Namespace $SMOKE_NS not present — nothing to clean up"
+        return 0
+    fi
+    confirm "Delete namespace $SMOKE_NS and everything in it?" || { log_info "Aborted"; exit 0; }
+    log_step "Deleting namespace $SMOKE_NS"
+    spoke delete namespace "$SMOKE_NS" --wait=false >/dev/null
+    log_success "Deletion started (runs in the background)"
+}
+
+# --- Full setup --------------------------------------------------------------
+# After a Hive resume the API server answers before the node is schedulable,
+# which would break the `oc debug node` that check-node relies on.
+wait_for_node_ready() {
+    local waited=0 ready=""
+    log_substep "waiting for the node to be Ready (timeout ${TIMEOUT_NODE_READY}s)"
+    while (( waited < TIMEOUT_NODE_READY )); do
+        ready="$(spoke get nodes -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+        [[ "$ready" == "True" ]] && { log_success "node Ready"; return 0; }
+        sleep 15; waited=$((waited + 15))
+    done
+    log_error "Node did not become Ready in ${TIMEOUT_NODE_READY}s (last: ${ready:-unreachable})"
+    exit 1
+}
+
+# Run the whole path end to end. Every underlying command is re-runnable
+# (enable exits early when nested virt is on, install/smoke-test use apply),
+# so a setup that fails partway can just be run again.
+cmd_setup() {
+    resolve_cluster_ns
+    resolve_spoke_access
+
+    log_step "Full OpenShift Virtualization setup for $CLUSTER_NS"
+    log_substep "hub:   $HUB_CTX"
+    log_substep "spoke: $SPOKE_SOURCE"
+    if [[ "$SKIP_SMOKE_TEST" == "true" ]]; then
+        log_substep "smoke test: skipped (--skip-smoke-test)"
+    elif [[ "$KEEP_VM" == "true" ]]; then
+        log_substep "smoke test: run, VM kept (--keep-vm)"
+    else
+        log_substep "smoke test: run, then $SMOKE_NS deleted"
+    fi
+
+    # Only tear down a smoke-test namespace that this run created.
+    local ns_preexisting=false
+    if [[ "$SKIP_SMOKE_TEST" != "true" ]] && spoke get namespace "$SMOKE_NS" &>/dev/null; then
+        ns_preexisting=true
+        log_warn "$SMOKE_NS already exists — it will be reused and NOT deleted"
+    fi
+
+    echo ""; cmd_enable
+    echo ""; log_step "Waiting for the spoke to settle"; wait_for_node_ready
+    echo ""; cmd_check_node
+    echo ""; cmd_install
+
+    if [[ "$SKIP_SMOKE_TEST" != "true" ]]; then
+        echo ""; cmd_smoke_test
+        if [[ "$KEEP_VM" == "true" || "$ns_preexisting" == "true" ]]; then
+            log_info "Keeping $SMOKE_NS — delete it with:"
+            log_info "  sno-virt cleanup $(spoke_hint) --smoke-ns $SMOKE_NS"
+        else
+            echo ""
+            log_step "Removing the smoke-test VM"
+            local prev_yes="${ACM_TOOLS_YES:-}"
+            export ACM_TOOLS_YES=true
+            cmd_cleanup
+            if [[ -n "$prev_yes" ]]; then export ACM_TOOLS_YES="$prev_yes"; else unset ACM_TOOLS_YES; fi
+        fi
+    fi
+
+    echo ""; cmd_status
+    log_success "Setup complete for $CLUSTER_NS"
+}
+
+# --- Dispatch ----------------------------------------------------------------
+resolve_hub_context
+
+case "$COMMAND" in
+    status)     cmd_status ;;
+    check-node) cmd_check_node ;;
+    enable)     cmd_enable ;;
+    install)    cmd_install ;;
+    smoke-test) cmd_smoke_test ;;
+    cleanup)    cmd_cleanup ;;
+    setup)      cmd_setup ;;
+    *)          log_error "Unknown command: $COMMAND"; usage; exit 1 ;;
+esac

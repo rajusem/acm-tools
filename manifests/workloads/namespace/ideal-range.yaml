@@ -25,11 +25,19 @@ spec:
             cpu: "50m"
             memory: "64Mi"
           limits:
-            cpu: "200m"
+            # limits.cpu MUST equal requests.cpu. The busy loop below would otherwise consume
+            # up to the LIMIT, and acm_rs:namespace:cpu_recommendation = usage * 1.10 is compared
+            # against the REQUEST — with the old 200m limit that gave 1.1*200/50 = 4.4
+            # (underestimated), the opposite of what this fixture is for. Equal request/limit lets
+            # CFS pin usage at 50m, so ratio = 1.1 * 50/50 = 1.10 -> "ideal" ([0.8,1.2] in
+            # bin/rs-e2e classify_recommendation).
+            # Margin note: 1.10 sits 8% below the 1.2 "underestimated" cutoff, so this fixture
+            # holds while recommendationPercentage stays in [80,120] (MCOA ships 110).
+            cpu: "50m"
             memory: "128Mi"
         command:
         - /bin/sh
         - -c
         - |
           dd if=/dev/zero of=/dev/shm/test bs=1M count=55 2>/dev/null
-          sleep infinity
+          while :; do :; done

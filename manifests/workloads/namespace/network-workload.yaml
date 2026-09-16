@@ -2,14 +2,16 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: network-workload
+  # DO NOT "fix" this literal — it is the sed key + file selector in rs-e2e
+  # deploy_namespace_workloads (~line 1088). Deployed name = RS_NS_WORKLOAD_NS.
   namespace: offline-workload
   labels:
     app: network
     workload-type: network
 spec:
   schedule: "*/5 * * * *"
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 1
+  successfulJobsHistoryLimit: 0
+  failedJobsHistoryLimit: 0
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
@@ -26,7 +28,8 @@ spec:
             resources:
               requests:
                 cpu: "50m"
-                memory: "64Mi"
+                # 32Mi keeps the namespace request total at 256Mi — see simple-memory-workload.yaml
+                memory: "32Mi"
               limits:
                 cpu: "200m"
                 memory: "128Mi"

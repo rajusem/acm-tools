@@ -3294,9 +3294,9 @@ phase_20() {
     # Namespace classification pairs: (namespace, expected_class, cpu_mode, mem_mode)
     # cpu_mode/mem_mode: "hard" or "soft"
     local -a ns_tests=(
-        "$RS_NS_WORKLOAD_NS:underestimated:soft:soft"
+        "$RS_NS_WORKLOAD_NS:underestimated:hard:hard"
         "$RS_NS_OVERESTIMATED_NS:overestimated:hard:hard"
-        "$RS_NS_IDEAL_NS:ideal:skip:hard"
+        "$RS_NS_IDEAL_NS:ideal:hard:hard"
     )
 
     for entry in "${ns_tests[@]}"; do
@@ -3442,17 +3442,26 @@ phase_21() {
     # (floor(request - reco) < 0, i.e. usage > request/1.1 ≈ 90.9%), under which underestimation IS
     # achievable — that is validated separately in phase_21a with the cpu-underest-vm / mem-underest-vm
     # fixtures. Do not "fix" this list to expect underestimated here.
+    # (vm_name, expected_MEMORY_class, expected_CPU_class, soft, expected_mem_request_gi)
+    # CPU is asserted separately from memory because a VM can legitimately differ on the two
+    # axes. rhel-vm1 is the case in point: memhold.service holds ~2900MiB (memory=ideal) while
+    # burning almost no CPU (cpu=overestimated, measured 0.102 and 0.123 on two runs). That is
+    # the fixture behaving correctly, not a defect — do not "fix" it to ideal. If you ever add
+    # CPU load to rhel-vm1, update its expected CPU class here too.
+    # NOTE: no VM can be expected "underestimated" on CPU here — cpu_request is the guest vCPU
+    # COUNT and usage is capped at it, so the ratio maxes at 1.1 and never crosses the 1.2
+    # cutoff. Floor-based CPU underestimation is validated in phase_21a instead.
     local -a vm_tests=(
-        "fedora-vm-1:ideal:false:4"
-        "fedora-vm-2:overestimated:false:4"
-        "rhel-vm1:ideal:true:4"
+        "fedora-vm-1:ideal:ideal:false:4"
+        "fedora-vm-2:overestimated:overestimated:false:4"
+        "rhel-vm1:ideal:overestimated:false:4"
     )
 
     for entry in "${vm_tests[@]}"; do
-        IFS=: read -r vm_name expected_class is_soft expected_mem_gi <<< "$entry"
+        IFS=: read -r vm_name expected_class expected_cpu_class is_soft expected_mem_gi <<< "$entry"
         local label_selector="name=\"$vm_name\",namespace=\"$RS_VM_WORKLOAD_NS\""
 
-        log_substep "Checking VM $vm_name (expected: $expected_class)"
+        log_substep "Checking VM $vm_name (expected: memory=$expected_class cpu=$expected_cpu_class)"
 
         local val_cpu_request="" val_cpu_usage="" val_cpu_recommendation=""
         local val_memory_request="" val_memory_usage="" val_memory_recommendation=""
@@ -3533,7 +3542,13 @@ phase_21() {
                             spoke_cpu_class=$(classify_recommendation "$spoke_cpu_rec" "$spoke_cpu_req")
                             local spoke_cpu_ratio
                             spoke_cpu_ratio=$(awk "BEGIN {printf \"%.3f\", $spoke_cpu_rec / $spoke_cpu_req}")
-                            log_info "  Spoke CPU: $spoke_cpu_class (ratio=$spoke_cpu_ratio) — informational"
+                            log_info "  Spoke CPU: $spoke_cpu_class (ratio=$spoke_cpu_ratio)"
+                            # The hub-side CPU assert below is skipped when the fallback fires,
+                            # so assert here instead — otherwise stale tier-2 data silently
+                            # disables VM CPU coverage entirely.
+                            assert_classification "cpu" "$expected_cpu_class" \
+                                "$spoke_cpu_rec" "$spoke_cpu_req" "$vm_name (spoke)" "$is_soft" || \
+                                ((errors++)) || true
                         fi
                     else
                         log_error "  Spoke Prometheus (tier-1): memory_request=$(format_bytes "$spoke_mem_req") — also inflated, fix not applied"
@@ -3557,15 +3572,14 @@ phase_21() {
             fi
         fi
 
-        # CPU classification — informational only under the ratio classifier (cpu usage is capped at
-        # the vCPU count, so ratio maxes at 1.1 and never reaches the 1.2 "underestimated" cutoff).
-        # Floor-based CPU underestimation (usage > request/1.1) is validated in phase_21a instead.
+        # CPU classification. ideal/overestimated ARE reachable and stable (fedora-vm-1 measured
+        # 1.095/1.095, fedora-vm-2 0.042/0.047, rhel-vm1 0.102/0.123 across two runs), so they are
+        # asserted against expected_cpu_class. Only "underestimated" is unreachable here — see the
+        # note on vm_tests above; phase_21a covers it with the floor-based panel query.
         if [[ "$spoke_fallback_needed" != "true" && -n "$val_cpu_request" && -n "$val_cpu_recommendation" ]]; then
-            local cpu_class
-            cpu_class=$(classify_recommendation "$val_cpu_recommendation" "$val_cpu_request")
-            local cpu_ratio
-            cpu_ratio=$(awk "BEGIN {printf \"%.3f\", $val_cpu_recommendation / $val_cpu_request}")
-            log_info "  $vm_name cpu: $cpu_class (ratio=$cpu_ratio) — VM CPU capped at vCPU count"
+            assert_classification "cpu" "$expected_cpu_class" \
+                "$val_cpu_recommendation" "$val_cpu_request" "$vm_name" "$is_soft" || \
+                ((errors++)) || true
         fi
     done
 
@@ -3740,6 +3754,7 @@ phase_21a() {
     # (assert_stat_table_match treats "both empty" as a trivial MATCH — that would silently pass even
     # if the cpu-underest-vm / mem-underest-vm fixtures failed to load or stopped underestimating).
     local cpu_underest_stat="" mem_underest_stat=""
+    local cpu_overest_stat="" mem_overest_stat=""
 
     for entry in "${pairs[@]}"; do
         IFS=: read -r label stat_tmpl_name table_tmpl_name <<< "$entry"
@@ -3757,6 +3772,8 @@ phase_21a() {
 
         [[ "$label" == "CPU Underestimation" ]] && cpu_underest_stat="$stat_val"
         [[ "$label" == "Memory Underestimation" ]] && mem_underest_stat="$stat_val"
+        [[ "$label" == "CPU Overestimation" ]] && cpu_overest_stat="$stat_val"
+        [[ "$label" == "Memory Overestimation" ]] && mem_overest_stat="$stat_val"
     done
 
     # Explicit non-empty coverage: the cpu-underest-vm and mem-underest-vm fixtures are deployed by
@@ -3783,6 +3800,27 @@ phase_21a() {
         fi
     else
         log_warn "  Memory Underestimation: mem-underest-vm not running — skipping non-empty assertion"
+    fi
+
+    # Same non-empty coverage for the OVERestimation panels. fedora-vm-2 is deployed by phase 18
+    # as the overestimated fixture (measured 2026-08-30: cpu stat=2, memory stat=7 GiB), so an
+    # empty stat here means the panel stopped reporting — which assert_stat_table_match would
+    # otherwise pass as a trivial "both empty" MATCH.
+    if vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" fedora-vm-2; then
+        if [[ -n "$cpu_overest_stat" ]] && awk "BEGIN {exit !($cpu_overest_stat > 0)}"; then
+            log_success "  CPU Overestimation: panel is reporting (stat=$cpu_overest_stat)"
+        else
+            log_error "  CPU Overestimation: fedora-vm-2 running but stat='${cpu_overest_stat:-empty}' (expected > 0)"
+            ((errors++)) || true
+        fi
+        if [[ -n "$mem_overest_stat" ]] && awk "BEGIN {exit !($mem_overest_stat > 0)}"; then
+            log_success "  Memory Overestimation: panel is reporting (stat=$(format_bytes "$mem_overest_stat"))"
+        else
+            log_error "  Memory Overestimation: fedora-vm-2 running but stat='${mem_overest_stat:-empty}' (expected > 0)"
+            ((errors++)) || true
+        fi
+    else
+        log_warn "  Overestimation panels: fedora-vm-2 not running — skipping non-empty assertions"
     fi
 
     stop_thanos_port_forward

@@ -45,7 +45,7 @@
 #   20   Namespace metrics validation (Thanos)
 #   21   VM metrics validation (Thanos)
 #   21a  VM dashboard query consistency (Thanos)
-#   21b  Stopped VM exclusion (ACM-41141)
+#   21b  Stopped VM exclusion + Perses stat check (ACM-41141, MCOA #620/#621/#623)
 #   22   Data-plane cleanup
 #
 #   Group 5: Destructive tests (MCO deletion/reinstall, runs last)
@@ -96,6 +96,7 @@ TOTAL_FAIL=0
 TOTAL_SKIP=0
 PHASE_FAIL_REASON=""
 PHASE_SKIP_REASON=""
+PHASE_PASS_NOTE=""
 E2E_START_TIME=0
 
 # =============================================================================
@@ -116,7 +117,7 @@ Options:
   --image-override       Apply existing image-override.json (no build)
   --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a)
   --release 2.16|2.17|5.0  ACM release (required when testing 5.0 images on a 2.17 cluster)
-  --skip-perses-check    Skip COO/Perses dashboard verification
+  --skip-perses-check    Skip COO/Perses dashboard verification (incl. the 21b stat-panel check)
   --yes                  Auto-confirm destructive phases (no prompts)
   -h, --help             Show this help
 
@@ -264,6 +265,7 @@ run_phase() {
 
     PHASE_FAIL_REASON=""
     PHASE_SKIP_REASON=""
+    PHASE_PASS_NOTE=""
 
     local phase_start=$SECONDS
     set +e
@@ -273,7 +275,7 @@ run_phase() {
     local phase_duration=$((SECONDS - phase_start))
 
     if [[ $rc -eq 0 ]]; then
-        record_result "$id" "$name" "PASS" "" "$phase_duration"
+        record_result "$id" "$name" "PASS" "${PHASE_PASS_NOTE:-}" "$phase_duration"
     elif [[ $rc -eq 2 ]]; then
         record_result "$id" "$name" "SKIP" "${PHASE_SKIP_REASON:-skipped}" "$phase_duration"
     else
@@ -912,7 +914,7 @@ discover_thanos_endpoint() {
     $KUBE_CLI port-forward svc/observability-thanos-query-frontend \
         -n "$OBS_NAMESPACE" 9090:9090 &>/dev/null &
     THANOS_PF_PID=$!
-    trap 'stop_thanos_port_forward; $KUBE_CLI config use-context "$ORIGINAL_CONTEXT" &>/dev/null 2>&1 || true' EXIT
+    trap e2e_on_exit EXIT
     sleep 3
     if kill -0 "$THANOS_PF_PID" 2>/dev/null; then
         THANOS_URL="http://localhost:9090"
@@ -926,7 +928,32 @@ stop_thanos_port_forward() {
     if [[ -n "$THANOS_PF_PID" ]]; then
         kill "$THANOS_PF_PID" 2>/dev/null || true
         THANOS_PF_PID=""
+        THANOS_URL=""   # the forward is gone; the next phase must rediscover the endpoint
     fi
+}
+
+# "context|namespace|vm" while phase 21b has a VM stopped, so e2e_on_exit can restart it.
+E2E_STOPPED_VM=""
+
+# Single EXIT handler. Restarts a VM that phase 21b left stopped (patch only, no wait), stops the
+# Thanos port-forward and restores the original kubeconfig context. Runs on normal exit, on a
+# `set -u` abort, on Ctrl-C and on SIGTERM (not on SIGKILL).
+e2e_on_exit() {
+    if [[ -n "${E2E_STOPPED_VM:-}" ]]; then
+        local ctx ns vm
+        IFS='|' read -r ctx ns vm <<< "$E2E_STOPPED_VM"
+        E2E_STOPPED_VM=""
+        if ! $KUBE_CLI --context="$ctx" --request-timeout=10s get vm "$vm" -n "$ns" &>/dev/null; then
+            log_warn "VM $vm on $ctx was left stopped by phase 21b but cannot be read (deleted?)"
+        elif $KUBE_CLI --context="$ctx" --request-timeout=10s patch vm "$vm" -n "$ns" \
+                --type=merge -p '{"spec":{"running":true}}' &>/dev/null; then
+            log_warn "Restarted VM $vm on $ctx (phase 21b was interrupted while it was stopped)"
+        else
+            log_error "Could not restart VM $vm on $ctx (if it still exists) — set spec.running=true on it"
+        fi
+    fi
+    stop_thanos_port_forward
+    $KUBE_CLI config use-context "${ORIGINAL_CONTEXT:-}" &>/dev/null 2>&1 || true
 }
 
 SPOKE_THANOS_HOST=""
@@ -1066,6 +1093,91 @@ thanos_query_promql() {
         [[ $attempt -lt 3 ]] && sleep 10
     done
     echo "$value"
+}
+
+# Hub Thanos clock minus the local clock, in seconds. Set once per run by e2e_sync_clock.
+E2E_CLOCK_OFFSET=""
+
+# Reads the hub Thanos clock once (an instant vector(time()) is evaluated at the server's "now"),
+# so query windows use the hub's time rather than this machine's. Returns 1 when no number comes
+# back: the endpoint answered but returned no data (token/RBAC?).
+e2e_sync_clock() {
+    [[ -n "$E2E_CLOCK_OFFSET" ]] && return 0
+    local local_now server
+    local_now=$(date +%s)
+    server=$(thanos_query_promql 'vector(time())')
+    [[ "$server" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+    E2E_CLOCK_OFFSET=$(( ${server%.*} - local_now ))
+    if [[ ${E2E_CLOCK_OFFSET#-} -gt 30 ]]; then
+        log_warn "  Local clock differs from the hub by ${E2E_CLOCK_OFFSET}s — using hub time"
+    fi
+    return 0
+}
+
+e2e_now() { echo $(( $(date +%s) + ${E2E_CLOCK_OFFSET:-0} )); }
+
+# Hub "now" rounded down to a multiple of the step. Sending an end that is already aligned keeps
+# the query-frontend's step alignment from moving it, so @ end() is evaluated exactly there.
+aligned_now() {
+    local step="${1:-60}"
+    echo $(( $(e2e_now) / step * step ))
+}
+
+# Range query (/api/v1/query_range). Prints the result matrix (.data.result) as compact JSON.
+# Returns 1 when the query fails, logging the HTTP code, curl exit code, errorType and the start of
+# the error (never headers or the token). Retries transient failures, never bad_data.
+# An empty matrix is only as trustworthy as the query path: rbac-query-proxy answers some auth
+# pre-check failures with status "success" and no data, so a check that expects "no data" must use
+# a sentinel such as "or vector(-1)".
+thanos_query_range() {
+    local query="${1:-}" start="${2:-}" end="${3:-}" step="${4:-60}"
+    local -a curl_args=(-sk --connect-timeout 10 --max-time 60 -w '\n%{http_code}')
+    [[ -n "${THANOS_TOKEN:-}" ]] && curl_args+=(-H "Authorization: Bearer $THANOS_TOKEN")
+
+    local attempt out rc http body status="" etype=""
+    for attempt in 1 2 3; do
+        out=$(curl "${curl_args[@]}" "${THANOS_URL}/api/v1/query_range" \
+            --data-urlencode "query=${query}" \
+            --data-urlencode "start=${start}" \
+            --data-urlencode "end=${end}" \
+            --data-urlencode "step=${step}" \
+            --data-urlencode "partial_response=false" 2>/dev/null) && rc=0 || rc=$?
+        http=${out##*$'\n'}
+        body=${out%$'\n'*}
+        status=$(jq -r '.status // empty' <<< "$body" 2>/dev/null) || status=""
+        [[ "$status" == "success" ]] && break
+        etype=$(jq -r '.errorType // empty' <<< "$body" 2>/dev/null) || etype=""
+        [[ "$etype" == "bad_data" ]] && break
+        [[ $attempt -lt 3 ]] && sleep 10
+    done
+    if [[ "$status" != "success" ]]; then
+        log_error "    query_range failed (http=${http:-none} curl_rc=$rc${etype:+ errorType=$etype}): $(jq -r '(.error // "")[0:300]' <<< "$body" 2>/dev/null)"
+        return 1
+    fi
+    local warnings
+    warnings=$(jq -r '(.warnings // []) | join("; ")' <<< "$body" 2>/dev/null) || warnings=""
+    [[ -n "$warnings" ]] && log_warn "    query_range warnings: $warnings" >&2
+    jq -c '.data.result' <<< "$body"
+}
+
+# Last non-null point of the first series — what a Perses StatChart with "last-number" shows.
+# Prints nothing when there is no data.
+range_last() { jq -r '.[0].values[-1][1] // empty' <<< "${1:-}" 2>/dev/null || true; }
+
+# Classifies the matrix of "(<query>) or vector(-1)": ok (one series, every point -1), stale (one
+# series with real values), multi (more than one series) or empty (no series: the query path
+# returned nothing even for vector(-1)).
+sentinel_state() {
+    [[ -n "${1:-}" ]] || { echo "empty"; return 0; }
+    jq -r 'if length == 0 then "empty"
+           elif length > 1 then "multi"
+           elif (.[0].values | length) > 0 and all(.[0].values[]; .[1] == "-1") then "ok"
+           else "stale" end' <<< "$1" 2>/dev/null || echo "empty"
+}
+
+# Last point of a sentinel matrix that is not the sentinel -1 (the value a stale panel shows).
+sentinel_last_value() {
+    jq -r '[.[0].values[]? | select(.[1] != "-1")][-1][1] // empty' <<< "${1:-}" 2>/dev/null || true
 }
 
 thanos_metric_exists() {
@@ -3597,8 +3709,12 @@ phase_21() {
 # Validates that stat panel queries (total overestimation/underestimation)
 # produce values consistent with sum(table panel per-VM values).
 # Source: multicluster-observability-addon/internal/perses/panels/rightsizing/vm-panels.go
-# Stat panels: lines 72-134 (VMTotalCPU/MemOverestimation/UnderestimationPanel)
-# Table panels: lines 181-344 (query #5 = overestimation/underestimation column)
+# Stat panels: VMTotal{CPU,Mem}{Over,Under}estimationPanel. The STAT_* templates are those queries
+#   WITHOUT the " @ end()" pinning MCOA added in #620/#621/#623: 21a and 21b Step 6 run them as
+#   instant queries, where @ end() is the evaluation time, so the results are identical. Perses
+#   runs the stat queries as range queries; phase 21b Steps 0 and 7 check the deployed, pinned
+#   queries that way, and Step 0 warns when a deployed query no longer matches its template.
+# Table panels: VM{CPU,Mem}{Over,Under}estimationTablePanel (query #5 = the estimation column).
 # If queries change in vm-panels.go, update these templates.
 # =============================================================================
 
@@ -3652,9 +3768,49 @@ subst_dashboard_vars() {
     local tmpl="$1" cluster="$2" profile="$3" namespace="$4" days="$5"
     echo "$tmpl" | sed \
         -e "s/\\\$cluster/$cluster/g" \
+        -e "s/\\\$cpu_profile/$profile/g" \
+        -e "s/\\\$memory_profile/$profile/g" \
         -e "s/\\\$profile/$profile/g" \
         -e "s/\\\$namespace/$namespace/g" \
         -e "s/\\\$days/$days/g"
+}
+
+# The deployed VM overview PersesDashboard spec, set by load_vm_overview_dashboard.
+VM_OVERVIEW_DASHBOARD_JSON=""
+
+# Loads the deployed VM overview PersesDashboard (the one with the "Total …" stat panels).
+# v1alpha1 keeps the dashboard inline in .spec; v1alpha2 nests it under .spec.config.
+load_vm_overview_dashboard() {
+    VM_OVERVIEW_DASHBOARD_JSON=$($KUBE_CLI --context="$HUB_CONTEXT" --request-timeout=10s \
+        get persesdashboard "${RS_VM_DASHBOARDS[0]}" -n "$ANALYTICS_NAMESPACE" -o json 2>/dev/null | \
+        jq -c '(.spec.config // .spec)' 2>/dev/null) || VM_OVERVIEW_DASHBOARD_JSON=""
+    [[ -n "$VM_OVERVIEW_DASHBOARD_JSON" && "$VM_OVERVIEW_DASHBOARD_JSON" != "null" ]]
+}
+
+# Prints the StatChart panel with this title from the loaded dashboard, or nothing.
+vm_stat_panel_json() {
+    jq -c --arg t "${1:-}" \
+        '[(.panels // {})[] | select(.spec.plugin.kind == "StatChart" and .spec.display.name == $t)][0] // empty' \
+        <<< "$VM_OVERVIEW_DASHBOARD_JSON" 2>/dev/null || true
+}
+
+# Adds name="<vm>" to every selector of a substituted VM dashboard query, so it only sees that VM.
+# Every selector in the VM panels ends with namespace=~"…"}.
+scope_query_to_vm() {
+    echo "${1:-}" | sed "s/namespace=~\"\([^\"]*\)\"}/namespace=~\"\1\", name=\"${2:-}\"}/g"
+}
+
+# Counts the fixed-string occurrences of $1 in $2.
+count_matches() { { grep -oF -- "${1:-}" <<< "${2:-}" || true; } | wc -l | tr -d ' '; }
+
+# The STAT_*_TMPL that mirrors the stat panel with this title (bash 3.2: no associative arrays).
+stat_template_for_title() {
+    case "${1:-}" in
+        "Total CPU Overestimation")     echo "$STAT_CPU_OVEREST_TMPL" ;;
+        "Total CPU Underestimation")    echo "$STAT_CPU_UNDEREST_TMPL" ;;
+        "Total Memory Overestimation")  echo "$STAT_MEM_OVEREST_TMPL" ;;
+        "Total Memory Underestimation") echo "$STAT_MEM_UNDEREST_TMPL" ;;
+    esac
 }
 
 assert_stat_table_match() {
@@ -3833,9 +3989,307 @@ phase_21a() {
 }
 
 # =============================================================================
-# Phase 21b: Stopped VM Exclusion (ACM-41141 regression test)
+# Phase 21b helpers: Perses stat-panel check (MCOA #620 main, #621 release-5.0, #623 release-2.17)
+# Perses runs StatChart queries as range queries and shows the last non-null point
+# ("last-number"); Table queries run as instant queries at the range end. MCOA pins the four
+# "Total …" stat queries with @ end() so a stopped VM leaves the stat totals when it leaves the
+# tables. In MCOA mode these helpers read the deployed VM overview dashboard and check that:
+#   Step 0  every stat panel is pinned (and still matches its STAT_*_TMPL), and the hub query path
+#           keeps @ end() fixed across a dashboard-length (1 week) range;
+#   Step P  both overestimation panels count the running test VM (so Step 7 cannot pass vacuously);
+#   Step 7  after the stop, neither counts it anywhere in a range that spans the stop, while the
+#           pre-fix query (no @ end()) still shows its stale value (so Step 7 would catch a regression).
+# State lives in VSC_* globals, reset at the start of every 21b run (set -u safe on bash 3.2).
+# If MCOA moves to the Perses per-query "instant" option, revisit the pin rule in Step 0.
+# =============================================================================
+
+VSC_ON=false
+VSC_NOTE=""
+VSC_ERRORS=0
+VSC_ALL_TITLES=("Total CPU Overestimation" "Total CPU Underestimation" "Total Memory Overestimation" "Total Memory Underestimation")
+VSC_TITLES=("Total CPU Overestimation" "Total Memory Overestimation")
+VSC_QUERIES=("" "")
+VSC_PINNED=(false false)
+VSC_READY=(false false)
+
+vm_stat_check_reset() {
+    VSC_ON=false
+    VSC_NOTE=""
+    VSC_ERRORS=0
+    VSC_QUERIES=("" "")
+    VSC_PINNED=(false false)
+    VSC_READY=(false false)
+}
+
+vsc_error() {
+    log_error "  $*"
+    ((VSC_ERRORS++)) || true
+}
+
+# Suffix for a 21b fail reason when Perses stat-panel checks failed before an early return.
+vsc_fail_suffix() {
+    if [[ ${VSC_ERRORS:-0} -gt 0 ]]; then
+        echo "; $VSC_ERRORS Perses stat-panel check(s) failed (MCOA #620/#621/#623)"
+    fi
+}
+
+# Step 0: gate, static checks of the deployed dashboard, template drift, the 1-week @ end() path
+# check, and the two scoped overestimation queries that Step P and Step 7 use.
+vm_stat_check_prepare() {
+    local mode="${1:-}" test_vm="${2:-}" cluster="${3:-}" profile="${4:-}" namespace="${5:-}" days="${6:-}"
+    local dashboard="${RS_VM_DASHBOARDS[0]}"
+
+    log_substep "Perses stat panels on persesdashboard/$dashboard (MCOA #620/#621/#623)"
+    if [[ "$SKIP_PERSES_CHECK" == "true" ]]; then
+        VSC_NOTE="Perses stat check skipped (--skip-perses-check)"
+        log_info "  $VSC_NOTE"
+        return 0
+    fi
+    if [[ "$mode" != "mcoa" ]]; then
+        if load_vm_overview_dashboard; then
+            log_warn "  persesdashboard/$dashboard exists in MCO mode (left over from MCOA mode?) — not checked"
+        fi
+        VSC_NOTE="Perses stat check skipped (MCO mode: Grafana stat panels are instant)"
+        log_info "  $VSC_NOTE"
+        return 0
+    fi
+    if ! load_vm_overview_dashboard; then
+        vsc_error "persesdashboard/$dashboard not found in $ANALYTICS_NAMESPACE (use --skip-perses-check to skip)"
+        return 0
+    fi
+
+    local n_stat
+    n_stat=$(jq '[(.panels // {})[] | select(.spec.plugin.kind == "StatChart")] | length' \
+        <<< "$VM_OVERVIEW_DASHBOARD_JSON" 2>/dev/null) || n_stat=0
+    if [[ "$n_stat" != "4" ]]; then
+        vsc_error "expected 4 stat panels, found ${n_stat:-0} (dashboard layout changed)"
+    fi
+
+    local title panel n_queries calc instant q q_norm tmpl i n_sel n_scoped
+    for title in "${VSC_ALL_TITLES[@]}"; do
+        # Index into VSC_TITLES; -1 for the underestimation panels (static checks only).
+        i=-1
+        [[ "$title" == "${VSC_TITLES[0]}" ]] && i=0
+        [[ "$title" == "${VSC_TITLES[1]}" ]] && i=1
+
+        panel=$(vm_stat_panel_json "$title")
+        if [[ -z "$panel" ]]; then
+            vsc_error "stat panel '$title' not found"
+            continue
+        fi
+        n_queries=$(jq '.spec.queries | length' <<< "$panel" 2>/dev/null) || n_queries=0
+        calc=$(jq -r '.spec.plugin.spec.calculation // empty' <<< "$panel" 2>/dev/null) || calc=""
+        if [[ "$n_queries" != "1" || "$calc" != "last-number" ]]; then
+            vsc_error "'$title': expected 1 query and calculation last-number, found $n_queries and '${calc:-none}' (this check emulates exactly that)"
+            continue
+        fi
+        instant=$(jq -r '.spec.queries[0].spec.plugin.spec.instant // false' <<< "$panel" 2>/dev/null) || instant=false
+        q=$(jq -r '.spec.queries[0].spec.plugin.spec.query // empty' <<< "$panel" 2>/dev/null) || q=""
+        if [[ "$instant" == "true" ]]; then
+            log_warn "  '$title' runs as an instant query — pinning not needed; relies on Perses honoring spec.instant (plugin >= 0.59), not verified"
+            VSC_NOTE="${VSC_NOTE:+$VSC_NOTE; }'$title' relies on Perses spec.instant (not verified)"
+            continue
+        fi
+
+        # Same rule as the MCOA unit test: both [$days:] subqueries and the running filter pinned.
+        if [[ "$(count_matches '[$days:] @ end()' "$q")" == "2" && "$q" == *'} @ end() > 0) > 0)'* ]]; then
+            log_success "  '$title': pinned with @ end()"
+            [[ $i -ge 0 ]] && VSC_PINNED[i]=true
+        else
+            vsc_error "'$title' is not pinned with @ end() — MCOA image lacks #620/#621/#623?"
+        fi
+
+        # Drift: without @ end() the deployed query must equal the template 21a and Step 6 use.
+        q_norm=${q//" @ end()"/}
+        q_norm=${q_norm//\$cpu_profile/\$profile}
+        q_norm=${q_norm//\$memory_profile/\$profile}
+        tmpl=$(stat_template_for_title "$title")
+        if [[ "$q_norm" != "$tmpl" ]]; then
+            log_warn "  '$title' no longer matches its STAT_*_TMPL template — update the template (21a and Step 6 compare against it)"
+        fi
+
+        [[ $i -ge 0 ]] || continue
+        q=$(subst_dashboard_vars "$q" "$cluster" "$profile" "$namespace" "$days")
+        if [[ "$q" == *'$'* ]]; then
+            vsc_error "'$title': unsubstituted variable left in the query"
+            continue
+        fi
+        q=$(scope_query_to_vm "$q" "$test_vm")
+        n_sel=$(count_matches 'namespace=~"' "$q")
+        n_scoped=$(count_matches "name=\"$test_vm\"" "$q")
+        if [[ "$n_sel" != "$n_scoped" || "$n_scoped" -lt 3 ]]; then
+            vsc_error "'$title': could not scope the query to $test_vm ($n_scoped of $n_sel selectors)"
+            continue
+        fi
+        VSC_QUERIES[i]="$q"
+        VSC_ON=true
+    done
+
+    if [[ "$VSC_ON" == "true" ]]; then
+        vm_stat_check_path
+    fi
+    return 0
+}
+
+# Step 0e: the hub query path must keep @ end() at the range end across a dashboard-length range
+# (1 week, the dashboard default), through the query-frontend's day splits. Uses no stored data:
+# every point of max_over_time(vector(time())[1m:1m] @ end()) must equal E. This exercises the
+# subquery form of @ end(); the stat queries also use the selector form, which Thanos rewrites in
+# the same function (query-frontend split_by_interval.go).
+vm_stat_check_path() {
+    local expr='max_over_time(vector(time())[1m:1m] @ end())'
+    local E m n_series n_points n_bad first last probe
+    E=$(aligned_now 600)
+    if ! m=$(thanos_query_range "$expr" $((E - 604800)) "$E" 600); then
+        vsc_error "1-week @ end() path check: query failed"
+        return 0
+    fi
+    n_series=$(jq 'length' <<< "$m" 2>/dev/null) || n_series=0
+    n_points=$(jq '[.[0].values[]?] | length' <<< "$m" 2>/dev/null) || n_points=0
+    n_bad=$(jq --arg e "$E" '[.[0].values[]? | select(.[1] != $e)] | length' <<< "$m" 2>/dev/null) || n_bad=-1
+    if [[ "$n_series" == "1" && "${n_points:-0}" -gt 0 && "$n_bad" == "0" ]]; then
+        log_success "  1-week range: @ end() stays at the range end ($n_points points)"
+        return 0
+    fi
+    first=$(jq -r '.[0].values[0][1] // "none"' <<< "$m" 2>/dev/null) || first="none"
+    last=$(jq -r '.[0].values[-1][1] // "none"' <<< "$m" 2>/dev/null) || last="none"
+    # One point at E (no split, nothing to align) tells an engine difference from a split problem.
+    probe=""
+    if m=$(thanos_query_range "$expr" "$E" "$E" 60); then
+        probe=$(range_last "$m")
+    fi
+    if [[ -n "$probe" && "$probe" != "$E" ]]; then
+        vsc_error "1-week @ end() path check: the query engine evaluates @ end() at $probe, not $E — stat panels can show stale values"
+    else
+        vsc_error "1-week @ end() path check: $n_series series, $n_bad of $n_points points differ from $E (first=$first last=$last) — the query-frontend split/alignment does not keep @ end() fixed; stat panels can show stale values"
+    fi
+    return 0
+}
+
+# Step P baseline: every scoped overestimation query must count the running test VM, so the
+# post-stop checks cannot pass for a query that never matched it. Returns 0 when all are ready.
+vm_stat_check_baseline() {
+    local i E m v all_ready=0
+    for i in 0 1; do
+        [[ -n "${VSC_QUERIES[i]:-}" ]] || continue
+        [[ "${VSC_READY[i]:-false}" == "true" ]] && continue
+        E=$(aligned_now 60)
+        if ! m=$(thanos_query_range "${VSC_QUERIES[i]}" $((E - 900)) "$E" 60); then
+            all_ready=1
+            continue
+        fi
+        v=$(range_last "$m")
+        if [[ -n "$v" ]] && awk "BEGIN {exit !($v > 0)}"; then
+            VSC_READY[i]=true
+            log_success "  '${VSC_TITLES[i]}' counts the running VM (value=$v)"
+        else
+            all_ready=1
+        fi
+    done
+    return $all_ready
+}
+
+# Step 7: with the test VM stopped and the hub no longer counting it as running, the deployed
+# (pinned) stat queries must count it nowhere in a range that spans the stop, evaluated as a range
+# query like Perses does. The pre-fix query (no @ end()) must still show its stale value, which
+# proves the range covers the VM's running period, i.e. that this check would catch a regression.
+vm_stat_check_after_stop() {
+    local test_vm="${1:-}" cluster="${2:-}" namespace="${3:-}" stop_ts="${4:-0}" hub_clear_ts="${5:-0}"
+    [[ "$VSC_ON" == "true" ]] || return 0
+
+    log_substep "Perses stat panels with $test_vm stopped (range queries, like Perses)"
+    # 7a: the end E sent below is already a multiple of the step, so the query-frontend's step
+    # alignment cannot move it. Wait once (at most 120 s) until E is past the hub clear.
+    local now_e wait_s
+    now_e=$(aligned_now 60)
+    wait_s=$(( hub_clear_ts + 5 - now_e ))
+    if [[ $wait_s -gt 0 ]]; then
+        wait_s=$(( (wait_s + 59) / 60 * 60 ))
+        [[ $wait_s -gt 120 ]] && wait_s=120
+        log_info "  Waiting ${wait_s}s so the range end is past the moment the hub stopped counting $test_vm"
+        sleep "$wait_s"
+    fi
+
+    local start=$(( (stop_ts - 900) / 60 * 60 ))
+    local running_q="max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster=\"$cluster\", namespace=~\"$namespace\", name=\"$test_vm\"} > 0) > 0"
+    local i title q E m state v attempt diag old_q
+    for i in 0 1; do
+        [[ "${VSC_READY[i]:-false}" == "true" ]] || continue
+        title="${VSC_TITLES[i]}"
+        q="${VSC_QUERIES[i]}"
+
+        # 7b: the deployed query. The sentinel makes "counted nowhere" a positive signal.
+        state="error"
+        E=0
+        m=""
+        for attempt in 1 2 3; do
+            E=$(aligned_now 60)
+            if ! m=$(thanos_query_range "($q) or vector(-1)" "$start" "$E" 60); then
+                state="error"
+                break
+            fi
+            state=$(sentinel_state "$m")
+            [[ "$state" == "stale" && $attempt -lt 3 ]] || break
+            sleep 15
+        done
+        case "$state" in
+            ok)
+                log_success "  '$title': stopped $test_vm counted nowhere in the range (range query, like Perses)" ;;
+            error)
+                vsc_error "'$title': range query failed" ;;
+            empty)
+                vsc_error "'$title': the query path returned no data even for vector(-1) (token/RBAC?)" ;;
+            multi)
+                vsc_error "'$title': returned more than one series — the stat query shape changed" ;;
+            stale)
+                v=$(sentinel_last_value "$m")
+                if [[ "${VSC_PINNED[i]:-false}" == "true" ]]; then
+                    # Diagnose without @ end(): does the hub still count the VM as running at E?
+                    diag=""
+                    if m=$(thanos_query_range "($running_q) or vector(-1)" "$E" "$E" 60); then
+                        diag=$(sentinel_state "$m")
+                    fi
+                    case "$diag" in
+                        ok)    vsc_error "'$title' still shows $v for stopped $test_vm although pinned — @ end() not honored on the query path" ;;
+                        stale) vsc_error "'$title' still shows $v for stopped $test_vm — the hub still reports it running at the range end (lag)" ;;
+                        *)     vsc_error "'$title' still shows $v for stopped $test_vm (diagnosis query: ${diag:-failed})" ;;
+                    esac
+                else
+                    vsc_error "'$title' still shows $v for stopped $test_vm — the Perses stat panel keeps counting it (MCOA #620/#621/#623 missing?)"
+                fi ;;
+            *)
+                vsc_error "'$title': unexpected result '$state'" ;;
+        esac
+
+        # 7c: control. The pre-fix query must still show the stale value over the same range.
+        [[ "${VSC_PINNED[i]:-false}" == "true" ]] || continue
+        old_q=${q//" @ end()"/}
+        v=""
+        for attempt in 1 2 3; do
+            E=$(aligned_now 60)
+            if m=$(thanos_query_range "$old_q" "$start" "$E" 60); then
+                v=$(range_last "$m")
+                if [[ -n "$v" ]] && awk "BEGIN {exit !($v > 0)}"; then
+                    break
+                fi
+            fi
+            v=""
+            [[ $attempt -lt 3 ]] && sleep 15
+        done
+        if [[ -n "$v" ]]; then
+            log_success "  control: the pre-fix query still shows a stale $v for $test_vm — this check would catch a regression"
+        else
+            vsc_error "control: the pre-fix query shows no data for stopped $test_vm — the range misses its running period, so the check above proves nothing"
+        fi
+    done
+    return 0
+}
+
+# =============================================================================
+# Phase 21b: Stopped VM Exclusion (ACM-41141 regression test) + Perses stat check
 # Stops a VM and verifies it is excluded from both stat and table queries.
-# Validates that running VM filter works end-to-end.
+# Validates that running VM filter works end-to-end. In MCOA mode it also checks
+# the deployed Perses stat panels the way Perses evaluates them (see helpers above).
 # =============================================================================
 
 phase_21b() {
@@ -3855,6 +4309,11 @@ phase_21b() {
         return 1
     fi
 
+    # fedora-vm-2 is the only fixture this phase may stop. It idles (~0.75 GiB used of a 4 GiB guest,
+    # near-zero CPU on 2 vCPUs), so it sits in BOTH overestimation panels: CPU until its 1-day max
+    # usage passes ~0.909 cores, memory until it passes ~2.73 GiB. Do not add load to fedora-vm-2.
+    # fedora-vm-1 and the underestimation fixtures start their load from cloud-init runcmd, which may
+    # not run again after a restart, so stopping them could silently break phases 21/21a.
     # Not declared local — must be visible to restart_test_vm trap handler
     test_vm="fedora-vm-2"
     if ! $KUBE_CLI --context="$VM_SPOKE_CONTEXT" get vm "$test_vm" -n "$RS_VM_WORKLOAD_NS" &>/dev/null 2>&1; then
@@ -3863,8 +4322,19 @@ phase_21b() {
     fi
 
     if ! vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm"; then
-        PHASE_FAIL_REASON="VM $test_vm is not running — cannot test stop/exclusion cycle"
-        return 1
+        # Still starting after a restart (e.g. by e2e_on_exit at the end of an interrupted run)?
+        local want_running
+        want_running=$($KUBE_CLI --context="$VM_SPOKE_CONTEXT" --request-timeout=10s get vm "$test_vm" \
+            -n "$RS_VM_WORKLOAD_NS" -o jsonpath='{.spec.running}' 2>/dev/null || echo "")
+        if [[ "$want_running" == "true" ]]; then
+            log_substep "Waiting for $test_vm to finish starting"
+            wait_until "$TIMEOUT_VM_BOOT" 10 "$test_vm running" \
+                vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm" || true
+        fi
+        if ! vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm"; then
+            PHASE_FAIL_REASON="VM $test_vm is not running — cannot test stop/exclusion cycle"
+            return 1
+        fi
     fi
 
     if [[ -z "${THANOS_URL:-}" ]]; then
@@ -3877,6 +4347,64 @@ phase_21b() {
     THANOS_TOKEN=$($KUBE_CLI whoami -t 2>/dev/null || echo "")
 
     local errors=0
+    local cluster="$VM_SPOKE_CONTEXT"
+    local profile="Max OverAll"
+    local namespace="$RS_VM_WORKLOAD_NS"
+    local days="1d"
+    local stop_ts=0 hub_clear_ts=0 E m i
+    vm_stat_check_reset
+
+    # Step C: the query path must return data at all. rbac-query-proxy answers some auth failures
+    # with "success" and no data, which would let every "excluded" check below pass vacuously.
+    log_substep "Checking that the hub Thanos query path returns data"
+    if ! e2e_sync_clock; then
+        PHASE_FAIL_REASON="Thanos query path returns no data (token/RBAC?): vector(time()) came back empty"
+        return 1
+    fi
+    E=$(aligned_now 60)
+    if ! m=$(thanos_query_range 'vector(1)' $((E - 60)) "$E" 60) || \
+            [[ "$(jq 'length' <<< "$m" 2>/dev/null)" != "1" ]]; then
+        PHASE_FAIL_REASON="Thanos query path returns no data (token/RBAC?): range query of vector(1) came back empty"
+        return 1
+    fi
+    log_success "  Query path returns data (hub clock offset ${E2E_CLOCK_OFFSET}s)"
+
+    # Step 0: Perses stat panels on the deployed dashboard (MCOA mode; static + 1-week path checks)
+    vm_stat_check_prepare "${CURRENT_MODE:-$(get_current_mode)}" "$test_vm" "$cluster" "$profile" "$namespace" "$days"
+
+    # Step P: wait until the hub counts the VM as running before stopping it. A VM restarted by an
+    # earlier run reaches the hub only with the next push (every 300 s); stopping it before that
+    # would let the exclusion checks below pass without proving anything.
+    log_substep "Waiting for hub Thanos to count $test_vm as running (up to ${TIMEOUT_HUB_METRIC_PROPAGATION}s)"
+    local running_q="max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster=\"$cluster\", namespace=\"$namespace\", name=\"$test_vm\"} > 0) > 0"
+    local running_seen=false extra_polls=0 waited=0
+    while [[ $waited -le $TIMEOUT_HUB_METRIC_PROPAGATION ]]; do
+        if [[ "$running_seen" != "true" ]]; then
+            E=$(aligned_now 60)
+            if m=$(thanos_query_range "$running_q" $((E - 60)) "$E" 60) && [[ -n "$(range_last "$m")" ]]; then
+                running_seen=true
+                log_success "  Hub Thanos counts $test_vm as running"
+            fi
+        fi
+        if [[ "$running_seen" == "true" ]]; then
+            [[ "$VSC_ON" == "true" ]] || break
+            vm_stat_check_baseline && break
+            # The baseline uses the same running filter plus 1-day rules, so it follows within a poll or two.
+            ((extra_polls++)) || true
+            [[ $extra_polls -gt 2 ]] && break
+        fi
+        sleep 30
+        waited=$((waited + 30))
+    done
+    if [[ "$running_seen" != "true" ]]; then
+        PHASE_FAIL_REASON="hub does not count running $test_vm after ${TIMEOUT_HUB_METRIC_PROPAGATION}s (restarted recently? metrics missing? token/RBAC?)$(vsc_fail_suffix)"
+        return 1
+    fi
+    for i in 0 1; do
+        if [[ -n "${VSC_QUERIES[i]:-}" && "${VSC_READY[i]:-false}" != "true" ]]; then
+            vsc_error "hub does not count running $test_vm in '${VSC_TITLES[i]}' (fixture/metrics issue) — skipping it after the stop"
+        fi
+    done
 
     # Cleanup trap: always restart the VM on exit from this function
     # Not declared local — nested functions called via trap RETURN don't inherit locals
@@ -3886,20 +4414,33 @@ phase_21b() {
         if [[ "$vm_stopped" == "true" ]]; then
             vm_stopped=false  # prevent double-execution on any stray RETURN
             log_substep "Cleanup: restarting $test_vm"
-            $KUBE_CLI --context="$VM_SPOKE_CONTEXT" patch vm "$test_vm" -n "$RS_VM_WORKLOAD_NS" \
-                --type=merge -p '{"spec":{"running":true}}' &>/dev/null || true
-            wait_until "$TIMEOUT_VM_BOOT" 10 "$test_vm running" \
-                vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm" || \
+            # E2E_STOPPED_VM stays set until the restart is confirmed, so e2e_on_exit retries a failed one.
+            if $KUBE_CLI --context="$VM_SPOKE_CONTEXT" --request-timeout=10s patch vm "$test_vm" \
+                    -n "$RS_VM_WORKLOAD_NS" --type=merge -p '{"spec":{"running":true}}' &>/dev/null; then
+                E2E_STOPPED_VM=""
+            fi
+            if wait_until "$TIMEOUT_VM_BOOT" 10 "$test_vm running" \
+                    vm_is_running "$VM_SPOKE_CONTEXT" "$RS_VM_WORKLOAD_NS" "$test_vm"; then
+                E2E_STOPPED_VM=""
+            else
                 log_warn "  $test_vm did not reach Running in ${TIMEOUT_VM_BOOT}s"
+            fi
         fi
     }
     trap restart_test_vm RETURN
 
-    # Step 1: Stop the VM
+    # Step 1: Stop the VM. Arm both restarts first: a patch can apply on the server even when the
+    # client reports an error, and an interrupt can land right after it.
     log_substep "Stopping VM $test_vm"
-    $KUBE_CLI --context="$VM_SPOKE_CONTEXT" patch vm "$test_vm" -n "$RS_VM_WORKLOAD_NS" \
-        --type=merge -p '{"spec":{"running":false}}' &>/dev/null
     vm_stopped=true
+    E2E_STOPPED_VM="$VM_SPOKE_CONTEXT|$RS_VM_WORKLOAD_NS|$test_vm"
+    stop_ts=$(e2e_now)
+    local patch_err
+    if ! patch_err=$($KUBE_CLI --context="$VM_SPOKE_CONTEXT" --request-timeout=10s patch vm "$test_vm" \
+            -n "$RS_VM_WORKLOAD_NS" --type=merge -p '{"spec":{"running":false}}' 2>&1 >/dev/null); then
+        PHASE_FAIL_REASON="could not stop $test_vm: ${patch_err:0:300}$(vsc_fail_suffix)"
+        return 1
+    fi
 
     # Step 2: Wait for VM to leave Running state
     local elapsed=0
@@ -3954,6 +4495,7 @@ phase_21b() {
         val=$(thanos_query_promql "max by (name, namespace) (kubevirt_vm_running_status_last_transition_timestamp_seconds{cluster=\"$VM_SPOKE_CONTEXT\", namespace=\"$RS_VM_WORKLOAD_NS\", name=\"$test_vm\"} > 0) > 0")
         if [[ -z "$val" ]]; then
             hub_cleared=true
+            hub_clear_ts=$(e2e_now)
             break
         fi
         ((attempt++)) || true
@@ -3967,10 +4509,6 @@ phase_21b() {
 
     # Step 5: Exclusion check — stopped VM should not appear in overestimation table
     log_substep "Exclusion check: verifying $test_vm is absent from memory overestimation query"
-    local cluster="$VM_SPOKE_CONTEXT"
-    local profile="Max OverAll"
-    local namespace="$RS_VM_WORKLOAD_NS"
-    local days="1d"
 
     local excl_query
     excl_query=$(subst_dashboard_vars \
@@ -4019,12 +4557,23 @@ phase_21b() {
             ((errors++)) || true
     done
 
+    # Step 7: Perses stat panels with the VM stopped (range queries, like Perses)
+    vm_stat_check_after_stop "$test_vm" "$cluster" "$namespace" "$stop_ts" "$hub_clear_ts"
+
     stop_thanos_port_forward
 
+    local reason=""
     if [[ $errors -gt 0 ]]; then
-        PHASE_FAIL_REASON="$errors check(s) failed with stopped VM"
+        reason="$errors ACM-41141 check(s) failed with $test_vm stopped"
+    fi
+    if [[ $VSC_ERRORS -gt 0 ]]; then
+        reason="${reason:+$reason; }$VSC_ERRORS Perses stat-panel check(s) failed (MCOA #620/#621/#623)"
+    fi
+    if [[ -n "$reason" ]]; then
+        PHASE_FAIL_REASON="$reason"
         return 1
     fi
+    PHASE_PASS_NOTE="$VSC_NOTE"
     return 0
 }
 
@@ -4184,6 +4733,7 @@ main() {
 
     init_acm_tools
     init_hub_context
+    trap e2e_on_exit EXIT   # superset of init_hub_context's trap (also restarts a VM 21b left stopped)
     detect_release
     apply_release_phase_defaults
 
@@ -4243,7 +4793,7 @@ main() {
     run_phase "20"  "Namespace metrics validation"    phase_20
     run_phase "21"  "VM metrics validation"           phase_21
     run_phase "21a" "VM dashboard query consistency"  phase_21a
-    run_phase "21b" "Stopped VM exclusion"            phase_21b
+    run_phase "21b" "Stopped VM exclusion + Perses stat check" phase_21b
     run_phase "22"  "Data-plane cleanup"              phase_22
 
     # Group 4: Destructive tests (last — MCO deletion/reinstall)

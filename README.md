@@ -457,7 +457,7 @@ bin/rs-e2e --phases 17-22 --skip-vm          # Data-plane only, no VMs
 bin/rs-e2e --build mco                       # Build MCO image, then run tests
 bin/rs-e2e --build both                      # Build MCO + MCOA images, then run tests
 bin/rs-e2e --image-override                  # Apply image-override.json, then run tests
-bin/rs-e2e --skip-perses-check               # Skip COO/Perses dashboard verification
+bin/rs-e2e --skip-perses-check               # Skip COO/Perses dashboard checks (incl. 21b stat panels)
 bin/rs-e2e mcoa                              # Force testing in MCOA mode
 ```
 
@@ -519,7 +519,7 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 20 | Namespace metrics validation | Discovers Thanos endpoint (rbac-query-proxy Route), queries all 6 `acm_rs:namespace:*` metrics for the workload namespace. Reports values or failures. |
 | 21 | VM metrics validation | Queries all 6 `acm_rs_vm:namespace:*` metrics for the VM workload namespace (ratio classifier: ideal/overestimated). Skipped with `--skip-vm`. |
 | 21a | VM dashboard stat/table consistency | Compares dashboard stat-panel totals against summed table-panel values for all 4 CPU/Memory × Over/Under categories, and asserts the underestimation fixtures (`cpu-underest-vm`, `mem-underest-vm`) actually make the floor-based Underestimation panels fire (non-zero). Skipped with `--skip-vm`. |
-| 21b | Stopped VM exclusion (ACM-41141) | Stops `fedora-vm-2` and verifies it is excluded from the running-VM-filtered stat/table queries. Skipped with `--skip-vm`. |
+| 21b | Stopped VM exclusion + Perses stat check (ACM-41141, MCOA #620/#621/#623) | Checks that the hub Thanos query path returns data, waits until the hub counts `fedora-vm-2` as running, stops it, and verifies it is excluded from the running-VM-filtered stat/table queries. In MCOA mode it also reads the deployed `acm-rightsizing-openshift-virtualization` PersesDashboard: all 4 stat panels must be pinned with `@ end()`, the query path must keep `@ end()` fixed over a 1-week range, and the CPU/Memory overestimation stat queries — run as range queries, the way Perses runs stat panels — must count the stopped VM nowhere, while the pre-fix query (no `@ end()`) still shows its stale value. The VM is restarted on exit, including after Ctrl-C. Skipped with `--skip-vm`; the Perses part is skipped in MCO mode and with `--skip-perses-check`. See [TROUBLESHOOTING](docs/TROUBLESHOOTING.md#phase-21b-perses-stat-panel-check-mcoa-620621623). |
 | 22 | Data-plane cleanup | Deletes workload namespaces from spoke clusters. Robust to unreachable spokes. |
 
 Phases 5-12, 15-16 require `--mode-switch`. Phases 17-22 require `--data-plane`. Both can be combined with explicit `--phases` selection. Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.

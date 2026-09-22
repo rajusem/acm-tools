@@ -1322,3 +1322,50 @@ in phase 21a):
 > Note: phase 21 uses the *ratio* classifier (`ratio > 1.2` = underestimated), under which VM
 > underestimation can never register (max ratio = 1.1). The floor-based panels above are validated
 > in phase 21a instead.
+
+## Phase 21b: Perses Stat-Panel Check (MCOA #620/#621/#623)
+
+**Why it exists**: Perses runs **StatChart** queries as *range* queries and shows the last non-null
+point (`calculation: "last-number"`), but runs **Table** queries as *instant* queries at the range end.
+Without `@ end()`, a stopped VM stays in the "Total … Over/Underestimation" stat panels until its last
+running point leaves the dashboard range (up to 1 week), while the tables drop it at once. MCOA pins
+the four stat queries with `@ end()` (#620 main, #621 release-5.0, #623 release-2.17). Instant-query
+checks (21a, 21b Step 6) cannot see this, because an instant query at "now" drops the VM either way.
+
+**What 21b checks** (Perses part only in MCOA mode; skipped in MCO mode and with `--skip-perses-check`):
+
+| Step | Check |
+|------|-------|
+| C | The hub query path returns data: instant `vector(time())` (also measures the hub clock) and range `vector(1)`. Runs in every mode. |
+| 0 | The deployed `acm-rightsizing-openshift-virtualization` PersesDashboard has 4 StatChart panels, each with 1 query and `last-number`, pinned like the MCOA unit test expects (`[$days:] @ end()` ×2 and a pinned running filter). Warns when a deployed query (minus `@ end()`) no longer matches its `STAT_*_TMPL`. |
+| 0e | `max_over_time(vector(time())[1m:1m] @ end())` over 1 week (step 600) returns the range end `E` at every point, i.e. the query-frontend's day splits keep `@ end()` fixed. |
+| P | Before the stop, the hub counts `fedora-vm-2` as running, and both overestimation stat queries (scoped to that VM) count it. Runs in every mode. |
+| 7 | After the stop, `(<scoped stat query>) or vector(-1)` over `[stop − 15 min, E]` is `-1` at every point (counted nowhere), while the pre-fix query (no `@ end()`) still shows the stale value (the control that proves the check can see the bug). |
+
+**Timing facts it relies on**:
+- The hub gets a new sample every 300 s (MCO `interval` default, MCOA agent scrape interval), and the
+  hub lookback is 2 × interval = 600 s. A VM restarted a moment ago is not "running" on the hub yet —
+  Step P waits for that instead of failing.
+- The Thanos query-frontend aligns `start`/`end` down to the step (`--query-range.align-range-with-step`,
+  default true) before splitting by day, and rewrites `@ end()` to that aligned end. rs-e2e therefore
+  sends an end that is already a multiple of the step, and waits until it is past the moment the hub
+  stopped counting the VM.
+- rbac-query-proxy can answer an auth pre-check failure with `status: success` and no data, so "no data"
+  is never taken as a pass: the post-stop check needs the `-1` sentinel at every point.
+
+**Failure messages**:
+
+| Message | Likely cause | What to do |
+|---------|--------------|------------|
+| `Thanos query path returns no data (token/RBAC?)` | Token without access to all clusters, expired login, proxy pre-check failure | `oc whoami` on the hub; nothing was stopped |
+| `hub does not count running fedora-vm-2 after …s` | VM (re)started less than a push ago, metrics collection broken | Rerun (the phase waits); check `kubevirt_vm_running_status_last_transition_timestamp_seconds` for the VM on the hub |
+| `'Total …' is not pinned with @ end()` / `… keeps counting it (MCOA #620/#621/#623 missing?)` | Deployed MCOA image lacks the fix (e.g. 2.17 before #623) | Product finding — check the MCOA image, do not retry |
+| `… hub still reports it running at the range end (lag)` | Hub replica lag after the retries | Rerun once |
+| `… @ end() not honored on the query path` / `1-week @ end() path check: …` | Query-frontend or query engine does not evaluate `@ end()` as Perses needs | Report with the logged values; do not retry |
+| `control: the pre-fix query shows no data …` | The range missed the VM's running period, so the check proved nothing | Check hub data for `fedora-vm-2` before the stop |
+| `persesdashboard/… not found` | COO not installed or VM right-sizing disabled (MCOA mode) | Check `oc get persesdashboard -n observability-analytics`, or use `--skip-perses-check` |
+
+**Safety**: `fedora-vm-2` is restarted when the phase returns, and also by the script's EXIT handler if
+the run is aborted (Ctrl-C, SIGTERM, a bash error) while the VM is stopped. Only `fedora-vm-2` is ever
+stopped: it idles, so it stays in both overestimation panels. `fedora-vm-1` and the underestimation
+fixtures start their load from cloud-init `runcmd`, which may not run again after a restart.

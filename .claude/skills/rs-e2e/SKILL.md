@@ -11,9 +11,9 @@ Run end-to-end validation of right-sizing resource lifecycle on the current clus
 - `--image-override` — Apply existing `image-override.json` without building
 - `--phases 0-3,5,9a` — Run specific phases (comma-separated, ranges OK)
 - `--data-plane` — Include data-plane validation phases 17-22 (deploy workloads, wait for Thanos metrics, validate)
-- `--skip-vm` — Skip VM workload phases (18, 21)
+- `--skip-vm` — Skip VM workload phases (18, 21, 21a, 21b)
 - `--no-metrics-wait` — Skip the 20-minute metrics collection wait (phase 19)
-- `--skip-perses-check` — Skip COO/Perses dashboard verification
+- `--skip-perses-check` — Skip COO/Perses dashboard verification (also skips the 21b Perses stat-panel check)
 - `--yes` / `-y` — Auto-confirm destructive phases (13, 14, 15)
 - `mco` or `mcoa` — Force testing a specific mode (default: auto-detect)
 
@@ -102,6 +102,8 @@ If phases fail, diagnose using the troubleshooting tables below and attempt a fi
 | 19 | Metrics collection wait (~20 min) | `--data-plane` | 2.16, 2.17, 5.0 |
 | 20 | Namespace metrics validation (Thanos) | `--data-plane` | 2.16, 2.17, 5.0 |
 | 21 | VM metrics validation (Thanos) | `--data-plane` | 2.16, 2.17, 5.0 |
+| 21a | VM dashboard stat/table consistency (Thanos) | `--data-plane` | 2.16, 2.17, 5.0 |
+| 21b | Stopped VM exclusion + Perses stat check (ACM-41141, MCOA #620/#621/#623; Perses part MCOA mode only) | `--data-plane` | 2.16, 2.17, 5.0 |
 | 22 | Data-plane cleanup | `--data-plane` | 2.16, 2.17, 5.0 |
 
 ## Troubleshooting failures
@@ -134,6 +136,14 @@ If the script fails or a phase reports FAIL:
 8. **Stuck ManifestWorks blocking phases 5/14**: The script calls `cleanup_stuck_mcoa_mw()` at phase 5 entry and passes `--force-cleanup-mw` to `setup-observability install` in reinstall phases. If ManifestWorks are stuck in Deleting on `local-cluster`, the script handles it automatically.
 
 9. **Stock ACM image limitations**: Stock ACM 2.16.0 image does NOT clean up RS resources on MCO deletion and does NOT support MCOA mode. Use custom images (via `--build` or `--image-override`) for full test coverage.
+
+10. **Phase 21b failures** (details: `docs/TROUBLESHOOTING.md`, section "Phase 21b: Perses Stat-Panel Check"):
+   - `Thanos query path returns no data (token/RBAC?)` — rbac-query-proxy answered with no data. Check `oc whoami` on the hub and the user's cluster access. Nothing was stopped.
+   - `hub does not count running fedora-vm-2 after …s` — the VM was (re)started less than one metrics push (300 s) ago, or its metrics are not collected. Rerunning is safe; the phase waits up to `TIMEOUT_HUB_METRIC_PROPAGATION`.
+   - `'Total … Overestimation' is not pinned with @ end()` / `… keeps counting it (MCOA #620/#621/#623 missing?)` — the deployed MCOA image lacks the fix (e.g. 2.17 before #623). A product finding, not an infra problem — do not retry.
+   - `… (lag)` — the hub still counted the VM as running at the range end after retries; rerun once.
+   - `@ end() not honored` / `1-week @ end() path check …` — the hub query path (query-frontend / query engine) does not evaluate `@ end()` as Perses needs. Report it; do not retry.
+   - `control: the pre-fix query shows no data …` — the range did not cover the VM's running period, so the check proved nothing. Check hub metrics for `fedora-vm-2` before the stop.
 
 ## Environment variables
 

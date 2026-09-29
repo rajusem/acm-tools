@@ -94,7 +94,7 @@ oc --context=hub logs -n open-cluster-management-observability \
   -l app.kubernetes.io/name=thanos-compact --tail=10 | grep -i 'Bucket quota\|error'
 ```
 
-If `Bucket quota exceeded`: the MinIO/S3 bucket backing object storage is full. Fix by increasing bucket quota or applying retention config. See TROUBLESHOOTING.md "Thanos Receive PVC Full / Bucket Quota Exceeded".
+If `Bucket quota exceeded`: the S3 bucket backing object storage (SeaweedFS, MinIO, or external S3) is full. Fix by increasing bucket quota or applying retention config. See TROUBLESHOOTING.md "Thanos Receive PVC Full / Bucket Quota Exceeded".
 
 **Thanos compact crash**: If compact is in CrashLoopBackOff, check for `retentionResolution5m` set below 11 days:
 

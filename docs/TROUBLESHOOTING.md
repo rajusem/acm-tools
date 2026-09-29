@@ -1115,7 +1115,7 @@ oc get mco observability 2>&1  # should be NotFound
 
 **Symptom**: MCO shows `Failed` with `StatefulSetNotReady`. One or more `observability-thanos-receive-default-*` pods are `0/1` with hundreds of restarts. RS Policies may disappear. No new metrics reach Thanos.
 
-**Root cause**: The MinIO/S3 bucket backing object storage hit its quota. Thanos receive can't upload blocks → local TSDB fills the PVC → pod crashes → StatefulSet not ready → MCO Failed.
+**Root cause**: The S3 bucket (SeaweedFS, MinIO, or external) backing object storage hit its quota. Thanos receive can't upload blocks → local TSDB fills the PVC → pod crashes → StatefulSet not ready → MCO Failed.
 
 **Diagnosis**:
 ```bash
@@ -1132,7 +1132,7 @@ oc logs -n open-cluster-management-observability -l app.kubernetes.io/name=thano
 oc exec observability-thanos-receive-default-2 -n open-cluster-management-observability -- df -h /var/thanos/receive
 ```
 
-**Fix**: Increase the MinIO bucket quota or reduce retention to free space. The bucket quota must be increased first — without it, receive and compact can't upload regardless of PVC size.
+**Fix**: Increase the bucket quota or reduce retention to free space. The bucket quota must be increased first — without it, receive and compact can't upload regardless of PVC size.
 
 ```bash
 # Option 1: Increase bucket quota (from MinIO admin)

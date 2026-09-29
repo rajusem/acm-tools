@@ -43,6 +43,7 @@ usage() {
 }
 
 create_manifests_if_missing() {
+    local skip_object_store="${1:-false}"
     mkdir -p "$MANIFESTS_DIR"
 
     # Namespace
@@ -141,9 +142,11 @@ EOF
 
     # Thanos object storage secret. A file generated before the SeaweedFS switch
     # still points at the MinIO service; regenerate it so MCO does not keep
-    # talking to MinIO. Hand-edited files for external storage are left alone.
+    # talking to MinIO. Hand-edited files for external storage are left alone,
+    # and so is the MinIO file under --skip-object-store (a user-run MinIO).
     local secret_file="$MANIFESTS_DIR/thanos-object-storage-secret.yaml"
-    if [[ -f "$secret_file" ]] && grep 'minio.open-cluster-management-observability.svc' "$secret_file" >/dev/null; then
+    if [[ "$skip_object_store" == "false" && -f "$secret_file" ]] && \
+        grep 'minio.open-cluster-management-observability.svc' "$secret_file" >/dev/null; then
         log_warn "Regenerating $secret_file (it still points at the old MinIO endpoint)"
         rm -f "$secret_file"
     fi
@@ -182,6 +185,14 @@ spec:
       name: thanos-object-storage
 EOF
     fi
+}
+
+# existing_storage_endpoint prints the S3 endpoint of the in-cluster
+# thanos-object-storage secret, or nothing if the secret does not exist.
+# Only the endpoint is printed, never the credentials.
+existing_storage_endpoint() {
+    get_resource_field secret thanos-object-storage "$OBS_NAMESPACE" '{.data.thanos\.yaml}' | \
+        base64 -d 2>/dev/null | awk '$1 == "endpoint:" { gsub(/["\047]/, "", $2); print $2; exit }' || true
 }
 
 # detect_stuck_manifestworks outputs "cluster/mw-name|deletionTimestamp|age_seconds"
@@ -269,7 +280,7 @@ do_install() {
         esac
     done
 
-    create_manifests_if_missing
+    create_manifests_if_missing "$skip_object_store"
 
     log_step "Setting up MCO Observability"
     echo ""
@@ -301,8 +312,20 @@ EOF
         log_info "You may need to create it manually"
     fi
 
-    # 3. SeaweedFS
-    if [[ "$skip_object_store" == "false" ]]; then
+    # An existing thanos-object-storage secret is kept as-is: `uninstall` keeps
+    # storage, and rs-e2e reinstalls unattended, so overwriting it would silently
+    # move MCO to empty storage (e.g. from external S3 to in-cluster SeaweedFS).
+    local keep_secret=false existing_endpoint=""
+    if resource_exists secret thanos-object-storage "$OBS_NAMESPACE"; then
+        keep_secret=true
+        existing_endpoint=$(existing_storage_endpoint)
+    fi
+
+    # 3. SeaweedFS — skipped when the kept secret points somewhere else
+    if [[ "$skip_object_store" == "false" && "$keep_secret" == "true" && \
+          "$existing_endpoint" != seaweedfs* ]]; then
+        log_info "Existing object storage secret points at '${existing_endpoint:-unknown}' — not deploying SeaweedFS"
+    elif [[ "$skip_object_store" == "false" ]]; then
         log_substep "Deploying SeaweedFS"
         $KUBE_CLI apply -f "$MANIFESTS_DIR/seaweedfs-deployment.yaml"
         $KUBE_CLI apply -f "$MANIFESTS_DIR/seaweedfs-service.yaml"
@@ -313,8 +336,20 @@ EOF
     fi
 
     # 4. Thanos object storage secret
-    log_substep "Creating Thanos object storage secret"
-    $KUBE_CLI apply -f "$MANIFESTS_DIR/thanos-object-storage-secret.yaml"
+    if [[ "$keep_secret" == "true" ]]; then
+        log_info "Keeping existing Thanos object storage secret (endpoint: ${existing_endpoint:-unknown})"
+        if [[ "$existing_endpoint" != seaweedfs* ]]; then
+            log_info "  To switch to in-cluster SeaweedFS, delete secret thanos-object-storage in $OBS_NAMESPACE and re-run"
+        fi
+    else
+        if [[ "$skip_object_store" == "true" ]] && \
+            grep 'seaweedfs.open-cluster-management-observability.svc' "$MANIFESTS_DIR/thanos-object-storage-secret.yaml" >/dev/null; then
+            log_warn "--skip-object-store is set, but $MANIFESTS_DIR/thanos-object-storage-secret.yaml points at in-cluster SeaweedFS"
+            log_warn "  Edit it to point at your object storage, or MCO will not reach any storage"
+        fi
+        log_substep "Creating Thanos object storage secret"
+        $KUBE_CLI apply -f "$MANIFESTS_DIR/thanos-object-storage-secret.yaml"
+    fi
 
     # 4.5 Check for stuck ManifestWorks
     local stuck_mws
@@ -534,7 +569,7 @@ do_status() {
 
     # Object storage secret
     if resource_exists secret thanos-object-storage "$OBS_NAMESPACE"; then
-        log_success "Thanos object storage secret: exists"
+        log_success "Thanos object storage secret: exists (endpoint: $(existing_storage_endpoint))"
     else
         log_warn "Thanos object storage secret: not found"
     fi

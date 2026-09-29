@@ -1,18 +1,18 @@
 #!/bin/bash
 # =============================================================================
-# setup-observability — Bootstrap MCO on a hub cluster with Minio storage
+# setup-observability — Bootstrap MCO on a hub cluster with SeaweedFS storage
 # =============================================================================
 #
 # Usage:
 #   setup-observability [options]
-#   setup-observability --skip-minio          # Use existing object storage
+#   setup-observability --skip-object-store   # Use existing object storage
 #   setup-observability --enable-rightsizing   # Also enable right-sizing
 #   setup-observability --status              # Show observability status
 #
 # Sets up:
 #   1. Observability namespace
 #   2. Pull secret
-#   3. Minio (optional in-cluster object storage)
+#   3. SeaweedFS (optional in-cluster S3 object storage)
 #   4. Thanos object storage secret
 #   5. MultiClusterObservability CR
 # =============================================================================
@@ -32,16 +32,18 @@ usage() {
     echo "  status      Show observability installation status"
     echo ""
     echo "Options (for install):"
-    echo "  --skip-minio            Don't install Minio (use existing object storage)"
+    echo "  --skip-object-store     Don't install SeaweedFS (use existing object storage)"
+    echo "                          (--skip-minio is kept as an alias)"
     echo "  --enable-rightsizing    Enable right-sizing after setup"
     echo "  --mcoa-mode             Also set MCOA right-sizing annotation"
     echo "  --force-cleanup-mw      Remove finalizers from stuck MCOA ManifestWorks (local-cluster)"
     echo "  --wait-timeout N        Wait timeout in seconds (default: 300)"
     echo ""
-    echo "Note: Minio uses dev-only credentials (minio/minio123). Do not use on shared clusters."
+    echo "Note: SeaweedFS uses dev-only credentials and ephemeral storage. Do not use on shared clusters."
 }
 
 create_manifests_if_missing() {
+    local skip_object_store="${1:-false}"
     mkdir -p "$MANIFESTS_DIR"
 
     # Namespace
@@ -54,76 +56,102 @@ metadata:
 EOF
     fi
 
-    # Minio Deployment (dev-only credentials: minio/minio123 — do not use on shared clusters)
-    if [[ ! -f "$MANIFESTS_DIR/minio-deployment.yaml" ]]; then
-        cat > "$MANIFESTS_DIR/minio-deployment.yaml" <<'EOF'
+    # SeaweedFS Deployment (dev-only credentials — do not use on shared clusters).
+    # Mirrors dev-scripts/manifests/storage/seaweedfs-deployment.yaml in the MCO
+    # repo, which replaced MinIO (quay.io/minio/minio:latest is no longer available).
+    # emptyDir: data is lost on pod restart, same as the previous MinIO setup.
+    if [[ ! -f "$MANIFESTS_DIR/seaweedfs-deployment.yaml" ]]; then
+        cat > "$MANIFESTS_DIR/seaweedfs-deployment.yaml" <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: minio
+  name: seaweedfs
   namespace: open-cluster-management-observability
+  labels:
+    app.kubernetes.io/name: seaweedfs
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: minio
+      app.kubernetes.io/name: seaweedfs
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
-        app: minio
+        app.kubernetes.io/name: seaweedfs
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-        - name: minio
-          image: quay.io/minio/minio:latest
-          command:
-            - /bin/sh
-            - -c
-            - |
-              mkdir -p /data/thanos
-              minio server /data --console-address ":9001"
+        - name: seaweedfs
+          # Override args (not command) so the image entrypoint still dispatches
+          # to `mini`; WebDAV and Iceberg listeners are not needed.
+          args:
+            - mini
+            - -dir=/data
+            - -webdav=false
+            - -s3.port.iceberg=0
+          image: chrislusf/seaweedfs:4.29
+          imagePullPolicy: IfNotPresent
           env:
-            - name: MINIO_ROOT_USER
-              value: minio
-            - name: MINIO_ROOT_PASSWORD
-              value: minio123
+            - name: AWS_ACCESS_KEY_ID
+              value: seaweedfsadmin
+            - name: AWS_SECRET_ACCESS_KEY
+              value: seaweedfsadmin
+            - name: S3_BUCKET
+              value: thanos
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
-            - containerPort: 9000
-            - containerPort: 9001
+            - name: s3
+              containerPort: 8333
+              protocol: TCP
           volumeMounts:
-            - name: data
+            - name: storage
               mountPath: /data
       volumes:
-        - name: data
+        - name: storage
           emptyDir: {}
 EOF
     fi
 
-    # Minio Service
-    if [[ ! -f "$MANIFESTS_DIR/minio-service.yaml" ]]; then
-        cat > "$MANIFESTS_DIR/minio-service.yaml" <<'EOF'
+    # SeaweedFS Service
+    if [[ ! -f "$MANIFESTS_DIR/seaweedfs-service.yaml" ]]; then
+        cat > "$MANIFESTS_DIR/seaweedfs-service.yaml" <<'EOF'
 apiVersion: v1
 kind: Service
 metadata:
-  name: minio
+  name: seaweedfs
   namespace: open-cluster-management-observability
 spec:
+  type: ClusterIP
   ports:
-    - port: 9000
-      targetPort: 9000
+    - port: 8333
+      targetPort: 8333
       protocol: TCP
-      name: api
-    - port: 9001
-      targetPort: 9001
-      protocol: TCP
-      name: console
+      name: s3
   selector:
-    app: minio
+    app.kubernetes.io/name: seaweedfs
 EOF
     fi
 
-    # Thanos object storage secret
-    if [[ ! -f "$MANIFESTS_DIR/thanos-object-storage-secret.yaml" ]]; then
-        cat > "$MANIFESTS_DIR/thanos-object-storage-secret.yaml" <<'EOF'
+    # Thanos object storage secret. A file generated before the SeaweedFS switch
+    # still points at the MinIO service; regenerate it so MCO does not keep
+    # talking to MinIO. Hand-edited files for external storage are left alone,
+    # and so is the MinIO file under --skip-object-store (a user-run MinIO).
+    local secret_file="$MANIFESTS_DIR/thanos-object-storage-secret.yaml"
+    if [[ "$skip_object_store" == "false" && -f "$secret_file" ]] && \
+        grep 'minio.open-cluster-management-observability.svc' "$secret_file" >/dev/null; then
+        log_warn "Regenerating $secret_file (it still points at the old MinIO endpoint)"
+        rm -f "$secret_file"
+    fi
+    if [[ ! -f "$secret_file" ]]; then
+        cat > "$secret_file" <<'EOF'
 apiVersion: v1
 kind: Secret
 metadata:
@@ -135,10 +163,10 @@ stringData:
     type: s3
     config:
       bucket: thanos
-      endpoint: minio.open-cluster-management-observability.svc:9000
+      endpoint: seaweedfs.open-cluster-management-observability.svc:8333
       insecure: true
-      access_key: minio
-      secret_key: minio123
+      access_key: seaweedfsadmin
+      secret_key: seaweedfsadmin
 EOF
     fi
 
@@ -157,6 +185,14 @@ spec:
       name: thanos-object-storage
 EOF
     fi
+}
+
+# existing_storage_endpoint prints the S3 endpoint of the in-cluster
+# thanos-object-storage secret, or nothing if the secret does not exist.
+# Only the endpoint is printed, never the credentials.
+existing_storage_endpoint() {
+    get_resource_field secret thanos-object-storage "$OBS_NAMESPACE" '{.data.thanos\.yaml}' | \
+        base64 -d 2>/dev/null | awk '$1 == "endpoint:" { gsub(/["\047]/, "", $2); print $2; exit }' || true
 }
 
 # detect_stuck_manifestworks outputs "cluster/mw-name|deletionTimestamp|age_seconds"
@@ -227,7 +263,7 @@ cleanup_stuck_manifestworks() {
 }
 
 do_install() {
-    local skip_minio=false
+    local skip_object_store=false
     local enable_rs=false
     local mcoa_mode=false
     local force_cleanup=false
@@ -235,7 +271,7 @@ do_install() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --skip-minio)         skip_minio=true; shift ;;
+            --skip-object-store|--skip-minio) skip_object_store=true; shift ;;
             --enable-rightsizing)  enable_rs=true; shift ;;
             --mcoa-mode)          mcoa_mode=true; enable_rs=true; shift ;;
             --force-cleanup-mw)   force_cleanup=true; shift ;;
@@ -244,7 +280,7 @@ do_install() {
         esac
     done
 
-    create_manifests_if_missing
+    create_manifests_if_missing "$skip_object_store"
 
     log_step "Setting up MCO Observability"
     echo ""
@@ -276,20 +312,44 @@ EOF
         log_info "You may need to create it manually"
     fi
 
-    # 3. Minio
-    if [[ "$skip_minio" == "false" ]]; then
-        log_substep "Deploying Minio"
-        $KUBE_CLI apply -f "$MANIFESTS_DIR/minio-deployment.yaml"
-        $KUBE_CLI apply -f "$MANIFESTS_DIR/minio-service.yaml"
+    # An existing thanos-object-storage secret is kept as-is: `uninstall` keeps
+    # storage, and rs-e2e reinstalls unattended, so overwriting it would silently
+    # move MCO to empty storage (e.g. from external S3 to in-cluster SeaweedFS).
+    local keep_secret=false existing_endpoint=""
+    if resource_exists secret thanos-object-storage "$OBS_NAMESPACE"; then
+        keep_secret=true
+        existing_endpoint=$(existing_storage_endpoint)
+    fi
 
-        log_substep "Waiting for Minio to be ready"
-        $KUBE_CLI rollout status deployment/minio -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s"
-        log_success "Minio is running"
+    # 3. SeaweedFS — skipped when the kept secret points somewhere else
+    if [[ "$skip_object_store" == "false" && "$keep_secret" == "true" && \
+          "$existing_endpoint" != seaweedfs* ]]; then
+        log_info "Existing object storage secret points at '${existing_endpoint:-unknown}' — not deploying SeaweedFS"
+    elif [[ "$skip_object_store" == "false" ]]; then
+        log_substep "Deploying SeaweedFS"
+        $KUBE_CLI apply -f "$MANIFESTS_DIR/seaweedfs-deployment.yaml"
+        $KUBE_CLI apply -f "$MANIFESTS_DIR/seaweedfs-service.yaml"
+
+        log_substep "Waiting for SeaweedFS to be ready"
+        $KUBE_CLI rollout status deployment/seaweedfs -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s"
+        log_success "SeaweedFS is running"
     fi
 
     # 4. Thanos object storage secret
-    log_substep "Creating Thanos object storage secret"
-    $KUBE_CLI apply -f "$MANIFESTS_DIR/thanos-object-storage-secret.yaml"
+    if [[ "$keep_secret" == "true" ]]; then
+        log_info "Keeping existing Thanos object storage secret (endpoint: ${existing_endpoint:-unknown})"
+        if [[ "$existing_endpoint" != seaweedfs* ]]; then
+            log_info "  To switch to in-cluster SeaweedFS, delete secret thanos-object-storage in $OBS_NAMESPACE and re-run"
+        fi
+    else
+        if [[ "$skip_object_store" == "true" ]] && \
+            grep 'seaweedfs.open-cluster-management-observability.svc' "$MANIFESTS_DIR/thanos-object-storage-secret.yaml" >/dev/null; then
+            log_warn "--skip-object-store is set, but $MANIFESTS_DIR/thanos-object-storage-secret.yaml points at in-cluster SeaweedFS"
+            log_warn "  Edit it to point at your object storage, or MCO will not reach any storage"
+        fi
+        log_substep "Creating Thanos object storage secret"
+        $KUBE_CLI apply -f "$MANIFESTS_DIR/thanos-object-storage-secret.yaml"
+    fi
 
     # 4.5 Check for stuck ManifestWorks
     local stuck_mws
@@ -493,19 +553,23 @@ do_status() {
         fi
     done
 
-    # Minio
+    # In-cluster object storage (SeaweedFS; MinIO on hubs set up before the switch)
     echo ""
-    if resource_exists deployment minio "$OBS_NAMESPACE"; then
-        local minio_ready
-        minio_ready=$(get_resource_field deployment minio "$OBS_NAMESPACE" '{.status.readyReplicas}')
-        log_success "Minio: ${minio_ready:-0} ready"
-    else
-        log_info "Minio: not deployed (using external storage)"
+    local store store_ready found_store=false
+    for store in seaweedfs minio; do
+        if resource_exists deployment "$store" "$OBS_NAMESPACE"; then
+            store_ready=$(get_resource_field deployment "$store" "$OBS_NAMESPACE" '{.status.readyReplicas}')
+            log_success "Object storage ($store): ${store_ready:-0} ready"
+            found_store=true
+        fi
+    done
+    if [[ "$found_store" == "false" ]]; then
+        log_info "Object storage: no in-cluster store deployed (using external storage)"
     fi
 
     # Object storage secret
     if resource_exists secret thanos-object-storage "$OBS_NAMESPACE"; then
-        log_success "Thanos object storage secret: exists"
+        log_success "Thanos object storage secret: exists (endpoint: $(existing_storage_endpoint))"
     else
         log_warn "Thanos object storage secret: not found"
     fi

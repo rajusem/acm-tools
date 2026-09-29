@@ -142,11 +142,11 @@ The dev catalog image defaults to `quay.io:443/acm-d/mce-dev-catalog:latest-5.0`
 
 ### setup-observability
 
-Bootstrap MCO observability on a hub cluster with Minio storage.
+Bootstrap MCO observability on a hub cluster with SeaweedFS storage (in-cluster S3, dev-only, ephemeral).
 
 ```bash
-bin/setup-observability                      # Full setup with Minio
-bin/setup-observability --skip-minio         # Use existing object storage
+bin/setup-observability                      # Full setup with SeaweedFS
+bin/setup-observability --skip-object-store  # Use existing object storage (--skip-minio still works)
 bin/setup-observability --enable-rightsizing  # Also enable right-sizing
 bin/setup-observability --mcoa-mode          # Enable right-sizing in MCOA mode
 bin/setup-observability --force-cleanup-mw   # Clean stuck ManifestWorks before install

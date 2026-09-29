@@ -344,7 +344,7 @@ check_thanos_health() {
 
     if [[ -n "$bucket_err" ]]; then
         add_issue "FAIL" "Object storage: Bucket quota exceeded" \
-            "Increase MinIO bucket quota, or apply retention config (WARNING: reduces data retention):
+            "Increase the object storage bucket quota, or apply retention config (WARNING: reduces data retention):
          oc patch mco observability --type merge -p '{\"spec\":{\"advanced\":{\"retentionConfig\":{\"retentionResolutionRaw\":\"5d\",\"retentionResolution5m\":\"14d\",\"retentionResolution1h\":\"30d\"}}}}'"
     fi
 

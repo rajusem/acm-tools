@@ -566,6 +566,14 @@ Checks 5 areas: Infrastructure (node health, operator pods, image overrides), Ob
 
 The `analyze` subcommand examines collected data offline (no cluster connection needed) and checks for: pod health, ADC state consistency, resource mismatches, ManifestWork generation lag, log errors/panics, and missing ConfigMaps.
 
+## Utilities
+
+Stand-alone helpers in `utility/`. They never connect to a cluster. Usage: [utility/README.md](utility/README.md).
+
+| Utility | Purpose |
+|---------|---------|
+| `konflux-pr-image.py` | Find the Konflux image built for a GitHub PR: build status, image, quay.io expiry, and `image-override.json` entries |
+
 ## Claude Code Skills
 
 Interactive workflows available as `/skill-name` slash commands in Claude Code. These automate multi-step processes that combine CLI tools with external services.
@@ -644,6 +652,7 @@ acm-tools/
   image-override.json      # Image override entries (edit to add/remove images)
   lib/common.sh            # Shared library (logging, helpers, constants)
   bin/                     # Tool scripts (all executable)
+  utility/                 # Stand-alone helpers (usage: utility/README.md)
   install-custom-acm/      # Pull secret for ACM install
     pull-secret.json       # Your quay.io pull secret (gitignored)
     pull-secret.json.example

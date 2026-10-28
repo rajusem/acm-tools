@@ -26,6 +26,7 @@ acm-tools/
   image-override.json    # Image override entries (edit to add/remove images)
   lib/common.sh          # Shared library (logging, helpers, constants)
   bin/                   # Tool scripts (all executable, bash)
+  utility/               # Stand-alone helpers, Python (usage: utility/README.md)
   install-custom-acm/    # Pull secret directory
   manifests/             # Generated YAML manifests
   .claude/skills/        # Claude Code skill definitions (rs-e2e, cluster-debug, etc.)
@@ -48,6 +49,8 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 | `cluster-diagnose` | Automated cluster health diagnostic (16 checks, issues + fix commands) |
 | `add-managed-cluster` | Import/re-import managed clusters (klusterlet cleanup, pull secret sync) |
 | `sno-virt` | Enable/validate OpenShift Virtualization on an AWS SNO cluster (EC2 nested virt) |
+
+Stand-alone helpers (Python, no cluster access) live in `utility/`; see `utility/README.md`.
 
 ## Configuration
 

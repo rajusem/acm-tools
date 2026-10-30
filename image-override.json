@@ -1,13 +1,13 @@
 [
   {
     "image-name": "multicluster-observability-operator",
-    "image-tag": "v212_prometheus_evaluation_time",
+    "image-tag": "v213_prometheus_evaluation_time",
     "image-remote": "quay.io/rzalavad",
     "image-key": "multicluster_observability_operator"
   },
   {
     "image-name": "multicluster-observability-addon",
-    "image-tag": "v212_prometheus_evaluation_time",
+    "image-tag": "v213_prometheus_evaluation_time",
     "image-remote": "quay.io/rzalavad",
     "image-key": "multicluster_observability_addon"
   }

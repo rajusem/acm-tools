@@ -3642,11 +3642,12 @@ phase_10b() {
     $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
         -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || \
         log_warn "MCOA rollout status timed out — continuing"
-    # Re-patch after the restart so the fresh cold cache receives a guaranteed
-    # UpdateFunc event.  Without this, MCOA's initial list-watch sync may not
-    # trigger a reconcile for the existing invalid values within the timeout.
-    patch_rs_rule_config rs-namespace-config evaluationInterval 3m || true
-    patch_rs_rule_config rs-namespace-config evaluationInterval1d 12h || true
+    # Re-patch to a *different* invalid value after the restart so the fresh
+    # cold cache receives a guaranteed UpdateFunc event.  Kubernetes only fires
+    # an update event when the value actually changes, so re-patching the same
+    # value (3m) would be a no-op and MCOA would never receive the trigger.
+    patch_rs_rule_config rs-namespace-config evaluationInterval 1m || true
+    patch_rs_rule_config rs-namespace-config evaluationInterval1d 7h || true
     wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "cold-cache rolling interval default" \
         wait_rs_config_value rs-namespace-config evaluationInterval "$RS_EVAL_INTERVAL_DEFAULT" || ((errors++)) || true
     wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "cold-cache daily interval default" \

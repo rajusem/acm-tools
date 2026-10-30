@@ -33,6 +33,85 @@ SPOKE_FILTER_SET=false
 WATCH_MODE=false
 JSON_MODE=false
 
+status_config_value() {
+    local cm="$1" key="$2" value
+    value=$(rs_rule_config_get "$(rs_rule_config_from_cluster "$cm" "$OBS_NAMESPACE" 2>/dev/null || true)" "$key" 2>/dev/null || true)
+    printf '%s\n' "$value"
+}
+
+status_rendered_interval() {
+    local cm="$1" kind="$2" rule_name suffix mc_list mc mw value
+    if [[ "$cm" == "rs-namespace-config" ]]; then
+        rule_name="acm-rs-namespace-prometheus-rules"
+        [[ "$kind" == "rolling" ]] && suffix="-5m.rule" || suffix="-1d"
+    else
+        rule_name="acm-rs-virt-prometheus-rules"
+        [[ "$kind" == "rolling" ]] && suffix="-5m.rule" || suffix="-1d"
+    fi
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            value=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null | jq -r \
+                --arg rule "$rule_name" --arg suffix "$suffix" '
+                [ .spec.workload.manifests[]? | select(.kind == "PrometheusRule" and .metadata.name == $rule) |
+                  .spec.groups[]? | select(.name | endswith($suffix)) | .interval ] | .[0] // empty
+            ' 2>/dev/null || true)
+            if [[ -n "$value" ]]; then
+                printf '%s\n' "$value"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+status_rs_config_json() {
+    local cm="$1" value value_1d rendered rendered_1d source
+    value=$(status_config_value "$cm" evaluationInterval)
+    value_1d=$(status_config_value "$cm" evaluationInterval1d)
+    rendered=$(status_rendered_interval "$cm" rolling 2>/dev/null || true)
+    rendered_1d=$(status_rendered_interval "$cm" daily 2>/dev/null || true)
+    source="mixed"
+    [[ -z "$value" && -z "$value_1d" ]] && source="default"
+    [[ -n "$value" && -n "$value_1d" ]] && source="custom"
+    jq -n --arg value "$value" --arg value1d "$value_1d" \
+        --arg source "$source" \
+        --arg rendered "$rendered" --arg rendered1d "$rendered_1d" '{
+          evaluation_interval: (if $value == "" then null else $value end),
+          evaluation_interval_1d: (if $value1d == "" then null else $value1d end),
+          source: $source,
+          rendered: {evaluation_interval: (if $rendered == "" then null else $rendered end), evaluation_interval_1d: (if $rendered1d == "" then null else $rendered1d end)}
+        }'
+}
+
+status_print_interval() {
+    local cm="$1" label="$2" value="$3" default="$4" min="$5" max="$6" rendered="$7" rc color suffix
+    local shown="${value:-$default}"
+    suffix=""
+    [[ -z "$value" ]] && suffix=" (default)"
+    if rs_eval_interval_check "$value" "$min" "$max"; then
+        color="$GREEN"
+    else
+        rc=$?
+        color="$RED"
+        if [[ "$rc" -eq 2 ]]; then
+            suffix=" (invalid: allowed $min to $max; MCOA will revert)"
+        else
+            suffix=" (invalid: expected a single duration $min to $max; MCOA will revert)"
+        fi
+    fi
+    if [[ -n "$rendered" ]]; then
+        if rs_eval_interval_check "$value" "$min" "$max" && \
+            [[ "$(rs_duration_ms "${value:-$default}")" == "$(rs_duration_ms "$rendered")" ]]; then
+            suffix="$suffix rendered=$rendered"
+        else
+            suffix="$suffix rendered=$rendered (DRIFT)"
+            color="$RED"
+        fi
+    fi
+    echo -e "      ${color}${label}=${shown}${suffix}${NC}"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --hub-only) HUB_ONLY=true; shift ;;
@@ -140,6 +219,22 @@ show_status() {
     for cm in rs-namespace-config rs-virt-config; do
         if resource_exists configmap "$cm" "$OBS_NAMESPACE"; then
             echo -e "    ${GREEN}$cm: exists${NC}"
+            local cm_eval cm_eval_1d rendered rendered_1d
+            cm_eval=$(status_config_value "$cm" evaluationInterval)
+            cm_eval_1d=$(status_config_value "$cm" evaluationInterval1d)
+            rendered=$(status_rendered_interval "$cm" rolling 2>/dev/null || true)
+            rendered_1d=$(status_rendered_interval "$cm" daily 2>/dev/null || true)
+            status_print_interval "$cm" "evaluationInterval" "$cm_eval" "$RS_EVAL_INTERVAL_DEFAULT" \
+                "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX" "$rendered"
+            status_print_interval "$cm" "evaluationInterval1d" "$cm_eval_1d" "$RS_EVAL_INTERVAL_1D_DEFAULT" \
+                "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX" "$rendered_1d"
+            if [[ -n "$cm_eval" && -n "$cm_eval_1d" ]] && \
+                rs_eval_interval_check "$cm_eval" "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX" && \
+                rs_eval_interval_check "$cm_eval_1d" "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX"; then
+                if (( $(rs_duration_ms "$cm_eval") > $(rs_duration_ms "$cm_eval_1d") )); then
+                    echo -e "      ${YELLOW}warning: evaluationInterval is coarser than evaluationInterval1d${NC}"
+                fi
+            fi
         else
             echo -e "    ${RED}$cm: not found${NC}"
         fi
@@ -367,7 +462,7 @@ show_status() {
 }
 
 show_status_json() {
-    local annotation="" ns_enabled virt_enabled ns_adc virt_adc
+    local annotation="" ns_enabled virt_enabled ns_adc virt_adc ns_config_json virt_config_json
 
     annotation=$($KUBE_CLI get mco "$MCO_NAME" \
         -o jsonpath="{.metadata.annotations.${RS_ANNOTATION//./\\.}}" 2>/dev/null || echo "")
@@ -392,6 +487,15 @@ show_status_json() {
         virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null || echo "null")
     fi
 
+    ns_config_json="null"
+    virt_config_json="null"
+    if resource_exists configmap rs-namespace-config "$OBS_NAMESPACE"; then
+        ns_config_json=$(status_rs_config_json rs-namespace-config)
+    fi
+    if resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
+        virt_config_json=$(status_rs_config_json rs-virt-config)
+    fi
+
     jq -n \
         --arg mode "$mode" \
         --arg release "$RS_RELEASE" \
@@ -400,6 +504,8 @@ show_status_json() {
         --arg virt_enabled "$virt_enabled" \
         --arg ns_adc "${ns_adc:-null}" \
         --arg virt_adc "${virt_adc:-null}" \
+        --argjson ns_config "$ns_config_json" \
+        --argjson virt_config "$virt_config_json" \
         '{
             mode: $mode,
             release: $release,
@@ -411,6 +517,10 @@ show_status_json() {
             adc: {
                 namespace: (if $ns_adc == "null" then null else $ns_adc end),
                 virtualization: (if $virt_adc == "null" then null else $virt_adc end)
+            },
+            rs_config: {
+                namespace: $ns_config,
+                virtualization: $virt_config
             }
         }'
 }

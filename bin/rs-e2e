@@ -32,7 +32,10 @@
 #   9b   Swap features (MCOA)          (--mode-switch)
 #   9c   Disable both (MCOA)           (--mode-switch)
 #   9d   Re-enable both (MCOA)         (--mode-switch)
-#   10   ConfigMap propagation (MCOA)  (--mode-switch)
+#   10   ConfigMap propagation (MCOA)  (--mode-switch; selects 10a, 10b, 10c)
+#   10a  Evaluation interval propagation (MCOA)
+#   10b  Evaluation interval validation/write-back (MCOA)
+#   10c  Evaluation interval defaults/no-backfill (MCOA)
 #
 #   Group 3: Mode round-trip tests
 #   11   MCOA -> MCO switch            (--mode-switch)
@@ -85,6 +88,15 @@ SKIP_PERSES_CHECK=false
 THANOS_PF_PID=""
 CAPTURED_COO_VERSION=""
 CAPTURED_PERSES_IMAGE=""
+E2E_CAPTURED_NS_RULE_CONFIG=""
+E2E_CAPTURED_VIRT_RULE_CONFIG=""
+E2E_CAPTURED_NS_PLACEMENT=""
+E2E_CAPTURED_VIRT_PLACEMENT=""
+E2E_CAPTURED_NS_PLACEMENT_SET=false
+E2E_CAPTURED_VIRT_PLACEMENT_SET=false
+E2E_CAPTURED_FEATURES_SET=false
+E2E_CAPTURED_NS_FEATURE=""
+E2E_CAPTURED_VIRT_FEATURE=""
 
 RESULT_IDS=()
 RESULT_NAMES=()
@@ -115,8 +127,8 @@ Options:
   --no-metrics-wait      Skip the metrics collection wait (phase 19)
   --build mco|mcoa|both  Build, push, and apply custom images before tests
   --image-override       Apply existing image-override.json (no build)
-  --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a)
-  --release 2.16|2.17|5.0  ACM release (required when testing 5.0 images on a 2.17 cluster)
+  --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a); phase 10 selects 10,10a,10b,10c
+  --release 2.16|2.17|5.0|5.1  ACM release override (5.1 selects only interval phases by default)
   --skip-perses-check    Skip COO/Perses dashboard verification (incl. the 21b stat-panel check)
   --yes                  Auto-confirm destructive phases (no prompts)
   -h, --help             Show this help
@@ -132,14 +144,18 @@ Examples:
   $(basename "$0") --build mco --skip-uninstall
   $(basename "$0") --phases 0-3,5,13-16
   $(basename "$0") --release 5.0 --skip-uninstall   # Test 5.0 images on 2.17 cluster
+  $(basename "$0") --release 5.1                 # Run interval phases only (10a-10c)
   $(basename "$0") --mode-switch --yes    # Full run, no prompts
 EOF
 }
 
 apply_release_phase_defaults() {
     [[ -n "$SELECTED_PHASES" ]] && return   # --phases wins
-    if release_is_50; then
-        SELECTED_PHASES="0,0a,1,9a,9b,9c,9d,9e,10"
+    if [[ "$RS_RELEASE" == "5.1" && -z "$RS_MCH_VERSION" ]]; then
+        # An explicit --release 5.1 is an opt-in for just the interval tests.
+        SELECTED_PHASES="10a,10b,10c"
+    elif release_is_50; then
+        SELECTED_PHASES="0,0a,1,9a,9b,9c,9d,9e,10,10a,10b,10c"
     elif release_is_216; then
         SELECTED_PHASES="$( [[ "$SKIP_UNINSTALL" == "true" ]] && \
             echo "0,1,2a,2b,2c,2d,2e,3,4" || \
@@ -183,8 +199,8 @@ parse_args() {
                 shift 2 ;;
             --release)
                 RS_RELEASE="${2:-}"
-                [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || {
-                    log_error "--release must be 2.16, 2.17, or 5.0"; exit 1; }
+                [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0|5\.1)$ ]] || {
+                    log_error "--release must be 2.16, 2.17, 5.0, or 5.1"; exit 1; }
                 shift 2 ;;
             -h|--help) usage; exit 0 ;;
             mco|mcoa)  FORCE_MODE="$1"; shift ;;
@@ -536,6 +552,241 @@ manifestwork_contains() {
     return 1
 }
 
+RS_EVAL_INTERVAL_SUPPORT="unknown"
+
+mcoa_manifestwork_snapshot() {
+    local mc_list mc mw rv
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            rv=$($KUBE_CLI get "$mw" -n "$mc" -o jsonpath='{.metadata.resourceVersion}' \
+                --request-timeout=10s 2>/dev/null || echo "")
+            [[ -n "$rv" ]] && echo "$mc/$mw=$rv"
+        done
+    done
+}
+
+mcoa_manifestwork_has_values() {
+    local percentage="$1" interval="$2" interval_1d="$3" mc_list mc mw mw_json seen=false
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            seen=true
+            mw_json=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null || echo "{}")
+            if echo "$mw_json" | jq -e --arg p "$percentage" --arg i "$interval" --arg i1d "$interval_1d" '
+                ([ .spec.workload.manifests[]? | select(.kind == "PrometheusRule") |
+                  .spec.groups[]?.rules[]? | select((.expr // "") | contains("(" + $p + "/100)")) ] | length > 0)
+                and (([ .spec.workload.manifests[]? | select(.kind == "PrometheusRule") |
+                  .spec.groups[]? | .interval ] as $intervals |
+                  ($intervals | index($i)) != null and ($intervals | index($i1d)) != null))
+            ' >/dev/null 2>&1; then
+                :
+            else
+                return 1
+            fi
+        done
+    done
+    [[ "$seen" == "true" ]]
+}
+
+mcoa_manifestwork_rule_has_intervals() {
+    local rule_name="$1" interval="$2" interval_1d="$3"
+    mcoa_manifestwork_rules_have_intervals "$interval" "$interval_1d" "$rule_name"
+}
+
+mcoa_manifestwork_rules_have_intervals() {
+    local interval="$1" interval_1d="$2" mc_list mc mw mw_json seen=false rule_name
+    shift 2
+    [[ "$#" -gt 0 ]] || return 1
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            seen=true
+            mw_json=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null || echo "{}")
+            for rule_name in "$@"; do
+                if ! echo "$mw_json" | jq -e --arg rule "$rule_name" --arg i "$interval" --arg i1d "$interval_1d" '
+                    [ .spec.workload.manifests[]? | select(.kind == "PrometheusRule" and .metadata.name == $rule) |
+                      .spec.groups[]? | .interval ] as $intervals |
+                    ($intervals | length) > 0 and
+                    ($intervals | index($i)) != null and ($intervals | index($i1d)) != null
+                ' >/dev/null 2>&1; then
+                    return 1
+                fi
+            done
+        done
+    done
+    [[ "$seen" == "true" ]]
+}
+
+mcoa_manifestwork_resource_version_changed() {
+    local before="$1" after
+    after=$(mcoa_manifestwork_snapshot)
+    [[ -n "$after" && "$after" != "$before" ]]
+}
+
+mcoa_manifestwork_rule_group_ok() {
+    local rule_name="$1" group_name="$2" expected_interval="$3" must_contain="${4:-}" must_not_contain="${5:-}" virt_cpu="${6:-false}" record_suffix="${7:-}"
+    local mc_list mc mw mw_json seen=false
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            seen=true
+            mw_json=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null || echo "{}")
+            if echo "$mw_json" | jq -e --arg rule "$rule_name" --arg group "$group_name" \
+                --arg interval "$expected_interval" --arg must "$must_contain" \
+                --arg not_must "$must_not_contain" --arg cpu "$virt_cpu" --arg suffix "$record_suffix" '
+                [ .spec.workload.manifests[]? | select(.kind == "PrometheusRule" and .metadata.name == $rule) |
+                  .spec.groups[]? | select(.name == $group) ] as $groups |
+                ($groups | length) > 0 and all($groups[];
+                  .interval == $interval and
+                  ((.rules // []) | length) > 0 and
+                  all(.rules[]?;
+                    (($must == "") or ((.expr // "") | contains($must))) and
+                    (($not_must == "") or (((.expr // "") | contains($not_must)) | not)) and
+                    ((.record == null) or (($cpu == "true") or ($suffix == "") or (.record | endswith($suffix))))
+                  )
+                )
+            ' >/dev/null 2>&1; then
+                :
+            else
+                return 1
+            fi
+        done
+    done
+    [[ "$seen" == "true" ]]
+}
+
+mcoa_rule_group_assert() {
+    local rule_name="$1" group_name="$2" expected_interval="$3" must_contain="${4:-}" must_not_contain="${5:-}" virt_cpu="${6:-false}" record_suffix="${7:-}"
+    if mcoa_manifestwork_rule_group_ok "$rule_name" "$group_name" "$expected_interval" \
+        "$must_contain" "$must_not_contain" "$virt_cpu" "$record_suffix"; then
+        log_success "  $rule_name/$group_name: interval=$expected_interval"
+        return 0
+    fi
+    log_error "  $rule_name/$group_name: expected interval=$expected_interval and rule content was not found"
+    return 1
+}
+
+mcoa_rule_group_any_expr_ok() {
+    local rule_name="$1" group_name="$2" must_contain="$3" record_name="${4:-}" mc_list mc mw mw_json seen=false
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
+            seen=true
+            mw_json=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null || echo "{}")
+            if echo "$mw_json" | jq -e --arg rule "$rule_name" --arg group "$group_name" \
+                --arg must "$must_contain" --arg record "$record_name" '
+                any(.spec.workload.manifests[]?;
+                    .kind == "PrometheusRule" and .metadata.name == $rule and
+                    any(.spec.groups[]?; .name == $group and
+                        any(.rules[]?;
+                            (($record == "") or (.record == $record)) and
+                            ((.expr // "") | contains($must)))))
+            ' >/dev/null 2>&1; then
+                :
+            else
+                return 1
+            fi
+        done
+    done
+    [[ "$seen" == "true" ]]
+}
+
+wait_rs_config_value() {
+    local cm="$1" key="$2" expected="$3" actual
+    actual=$(rs_rule_config_get "$(rs_rule_config_from_cluster "$cm" "$OBS_NAMESPACE" 2>/dev/null || true)" "$key" 2>/dev/null || true)
+    [[ "$actual" == "$expected" ]]
+}
+
+mcoa_log_contains() {
+    $KUBE_CLI logs deployment/"$MCOA_DEPLOY" -n "$OBS_NAMESPACE" --tail=500 2>/dev/null | \
+        grep -F "$1" >/dev/null
+}
+
+rs_eval_interval_probe() {
+    local original snapshot changed=false supported=false updated patch
+    original=$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || echo "")
+    [[ -n "$original" ]] || { PHASE_FAIL_REASON="rs-namespace-config has no prometheusRuleConfig"; return 1; }
+    snapshot=$(mcoa_manifestwork_snapshot)
+    updated=$(rs_rule_config_set "$original" recommendationPercentage 125) || return 1
+    updated=$(rs_rule_config_set "$updated" evaluationInterval 10m) || return 1
+    updated=$(rs_rule_config_set "$updated" evaluationInterval1d 30m) || return 1
+    patch=$(jq -n --arg config "$updated" '{data: {prometheusRuleConfig: $config}}')
+    kube_retry $KUBE_CLI patch configmap rs-namespace-config -n "$OBS_NAMESPACE" \
+        --type=merge -p "$patch" --request-timeout=15s || return 1
+
+    if wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "MCOA capability probe" \
+        mcoa_manifestwork_resource_version_changed "$snapshot"; then
+        changed=true
+        if mcoa_manifestwork_has_values 125 10m 30m; then
+            supported=true
+        fi
+    fi
+
+    # Restore the exact blob even when the probe says unsupported.  This is
+    # also what makes a standalone 10b/10c probe safe to interrupt.
+    if ! restore_rs_rule_config rs-namespace-config "$original"; then
+        PHASE_FAIL_REASON="MCOA capability probe could not restore rs-namespace-config"
+        return 1
+    fi
+    [[ "$changed" == "true" ]] || {
+        PHASE_FAIL_REASON="MCOA ManifestWork resourceVersion did not change during capability probe"
+        return 1
+    }
+    if [[ "$supported" == "true" ]]; then
+        RS_EVAL_INTERVAL_SUPPORT="yes"
+        return 0
+    fi
+    RS_EVAL_INTERVAL_SUPPORT="no"
+    return 0
+}
+
+rs_eval_interval_gate() {
+    local supported_release=false version_context
+    if [[ "$DATA_PLANE" == "true" ]]; then
+        PHASE_SKIP_REASON="Evaluation interval phases are skipped with --data-plane to avoid interval churn before data-plane checks"
+        return 2
+    fi
+    if [[ -n "$RS_MCH_VERSION" ]]; then
+        release_at_least 5.1 && supported_release=true
+    elif [[ "$RS_RELEASE" == "5.1" ]]; then
+        # An explicit --release 5.1 is the only opt-in when version detection
+        # is intentionally bypassed. It selects these tests; the probe still
+        # checks whether the deployed MCOA actually supports the feature.
+        supported_release=true
+    fi
+    if [[ "$supported_release" != "true" ]]; then
+        if [[ -n "$RS_MCH_VERSION" ]]; then
+            version_context="detected MCH $RS_MCH_VERSION"
+        else
+            version_context="MCH version unavailable or detection overridden (RS_RELEASE=$RS_RELEASE)"
+        fi
+        PHASE_SKIP_REASON="Evaluation interval tests require ACM 5.1 or later or explicit --release 5.1; $version_context. Custom image overrides do not bypass this release gate"
+        return 2
+    fi
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
+    capture_rs_feature_state || { PHASE_FAIL_REASON="Could not capture the original right-sizing feature state"; return 1; }
+    patch_rs_features true true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "RS ConfigMap availability" \
+        resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "virtualization RS ConfigMap availability" \
+        resource_exists configmap rs-virt-config "$OBS_NAMESPACE" || true
+    capture_rs_rule_configs
+
+    if [[ "$RS_EVAL_INTERVAL_SUPPORT" == "unknown" ]]; then
+        # The release gate runs first; probe only on ACM >= 5.1 or after an
+        # explicit --release 5.1 override.
+        rs_eval_interval_probe || return 1
+    fi
+
+    if [[ "$RS_EVAL_INTERVAL_SUPPORT" == "no" ]]; then
+        PHASE_FAIL_REASON="ACM ${RS_MCH_VERSION:-$RS_RELEASE} is expected to support evaluation intervals, but the deployed MCOA did not propagate them"
+        return 1
+    fi
+    return 0
+}
+
 cleanup_stuck_mcoa_mw() {
     local cleaned=false
     local mc_list
@@ -588,6 +839,19 @@ patch_rs_features() {
     }"
 }
 
+capture_rs_feature_state() {
+    [[ "$E2E_CAPTURED_FEATURES_SET" == "true" ]] && return 0
+    E2E_CAPTURED_NS_FEATURE=$(get_resource_field mco "$MCO_NAME" "" \
+        '{.spec.capabilities.platform.analytics.namespaceRightSizingRecommendation.enabled}' 2>/dev/null || true)
+    E2E_CAPTURED_VIRT_FEATURE=$(get_resource_field mco "$MCO_NAME" "" \
+        '{.spec.capabilities.platform.analytics.virtualizationRightSizingRecommendation.enabled}' 2>/dev/null || true)
+    if [[ "$E2E_CAPTURED_NS_FEATURE" =~ ^(true|false)$ && "$E2E_CAPTURED_VIRT_FEATURE" =~ ^(true|false)$ ]]; then
+        E2E_CAPTURED_FEATURES_SET=true
+        return 0
+    fi
+    return 1
+}
+
 patch_rs_namespace_binding() {
     local ns_binding="$1" virt_binding="$2"
     kube_retry $KUBE_CLI patch mco "$MCO_NAME" --type=merge -p "{
@@ -602,6 +866,64 @@ patch_rs_namespace_binding() {
             }
         }
     }"
+}
+
+patch_rs_rule_config() {
+    local cm="$1" key="$2" value="$3" current updated patch
+    current=$(rs_rule_config_from_cluster "$cm" "$OBS_NAMESPACE") || return 1
+    updated=$(rs_rule_config_set "$current" "$key" "$value") || return 1
+    patch_rs_rule_config_blob "$cm" "$updated"
+}
+
+patch_rs_rule_config_blob() {
+    local cm="$1" updated="$2" patch
+    patch=$(jq -n --arg config "$updated" \
+        '{data: {prometheusRuleConfig: $config}}')
+    kube_retry $KUBE_CLI patch configmap "$cm" -n "$OBS_NAMESPACE" \
+        --type=merge -p "$patch" --request-timeout=15s
+}
+
+patch_rs_config_data() {
+    local cm="$1" key="$2" value="$3" patch
+    patch=$(jq -n --arg key "$key" --arg value "$value" \
+        '{data: {($key): $value}}')
+    kube_retry $KUBE_CLI patch configmap "$cm" -n "$OBS_NAMESPACE" \
+        --type=merge -p "$patch" --request-timeout=15s
+}
+
+unset_rs_config_data() {
+    local cm="$1" key="$2" patch
+    patch=$(jq -n --arg key "$key" '{data: {($key): null}}')
+    kube_retry $KUBE_CLI patch configmap "$cm" -n "$OBS_NAMESPACE" \
+        --type=merge -p "$patch" --request-timeout=15s
+}
+
+restore_rs_rule_config() {
+    local cm="$1" value="$2" patch
+    [[ -n "$value" ]] || return 0
+    patch=$(jq -n --arg config "$value" \
+        '{data: {prometheusRuleConfig: $config}}')
+    kube_retry $KUBE_CLI patch configmap "$cm" -n "$OBS_NAMESPACE" \
+        --type=merge -p "$patch" --request-timeout=15s
+}
+
+capture_rs_rule_configs() {
+    if [[ -z "$E2E_CAPTURED_NS_RULE_CONFIG" ]] && resource_exists configmap rs-namespace-config "$OBS_NAMESPACE"; then
+        E2E_CAPTURED_NS_RULE_CONFIG=$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" || true)
+    fi
+    if [[ -z "$E2E_CAPTURED_VIRT_RULE_CONFIG" ]] && resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
+        E2E_CAPTURED_VIRT_RULE_CONFIG=$(rs_rule_config_from_cluster rs-virt-config "$OBS_NAMESPACE" || true)
+    fi
+    if [[ "$E2E_CAPTURED_NS_PLACEMENT_SET" == "false" ]] && resource_exists configmap rs-namespace-config "$OBS_NAMESPACE"; then
+        E2E_CAPTURED_NS_PLACEMENT=$(get_resource_field configmap rs-namespace-config "$OBS_NAMESPACE" \
+            '{.data.placementConfiguration}' 2>/dev/null || true)
+        E2E_CAPTURED_NS_PLACEMENT_SET=true
+    fi
+    if [[ "$E2E_CAPTURED_VIRT_PLACEMENT_SET" == "false" ]] && resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
+        E2E_CAPTURED_VIRT_PLACEMENT=$(get_resource_field configmap rs-virt-config "$OBS_NAMESPACE" \
+            '{.data.placementConfiguration}' 2>/dev/null || true)
+        E2E_CAPTURED_VIRT_PLACEMENT_SET=true
+    fi
 }
 
 ensure_mode() {
@@ -939,6 +1261,32 @@ E2E_STOPPED_VM=""
 # Thanos port-forward and restores the original kubeconfig context. Runs on normal exit, on a
 # `set -u` abort, on Ctrl-C and on SIGTERM (not on SIGKILL).
 e2e_on_exit() {
+    if [[ -n "${E2E_CAPTURED_NS_RULE_CONFIG:-}" ]] && resource_exists configmap rs-namespace-config "${OBS_NAMESPACE:-}"; then
+        restore_rs_rule_config rs-namespace-config "$E2E_CAPTURED_NS_RULE_CONFIG" >/dev/null 2>&1 || \
+            log_warn "Could not restore the captured namespace prometheusRuleConfig"
+    fi
+    if [[ -n "${E2E_CAPTURED_VIRT_RULE_CONFIG:-}" ]] && resource_exists configmap rs-virt-config "${OBS_NAMESPACE:-}"; then
+        restore_rs_rule_config rs-virt-config "$E2E_CAPTURED_VIRT_RULE_CONFIG" >/dev/null 2>&1 || \
+            log_warn "Could not restore the captured virtualization prometheusRuleConfig"
+    fi
+    if [[ "${E2E_CAPTURED_NS_PLACEMENT_SET:-false}" == "true" ]] && resource_exists configmap rs-namespace-config "${OBS_NAMESPACE:-}"; then
+        if [[ -n "${E2E_CAPTURED_NS_PLACEMENT:-}" ]]; then
+            patch_rs_config_data rs-namespace-config placementConfiguration "$E2E_CAPTURED_NS_PLACEMENT" >/dev/null 2>&1 || true
+        else
+            unset_rs_config_data rs-namespace-config placementConfiguration >/dev/null 2>&1 || true
+        fi
+    fi
+    if [[ "${E2E_CAPTURED_VIRT_PLACEMENT_SET:-false}" == "true" ]] && resource_exists configmap rs-virt-config "${OBS_NAMESPACE:-}"; then
+        if [[ -n "${E2E_CAPTURED_VIRT_PLACEMENT:-}" ]]; then
+            patch_rs_config_data rs-virt-config placementConfiguration "$E2E_CAPTURED_VIRT_PLACEMENT" >/dev/null 2>&1 || true
+        else
+            unset_rs_config_data rs-virt-config placementConfiguration >/dev/null 2>&1 || true
+        fi
+    fi
+    if [[ "${E2E_CAPTURED_FEATURES_SET:-false}" == "true" ]] && resource_exists mco "$MCO_NAME"; then
+        patch_rs_features "$E2E_CAPTURED_NS_FEATURE" "$E2E_CAPTURED_VIRT_FEATURE" >/dev/null 2>&1 || \
+            log_warn "Could not restore the captured right-sizing feature state"
+    fi
     if [[ -n "${E2E_STOPPED_VM:-}" ]]; then
         local ctx ns vm
         IFS='|' read -r ctx ns vm <<< "$E2E_STOPPED_VM"
@@ -2927,13 +3275,12 @@ phase_4() {
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
     ensure_mode mco || { PHASE_FAIL_REASON="Failed to switch to MCO mode"; return 1; }
 
-    log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
-    # MCO stores prometheusRuleConfig as YAML; MCOA stores it as JSON.
-    # Handle both: try JSON parse first, fall back to YAML gsub.
-    local _json
-    _json=$(kube_retry $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.prometheusRuleConfig |= (. as $v | try ($v | fromjson | .recommendationPercentage = 120 | tojson) catch ($v | gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")))')
-    kube_apply_json "$_json"
+    capture_rs_rule_configs
+    log_substep "Modifying rs-namespace-config: recommendationPercentage -> 120"
+    patch_rs_rule_config rs-namespace-config recommendationPercentage 120 || {
+        PHASE_FAIL_REASON="Could not update rs-namespace-config"
+        return 1
+    }
 
     # MCO renders the percentage in PrometheusRule expr as "(120/100)".
     wait_until "$TIMEOUT_E2E_RECONCILE" 5 "Policy update" \
@@ -2949,10 +3296,8 @@ phase_4() {
         ((errors++)) || true
     fi
 
-    log_substep "Reverting: recommendationPercentage 120 -> 110"
-    _json=$(kube_retry $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.prometheusRuleConfig |= (. as $v | try ($v | fromjson | .recommendationPercentage = 110 | tojson) catch ($v | gsub("recommendationPercentage: 120"; "recommendationPercentage: 110")))')
-    kube_apply_json "$_json"
+    log_substep "Restoring the captured rs-namespace-config"
+    restore_rs_rule_config rs-namespace-config "$E2E_CAPTURED_NS_RULE_CONFIG" || ((errors++)) || true
 
     CURRENT_MODE="mco"
 
@@ -2973,13 +3318,12 @@ phase_10() {
     ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
     ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
 
-    log_substep "Modifying rs-namespace-config: recommendationPercentage 110 -> 120"
-    # MCO stores prometheusRuleConfig as YAML; MCOA stores it as JSON.
-    # Handle both: try JSON parse first, fall back to YAML gsub.
-    local _json
-    _json=$(kube_retry $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.prometheusRuleConfig |= (. as $v | try ($v | fromjson | .recommendationPercentage = 120 | tojson) catch ($v | gsub("recommendationPercentage: 110"; "recommendationPercentage: 120")))')
-    kube_apply_json "$_json"
+    capture_rs_rule_configs
+    log_substep "Modifying rs-namespace-config: recommendationPercentage -> 120"
+    patch_rs_rule_config rs-namespace-config recommendationPercentage 120 || {
+        PHASE_FAIL_REASON="Could not update rs-namespace-config"
+        return 1
+    }
 
     # MCOA Watcher watches RS ConfigMaps and calls addonManager.Trigger() for all clusters.
     # The percentage appears in PrometheusRule expr as "(120/100)".
@@ -3005,15 +3349,351 @@ phase_10() {
         ((errors++)) || true
     fi
 
-    log_substep "Reverting: recommendationPercentage 120 -> 110"
-    _json=$(kube_retry $KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" -o json | \
-        jq '.data.prometheusRuleConfig |= (. as $v | try ($v | fromjson | .recommendationPercentage = 110 | tojson) catch ($v | gsub("recommendationPercentage: 120"; "recommendationPercentage: 110")))')
-    kube_apply_json "$_json"
+    log_substep "Restoring the captured rs-namespace-config"
+    restore_rs_rule_config rs-namespace-config "$E2E_CAPTURED_NS_RULE_CONFIG" || ((errors++)) || true
 
     CURRENT_MODE="mcoa"
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="ConfigMap change not propagated to ManifestWork"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phases 10a-10c: Configurable evaluation intervals (MCOA)
+# =============================================================================
+
+spoke_prometheus_group_interval_ok() {
+    local context="$1" rule_name="$2" group_name="$3" expected_interval="$4" response route_host token
+    local -a curl_args=(-ks --connect-timeout 5 --max-time 10)
+    response=$($KUBE_CLI --context="$context" get prometheusrule -n openshift-monitoring \
+        "$rule_name" -o json --request-timeout=10s 2>/dev/null || echo "")
+    [[ -n "$response" ]] || return 1
+    echo "$response" | jq -e --arg group "$group_name" --arg interval "$expected_interval" '
+        [ .spec.groups[]? | select(.name == $group) | .interval ] | index($interval) != null
+    ' >/dev/null 2>&1 || return 1
+
+    route_host=$($KUBE_CLI --context="$context" get route prometheus-k8s -n openshift-monitoring \
+        -o jsonpath='{.spec.host}' --request-timeout=10s 2>/dev/null || echo "")
+    [[ -n "$route_host" ]] || return 1
+    token=$($KUBE_CLI --context="$context" whoami -t 2>/dev/null || echo "")
+    [[ -n "$token" ]] && curl_args+=(-H "Authorization: Bearer $token")
+    curl "${curl_args[@]}" \
+        "https://${route_host}/api/v1/rules" 2>/dev/null | \
+        jq -e --arg group "$group_name" '
+            [ .data.groups[]? | select(.name == $group) | .rules[]? | (.lastError // "") ] |
+            length > 0 and all(. == "")
+        ' >/dev/null 2>&1
+}
+
+check_spoke_interval_groups() {
+    local context="$1" rule_name="$2" interval="$3" errors=0 group
+    for group in "$@"; do :; done
+    shift 3
+    for group in "$@"; do
+        if ! $KUBE_CLI --context="$context" cluster-info --request-timeout=10s >/dev/null 2>&1; then
+            log_info "  $context is unreachable; skipping direct spoke runtime check"
+            return 0
+        fi
+        if spoke_prometheus_group_interval_ok "$context" "$rule_name" "$group" "$interval"; then
+            log_success "  $context: $rule_name/$group interval=$interval, no Prometheus lastError"
+        else
+            log_error "  $context: $rule_name/$group was not admitted/running at interval=$interval"
+            ((errors++)) || true
+        fi
+    done
+    return "$errors"
+}
+
+check_mcoa_interval_source() {
+    [[ "$BUILD_TARGET" == "mcoa" || "$BUILD_TARGET" == "both" ]] || return 0
+    [[ -d "$MCOA_REPO_DIR" ]] || return 0
+    command -v rg >/dev/null 2>&1 || return 0
+
+    if rg -n 'backfillConfigKeys' "$MCOA_REPO_DIR/internal" >/dev/null 2>&1; then
+        PHASE_FAIL_REASON="MCOA source checkout still contains pre-#728 backfillConfigKeys; build the merged upstream #728 commit"
+        return 1
+    fi
+    if ! rg -n 'evaluationInterval' "$MCOA_REPO_DIR/internal/analytics/rightsizing/rulebuilder.go" >/dev/null 2>&1; then
+        PHASE_FAIL_REASON="MCOA source checkout does not contain configurable evaluation interval support"
+        return 1
+    fi
+    if ! rg -n 'MaxEvaluationInterval|MaxEvaluationInterval1d' \
+        "$MCOA_REPO_DIR/internal/analytics/rightsizing/rulebuilder.go" >/dev/null 2>&1; then
+        log_warn "Could not find upstream derived interval-bound constants; verify local bounds against the MCOA build"
+    fi
+    return 0
+}
+
+phase_10a() {
+    rs_eval_interval_gate || return $?
+    local errors=0 original_ns original_virt ns_5m ns_1d virt_5m virt_1d
+    if ! rs_eval_interval_check "$RS_EVAL_INTERVAL_TEST" "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX" || \
+       ! rs_eval_interval_check "$RS_EVAL_INTERVAL_1D_TEST" "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX"; then
+        PHASE_FAIL_REASON="RS_EVAL_INTERVAL_TEST/RS_EVAL_INTERVAL_1D_TEST is outside the supported interval range"
+        return 1
+    fi
+    capture_rs_rule_configs
+    original_ns="$E2E_CAPTURED_NS_RULE_CONFIG"
+    original_virt="$E2E_CAPTURED_VIRT_RULE_CONFIG"
+    [[ -n "$original_ns" && -n "$original_virt" ]] || {
+        PHASE_FAIL_REASON="Both RS ConfigMaps are required for interval propagation"
+        return 1
+    }
+
+    ns_5m=$(rs_rule_config_get "$original_ns" evaluationInterval 2>/dev/null || true)
+    ns_1d=$(rs_rule_config_get "$original_ns" evaluationInterval1d 2>/dev/null || true)
+    virt_5m=$(rs_rule_config_get "$original_virt" evaluationInterval 2>/dev/null || true)
+    virt_1d=$(rs_rule_config_get "$original_virt" evaluationInterval1d 2>/dev/null || true)
+    ns_5m="${ns_5m:-$RS_EVAL_INTERVAL_DEFAULT}"; ns_1d="${ns_1d:-$RS_EVAL_INTERVAL_1D_DEFAULT}"
+    virt_5m="${virt_5m:-$RS_EVAL_INTERVAL_DEFAULT}"; virt_1d="${virt_1d:-$RS_EVAL_INTERVAL_1D_DEFAULT}"
+
+    log_substep "Writing rolling=10m and daily=30m to both MCOA ConfigMaps"
+    if ! patch_rs_rule_config rs-namespace-config evaluationInterval "$RS_EVAL_INTERVAL_TEST" || \
+       ! patch_rs_rule_config rs-namespace-config evaluationInterval1d "$RS_EVAL_INTERVAL_1D_TEST" || \
+       ! patch_rs_rule_config rs-virt-config evaluationInterval "$RS_EVAL_INTERVAL_TEST" || \
+       ! patch_rs_rule_config rs-virt-config evaluationInterval1d "$RS_EVAL_INTERVAL_1D_TEST"; then
+        restore_rs_rule_config rs-namespace-config "$original_ns" || true
+        restore_rs_rule_config rs-virt-config "$original_virt" || true
+        PHASE_FAIL_REASON="Could not write both evaluation interval ConfigMaps"
+        return 1
+    fi
+
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "MCOA interval propagation" \
+        mcoa_manifestwork_rules_have_intervals "$RS_EVAL_INTERVAL_TEST" "$RS_EVAL_INTERVAL_1D_TEST" \
+        acm-rs-namespace-prometheus-rules acm-rs-virt-prometheus-rules || {
+        restore_rs_rule_config rs-namespace-config "$original_ns" || true
+        restore_rs_rule_config rs-virt-config "$original_virt" || true
+        PHASE_FAIL_REASON="Evaluation interval values did not propagate to ManifestWorks"
+        return 1
+    }
+
+    log_substep "Checking namespace rule groups and PromQL windows"
+    for group in acm-right-sizing-namespace-5m.rule acm-right-sizing-cluster-5m.rule; do
+        mcoa_rule_group_assert acm-rs-namespace-prometheus-rules "$group" "$RS_EVAL_INTERVAL_TEST" \
+            "[$RS_EVAL_INTERVAL_TEST:]" "[5m:]" false ":5m" || ((errors++)) || true
+    done
+    for group in acm-right-sizing-namespace-1d.rules acm-right-sizing-cluster-1d.rule; do
+        mcoa_rule_group_assert acm-rs-namespace-prometheus-rules "$group" "$RS_EVAL_INTERVAL_1D_TEST" \
+            "[1d]" "" || ((errors++)) || true
+    done
+
+    log_substep "Checking virtualization rule groups and the pinned CPU rate window"
+    for group in acm-vm-right-sizing-namespace-5m.rule acm-vm-right-sizing-cluster-5m.rule; do
+        local cpu_record="acm_rs_vm:namespace:cpu_usage:5m"
+        [[ "$group" == *-cluster-* ]] && cpu_record="acm_rs_vm:cluster:cpu_usage:5m"
+        mcoa_rule_group_assert acm-rs-virt-prometheus-rules "$group" "$RS_EVAL_INTERVAL_TEST" \
+            "[$RS_EVAL_INTERVAL_TEST:]" "" true || ((errors++)) || true
+        if mcoa_rule_group_any_expr_ok acm-rs-virt-prometheus-rules "$group" "[5m:]" "$cpu_record"; then
+            log_success "  $group retains the pinned CPU rate window [5m:]"
+        else
+            log_error "  $group lost the pinned CPU rate window [5m:]"
+            ((errors++)) || true
+        fi
+    done
+    for group in acm-vm-right-sizing-namespace-1d.rules acm-vm-right-sizing-cluster-1d.rule; do
+        mcoa_rule_group_assert acm-rs-virt-prometheus-rules "$group" "$RS_EVAL_INTERVAL_1D_TEST" \
+            "[1d]" "" || ((errors++)) || true
+    done
+
+    log_substep "Checking inclusive maxima and seconds-unit values"
+    patch_rs_rule_config rs-namespace-config evaluationInterval "$RS_EVAL_INTERVAL_MAX"
+    patch_rs_rule_config rs-namespace-config evaluationInterval1d "$RS_EVAL_INTERVAL_1D_MAX"
+    patch_rs_rule_config rs-virt-config evaluationInterval "$RS_EVAL_INTERVAL_MAX"
+    patch_rs_rule_config rs-virt-config evaluationInterval1d "$RS_EVAL_INTERVAL_1D_MAX"
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "maximum interval propagation" \
+        mcoa_manifestwork_rules_have_intervals "$RS_EVAL_INTERVAL_MAX" "$RS_EVAL_INTERVAL_1D_MAX" \
+        acm-rs-namespace-prometheus-rules acm-rs-virt-prometheus-rules || ((errors++)) || true
+
+    patch_rs_rule_config rs-namespace-config evaluationInterval 1800s
+    patch_rs_rule_config rs-namespace-config evaluationInterval1d 3600s
+    patch_rs_rule_config rs-virt-config evaluationInterval 1800s
+    patch_rs_rule_config rs-virt-config evaluationInterval1d 3600s
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "seconds-unit interval propagation" \
+        mcoa_manifestwork_rules_have_intervals 1800s 3600s \
+        acm-rs-namespace-prometheus-rules acm-rs-virt-prometheus-rules || ((errors++)) || true
+
+    log_substep "Checking live Prometheus admission and runtime on reachable spokes"
+    check_spoke_interval_groups "$NAMESPACE_SPOKE_CONTEXT" acm-rs-namespace-prometheus-rules 1800s \
+        acm-right-sizing-namespace-5m.rule acm-right-sizing-cluster-5m.rule || ((errors += $?)) || true
+    check_spoke_interval_groups "$NAMESPACE_SPOKE_CONTEXT" acm-rs-namespace-prometheus-rules 3600s \
+        acm-right-sizing-namespace-1d.rules acm-right-sizing-cluster-1d.rule || ((errors += $?)) || true
+    check_spoke_interval_groups "$VM_SPOKE_CONTEXT" acm-rs-virt-prometheus-rules 1800s \
+        acm-vm-right-sizing-namespace-5m.rule acm-vm-right-sizing-cluster-5m.rule || ((errors += $?)) || true
+    check_spoke_interval_groups "$VM_SPOKE_CONTEXT" acm-rs-virt-prometheus-rules 3600s \
+        acm-vm-right-sizing-namespace-1d.rules acm-vm-right-sizing-cluster-1d.rule || ((errors += $?)) || true
+
+    log_substep "Restoring captured ConfigMaps"
+    restore_rs_rule_config rs-namespace-config "$original_ns" || ((errors++)) || true
+    restore_rs_rule_config rs-virt-config "$original_virt" || ((errors++)) || true
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "restored interval propagation" \
+        mcoa_manifestwork_rule_has_intervals acm-rs-namespace-prometheus-rules "$ns_5m" "$ns_1d" || ((errors++)) || true
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "restored virtualization interval propagation" \
+        mcoa_manifestwork_rule_has_intervals acm-rs-virt-prometheus-rules "$virt_5m" "$virt_1d" || ((errors++)) || true
+
+    if (( errors > 0 )); then
+        PHASE_FAIL_REASON="$errors evaluation interval propagation assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_10b() {
+    rs_eval_interval_gate || return $?
+    local errors=0 original_ns original_virt original_placement_ns original_placement_virt
+    local original_cpu original_mem actual ns_before_virt
+    local original_ns_interval original_ns_interval_1d original_virt_interval
+    capture_rs_rule_configs
+    original_ns="$E2E_CAPTURED_NS_RULE_CONFIG"; original_virt="$E2E_CAPTURED_VIRT_RULE_CONFIG"
+    [[ -n "$original_ns" && -n "$original_virt" ]] || { PHASE_FAIL_REASON="Both RS ConfigMaps are required"; return 1; }
+    original_placement_ns=$(get_resource_field configmap rs-namespace-config "$OBS_NAMESPACE" \
+        '{.data.placementConfiguration}' 2>/dev/null || true)
+    original_placement_virt=$(get_resource_field configmap rs-virt-config "$OBS_NAMESPACE" \
+        '{.data.placementConfiguration}' 2>/dev/null || true)
+    original_cpu=$(rs_rule_config_get "$original_ns" cpuAggregator 2>/dev/null || true)
+    original_mem=$(rs_rule_config_get "$original_ns" memoryAggregator 2>/dev/null || true)
+    original_ns_interval=$(rs_rule_config_get "$original_ns" evaluationInterval 2>/dev/null || true)
+    original_ns_interval="${original_ns_interval:-$RS_EVAL_INTERVAL_DEFAULT}"
+    original_ns_interval_1d=$(rs_rule_config_get "$original_ns" evaluationInterval1d 2>/dev/null || true)
+    original_ns_interval_1d="${original_ns_interval_1d:-$RS_EVAL_INTERVAL_1D_DEFAULT}"
+    original_virt_interval=$(rs_rule_config_get "$original_virt" evaluationInterval 2>/dev/null || true)
+    original_virt_interval="${original_virt_interval:-$RS_EVAL_INTERVAL_DEFAULT}"
+
+    log_substep "Case 1: cached invalid intervals are independently restored"
+    patch_rs_rule_config rs-namespace-config evaluationInterval 3m
+    patch_rs_rule_config rs-namespace-config evaluationInterval1d 12h
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "rolling interval rejection" \
+        wait_rs_config_value rs-namespace-config evaluationInterval "$original_ns_interval" || ((errors++)) || true
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "daily interval rejection" \
+        wait_rs_config_value rs-namespace-config evaluationInterval1d "$original_ns_interval_1d" || ((errors++)) || true
+    if mcoa_log_contains "Invalid evaluationInterval in ConfigMap"; then log_success "  rolling interval rejection logged"; else log_warn "  rolling rejection log not present (soft check)"; fi
+    if mcoa_log_contains "Invalid evaluationInterval1d in ConfigMap"; then log_success "  daily interval rejection logged"; else log_warn "  daily rejection log not present (soft check)"; fi
+
+    log_substep "Case 2: compound duration is rejected and written back as YAML"
+    patch_rs_rule_config rs-namespace-config evaluationInterval 1h30m
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "compound interval rejection" \
+        wait_rs_config_value rs-namespace-config evaluationInterval "$original_ns_interval" || ((errors++)) || true
+    local after_blob
+    after_blob=$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)
+    grep '^evaluationInterval:[[:space:]]*[^"'"'"']' <<< "$after_blob" >/dev/null || ((errors++)) || true
+
+    log_substep "Case 3: aggregator rejection does not revert a valid interval"
+    patch_rs_rule_config rs-namespace-config cpuAggregator '[M80]'
+    patch_rs_rule_config rs-namespace-config evaluationInterval 10m
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "aggregator and interval validation" \
+        wait_rs_config_value rs-namespace-config evaluationInterval 10m || ((errors++)) || true
+    actual=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)" cpuAggregator 2>/dev/null || true)
+    [[ -z "$original_cpu" || "$actual" == "$original_cpu" ]] || { log_error "  cpuAggregator was not restored"; ((errors++)) || true; }
+
+    log_substep "Case 4: virtualization ConfigMap cache is isolated"
+    ns_before_virt=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)" evaluationInterval 2>/dev/null || true)
+    patch_rs_rule_config rs-virt-config evaluationInterval 3m
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "virtualization interval rejection" \
+        wait_rs_config_value rs-virt-config evaluationInterval "$original_virt_interval" || ((errors++)) || true
+    actual=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)" evaluationInterval 2>/dev/null || true)
+    [[ "$actual" == "$ns_before_virt" ]] || ((errors++)) || true
+
+    local placement_now_ns placement_now_virt
+    placement_now_ns=$(get_resource_field configmap rs-namespace-config "$OBS_NAMESPACE" '{.data.placementConfiguration}' 2>/dev/null || true)
+    placement_now_virt=$(get_resource_field configmap rs-virt-config "$OBS_NAMESPACE" '{.data.placementConfiguration}' 2>/dev/null || true)
+    [[ "$placement_now_ns" == "$original_placement_ns" ]] || ((errors++)) || true
+    [[ "$placement_now_virt" == "$original_placement_virt" ]] || ((errors++)) || true
+    if [[ -n "$original_mem" ]]; then
+        actual=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)" memoryAggregator 2>/dev/null || true)
+        [[ "$actual" == "$original_mem" ]] || ((errors++)) || true
+    fi
+
+    restore_rs_rule_config rs-namespace-config "$original_ns" || ((errors++)) || true
+    restore_rs_rule_config rs-virt-config "$original_virt" || ((errors++)) || true
+    local restore_5m restore_1d restore_virt_5m restore_virt_1d
+    restore_5m=$(rs_rule_config_get "$original_ns" evaluationInterval 2>/dev/null || true); restore_5m="${restore_5m:-$RS_EVAL_INTERVAL_DEFAULT}"
+    restore_1d=$(rs_rule_config_get "$original_ns" evaluationInterval1d 2>/dev/null || true); restore_1d="${restore_1d:-$RS_EVAL_INTERVAL_1D_DEFAULT}"
+    restore_virt_5m=$(rs_rule_config_get "$original_virt" evaluationInterval 2>/dev/null || true); restore_virt_5m="${restore_virt_5m:-$RS_EVAL_INTERVAL_DEFAULT}"
+    restore_virt_1d=$(rs_rule_config_get "$original_virt" evaluationInterval1d 2>/dev/null || true); restore_virt_1d="${restore_virt_1d:-$RS_EVAL_INTERVAL_1D_DEFAULT}"
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "restored validation intervals" \
+        mcoa_manifestwork_rule_has_intervals acm-rs-namespace-prometheus-rules "$restore_5m" "$restore_1d" || ((errors++)) || true
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "restored virtualization validation intervals" \
+        mcoa_manifestwork_rule_has_intervals acm-rs-virt-prometheus-rules "$restore_virt_5m" "$restore_virt_1d" || ((errors++)) || true
+    if (( errors > 0 )); then
+        PHASE_FAIL_REASON="$errors evaluation interval validation assertion(s) failed"
+        return 1
+    fi
+    return 0
+}
+
+phase_10c() {
+    rs_eval_interval_gate || return $?
+    check_mcoa_interval_source || return 1
+    local errors=0 original_ns original_virt original_placement_ns original_placement_virt fresh removed rv_before rv_after
+    local witness=123 actual
+    capture_rs_rule_configs
+    original_ns="$E2E_CAPTURED_NS_RULE_CONFIG"; original_virt="$E2E_CAPTURED_VIRT_RULE_CONFIG"
+    [[ -n "$original_ns" ]] || { PHASE_FAIL_REASON="rs-namespace-config is required"; return 1; }
+    original_placement_ns=$(get_resource_field configmap rs-namespace-config "$OBS_NAMESPACE" \
+        '{.data.placementConfiguration}' 2>/dev/null || true)
+    original_placement_virt=$(get_resource_field configmap rs-virt-config "$OBS_NAMESPACE" \
+        '{.data.placementConfiguration}' 2>/dev/null || true)
+
+    log_substep "Checking defaults on a newly recreated ConfigMap"
+    patch_rs_features false true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace ConfigMap deletion" \
+        not_resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    patch_rs_features true true
+    wait_until "$TIMEOUT_E2E_RECONCILE" 5 "namespace ConfigMap recreation" \
+        resource_exists configmap rs-namespace-config "$OBS_NAMESPACE" || ((errors++)) || true
+    fresh=$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)
+    [[ "$(rs_rule_config_get "$fresh" evaluationInterval 2>/dev/null || true)" == "$RS_EVAL_INTERVAL_DEFAULT" ]] || ((errors++)) || true
+    [[ "$(rs_rule_config_get "$fresh" evaluationInterval1d 2>/dev/null || true)" == "$RS_EVAL_INTERVAL_1D_DEFAULT" ]] || ((errors++)) || true
+
+    log_substep "Checking no-backfill on an existing ConfigMap"
+    removed=$(rs_rule_config_unset "$fresh" evaluationInterval 2>/dev/null || true)
+    removed=$(rs_rule_config_unset "$removed" evaluationInterval1d 2>/dev/null || true)
+    patch_rs_rule_config_blob rs-namespace-config "$removed"
+    patch_rs_rule_config rs-namespace-config recommendationPercentage "$witness"
+    rv_before=$(get_resource_field configmap rs-namespace-config "$OBS_NAMESPACE" '{.metadata.resourceVersion}' 2>/dev/null || true)
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "positive no-backfill witness" \
+        manifestwork_contains "($witness/100)" || ((errors++)) || true
+    rv_after=$(get_resource_field configmap rs-namespace-config "$OBS_NAMESPACE" '{.metadata.resourceVersion}' 2>/dev/null || true)
+    [[ "$rv_after" == "$rv_before" ]] || { log_error "  operator backfilled the absent interval keys"; ((errors++)) || true; }
+    actual=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)" evaluationInterval 2>/dev/null || true)
+    [[ -z "$actual" ]] || ((errors++)) || true
+    actual=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)" evaluationInterval1d 2>/dev/null || true)
+    [[ -z "$actual" ]] || ((errors++)) || true
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "default rendered intervals without backfill" \
+        mcoa_manifestwork_rule_has_intervals acm-rs-namespace-prometheus-rules \
+        "$RS_EVAL_INTERVAL_DEFAULT" "$RS_EVAL_INTERVAL_1D_DEFAULT" || ((errors++)) || true
+
+    log_substep "Checking legal but wasteful evaluation ordering"
+    patch_rs_rule_config rs-namespace-config evaluationInterval 30m
+    patch_rs_rule_config rs-namespace-config evaluationInterval1d 15m
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "wasteful ordering propagation" \
+        wait_rs_config_value rs-namespace-config evaluationInterval 30m || ((errors++)) || true
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "wasteful daily ordering propagation" \
+        wait_rs_config_value rs-namespace-config evaluationInterval1d 15m || ((errors++)) || true
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "wasteful ordering ManifestWork render" \
+        mcoa_manifestwork_rule_has_intervals acm-rs-namespace-prometheus-rules 30m 15m || ((errors++)) || true
+    if mcoa_log_contains "evaluationInterval"; then
+        log_info "  MCOA ordering log observed (absence is not a failure)"
+    else
+        log_info "  MCOA ordering log not observed (absence is not evidence; Logger.Info may be trimmed)"
+    fi
+
+    restore_rs_rule_config rs-namespace-config "$original_ns" || ((errors++)) || true
+    [[ -z "$original_virt" ]] || restore_rs_rule_config rs-virt-config "$original_virt" || ((errors++)) || true
+    if [[ -n "$original_placement_ns" ]]; then
+        patch_rs_config_data rs-namespace-config placementConfiguration "$original_placement_ns" || ((errors++)) || true
+    else
+        unset_rs_config_data rs-namespace-config placementConfiguration || ((errors++)) || true
+    fi
+    if [[ -n "$original_placement_virt" ]]; then
+        patch_rs_config_data rs-virt-config placementConfiguration "$original_placement_virt" || ((errors++)) || true
+    elif resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
+        unset_rs_config_data rs-virt-config placementConfiguration || ((errors++)) || true
+    fi
+    if (( errors > 0 )); then
+        PHASE_FAIL_REASON="$errors evaluation interval default/no-backfill assertion(s) failed"
         return 1
     fi
     return 0
@@ -3466,9 +4146,9 @@ phase_20() {
                 spoke_cpu_usage=$(spoke_query_metric "acm_rs:namespace:cpu_usage:5m" "namespace=\"$ns\"")
                 # recommendation:5m doesn't exist at tier-1 — compute from usage * (rp/100)
                 local rp
-                rp=$($KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" \
-                    -o jsonpath='{.data.prometheusRuleConfig}' --request-timeout=10s 2>/dev/null | \
-                    jq -r '.recommendationPercentage // 110' 2>/dev/null || echo "110")
+                rp=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)" \
+                    recommendationPercentage 2>/dev/null || true)
+                [[ -z "$rp" || "$rp" == "0" ]] && rp="110"
                 spoke_mem_rec=""
                 if [[ -n "$spoke_mem_usage" ]]; then
                     spoke_mem_rec=$(awk "BEGIN {printf \"%.0f\", $spoke_mem_usage * ($rp / 100)}")
@@ -3627,9 +4307,9 @@ phase_21() {
                 spoke_cpu_usage=$(spoke_query_metric "acm_rs_vm:namespace:cpu_usage:5m" "name=\"$vm_name\",namespace=\"$RS_VM_WORKLOAD_NS\"")
                 # recommendation:5m doesn't exist at tier-1 — compute from usage * (rp/100)
                 local rp
-                rp=$($KUBE_CLI get configmap rs-namespace-config -n "$OBS_NAMESPACE" \
-                    -o jsonpath='{.data.prometheusRuleConfig}' --request-timeout=10s 2>/dev/null | \
-                    jq -r '.recommendationPercentage // 110' 2>/dev/null || echo "110")
+                rp=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-virt-config "$OBS_NAMESPACE" 2>/dev/null || true)" \
+                    recommendationPercentage 2>/dev/null || true)
+                [[ -z "$rp" || "$rp" == "0" ]] && rp="110"
                 spoke_mem_rec=""
                 if [[ -n "$spoke_mem_usage" ]]; then
                     spoke_mem_rec=$(awk "BEGIN {printf \"%.0f\", $spoke_mem_usage * ($rp / 100)}")
@@ -4782,6 +5462,9 @@ main() {
     run_phase "9d"  "Re-enable both (MCOA)"           phase_9d
     run_phase "9e"  "NamespaceBinding change (MCOA)"  phase_9e
     run_phase "10"  "ConfigMap propagation (MCOA)"    phase_10
+    run_phase "10a" "Evaluation interval propagation (MCOA)" phase_10a
+    run_phase "10b" "Evaluation interval validation/write-back (MCOA)" phase_10b
+    run_phase "10c" "Evaluation interval defaults/no-backfill (MCOA)" phase_10c
     run_phase "11"  "MCOA -> MCO switch"              phase_11
     run_phase "12"  "Version mismatch"                phase_12
 

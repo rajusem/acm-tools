@@ -233,22 +233,37 @@ detect_acm_namespace() {
 # variable would exit immediately; this form preserves any value exported by a parent
 # process (e.g. rs-e2e → setup-observability) while defaulting to empty if unset.
 RS_RELEASE="${RS_RELEASE:-}"
+RS_MCH_VERSION="${RS_MCH_VERSION:-}"
+
+# Right-sizing evaluation interval bounds.  Keep these in one place so the
+# e2e checks, status dashboard, and must-gather analysis agree with the MCOA
+# contract.
+export RS_EVAL_INTERVAL_DEFAULT="${RS_EVAL_INTERVAL_DEFAULT:-5m}"
+export RS_EVAL_INTERVAL_MIN="${RS_EVAL_INTERVAL_MIN:-5m}"
+export RS_EVAL_INTERVAL_MAX="${RS_EVAL_INTERVAL_MAX:-1h}"
+export RS_EVAL_INTERVAL_1D_DEFAULT="${RS_EVAL_INTERVAL_1D_DEFAULT:-15m}"
+export RS_EVAL_INTERVAL_1D_MIN="${RS_EVAL_INTERVAL_1D_MIN:-15m}"
+export RS_EVAL_INTERVAL_1D_MAX="${RS_EVAL_INTERVAL_1D_MAX:-6h}"
 
 # detect_release — sets RS_RELEASE from MCH status.currentVersion.
 # Short-circuits if RS_RELEASE already set (--release flag or parent export wins).
 # Exports RS_RELEASE so subprocess calls (setup-observability, rs-mode-switch) inherit.
 # Must be called after init_acm_tools() (needs $KUBE_CLI and $ACM_NAMESPACE).
 detect_release() {
+    # An explicit --release is intentionally only a coarse behaviour token.
+    # There is no exact MCH version to compare in this path.
+    RS_MCH_VERSION=""
     if [[ -n "$RS_RELEASE" ]]; then
-        [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || {
+        [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0|5\.1)$ ]] || {
             log_error "Inherited RS_RELEASE='$RS_RELEASE' is not a recognized release — set --release or unset RS_RELEASE"
             exit 1
         }
-        export RS_RELEASE; return
+        export RS_RELEASE RS_MCH_VERSION; return
     fi
     local version major minor
     version=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" \
         '{.status.currentVersion}' 2>/dev/null || echo "")
+    RS_MCH_VERSION="$version"
     major=$(echo "$version" | cut -d. -f1)
     minor=$(echo "$version" | cut -d. -f2)
     if   [[ "$major" == "5"  ]];                    then RS_RELEASE="5.0"
@@ -258,8 +273,229 @@ detect_release() {
         log_warn "MCH version '${version:-<not found>}' not recognized — defaulting to 2.17; use --release to override"
         RS_RELEASE="2.17"
     fi
-    export RS_RELEASE
+    export RS_RELEASE RS_MCH_VERSION
     log_info "Release: $RS_RELEASE (auto-detected from MCH $version)"
+}
+
+# Numeric comparison for the exact MCH version fetched by detect_release.
+# Returns 1 for an unknown/unparseable version so callers can distinguish an
+# unknown release from one known to be below the minimum supported version.
+release_at_least() {
+    local required="$1" version_major version_minor required_major required_minor
+
+    [[ "$required" =~ ^([0-9]+)\.([0-9]+)$ ]] || return 1
+    required_major="${BASH_REMATCH[1]}"
+    required_minor="${BASH_REMATCH[2]}"
+    [[ "$RS_MCH_VERSION" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?([+-].*)?$ ]] || return 1
+    version_major="${BASH_REMATCH[1]}"
+    version_minor="${BASH_REMATCH[2]}"
+
+    if (( 10#$version_major > 10#$required_major )); then
+        return 0
+    fi
+    if (( 10#$version_major < 10#$required_major )); then
+        return 1
+    fi
+    (( 10#$version_minor >= 10#$required_minor ))
+}
+
+# Read a scalar top-level key from either the YAML representation used by
+# MCOA or the legacy JSON representation.  The YAML expression is anchored so
+# evaluationInterval cannot accidentally match evaluationInterval1d.
+rs_rule_config_get() {
+    local blob="$1" key="$2" value line yaml_key_re
+    [[ -n "$blob" ]] || return 1
+
+    yaml_key_re="^[[:space:]]*${key}:[[:space:]]*"
+    line=$(printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '
+        $0 ~ re { print; found=1; exit }
+        END { if (!found) exit 1 }
+    ' 2>/dev/null) || line=""
+    if [[ -n "$line" ]]; then
+        value="${line#*:}"
+        value="${value#${value%%[![:space:]]*}}"
+        value="${value%%[[:space:]]*}"
+        # Remove a trailing YAML comment only when it is separated by space.
+        value="${value%%[[:space:]]#*}"
+        if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^'(.*)'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+        if [[ -n "$value" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+        # YAML arrays and objects are commonly emitted as block values.  Return
+        # a compact JSON representation for those values so callers can compare
+        # them semantically instead of losing the field at the blank key line.
+        if command -v yq >/dev/null 2>&1; then
+            value=$(printf '%s\n' "$blob" | yq -o=json '.' 2>/dev/null | jq -cer --arg key "$key" \
+                'if type == "object" and has($key) and .[$key] != null then .[$key] else empty end' \
+                2>/dev/null) || value=""
+            [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }
+        fi
+        return 1
+    fi
+
+    value=$(printf '%s\n' "$blob" | jq -er --arg key "$key" \
+        'if type == "object" and has($key) and .[$key] != null then .[$key] | if type == "string" then . else tostring end else empty end' \
+        2>/dev/null) || return 1
+    [[ -n "$value" ]] || return 1
+    printf '%s\n' "$value"
+}
+
+# Convert a JSON object to YAML when yq is available.  YAML callers already
+# have a stable, human-readable representation and are edited in place below.
+rs_rule_config_json_to_yaml() {
+    if command -v yq >/dev/null 2>&1; then
+        yq -P '.' 2>/dev/null
+    else
+        # Keep the helper usable on installations without yq for scalar-only
+        # callers; callers that need to edit JSON receive an explicit error.
+        return 1
+    fi
+}
+
+rs_rule_config_set() {
+    local blob="$1" key="$2" value="$3" yaml_key_re normalized value_json json_blob updated
+    normalized="$value"
+    if [[ "$normalized" =~ ^\"(.*)\"$ || "$normalized" =~ ^'(.*)'$ ]]; then
+        normalized="${BASH_REMATCH[1]}"
+    fi
+
+    # Use a typed YAML round-trip whenever yq is available.  This preserves
+    # numeric fields and block-list fields from legacy JSON/YAML blobs; a
+    # string-only jq assignment would turn recommendationPercentage into a
+    # quoted YAML string and leave orphaned list items behind.
+    if command -v yq >/dev/null 2>&1; then
+        value_json=$(printf 'value: %s\n' "$normalized" | yq -o=json '.value' 2>/dev/null) || return 1
+        json_blob=$(printf '%s\n' "$blob" | yq -o=json '.' 2>/dev/null) || return 1
+        updated=$(printf '%s\n' "$json_blob" | jq --arg key "$key" --argjson value "$value_json" \
+            '.[$key] = $value' 2>/dev/null) || return 1
+        printf '%s\n' "$updated" | rs_rule_config_json_to_yaml
+        return $?
+    fi
+
+    yaml_key_re="^[[:space:]]*${key}:"
+    if printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 ~ re && $0 ~ /:[[:space:]]*$/ { found=1; exit } END { exit !found }' \
+        >/dev/null 2>&1; then
+        log_error "Editing block-valued prometheusRuleConfig key '$key' requires yq" >&2
+        return 1
+    fi
+    if printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 ~ re { found=1; exit } END { exit !found }' \
+        >/dev/null 2>&1; then
+        printf '%s\n' "$blob" | awk -v re="$yaml_key_re" -v key="$key" -v value="$normalized" '
+            $0 ~ re { print key ": " value; replaced=1; next }
+            { print }
+            END { if (!replaced) print key ": " value }
+        '
+        return 0
+    fi
+
+    if printf '%s\n' "$blob" | jq -e . >/dev/null 2>&1; then
+        normalized=$(printf '%s\n' "$blob" | jq --arg key "$key" --arg value "$normalized" '.[$key] = $value' 2>/dev/null) || return 1
+        printf '%s\n' "$normalized" | rs_rule_config_json_to_yaml || {
+            log_error "Editing JSON prometheusRuleConfig requires yq for YAML normalization" >&2
+            return 1
+        }
+        return 0
+    fi
+
+    if [[ -n "$blob" ]]; then
+        printf '%s\n' "$blob"
+    fi
+    printf '%s: %s\n' "$key" "$normalized"
+}
+
+rs_rule_config_unset() {
+    local blob="$1" key="$2" yaml_key_re json_blob updated
+    [[ -n "$blob" ]] || { printf '\n'; return 0; }
+    if command -v yq >/dev/null 2>&1; then
+        json_blob=$(printf '%s\n' "$blob" | yq -o=json '.' 2>/dev/null) || return 1
+        updated=$(printf '%s\n' "$json_blob" | jq --arg key "$key" 'del(.[$key])' 2>/dev/null) || return 1
+        printf '%s\n' "$updated" | rs_rule_config_json_to_yaml
+        return $?
+    fi
+
+    yaml_key_re="^[[:space:]]*${key}:"
+    if printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 ~ re && $0 ~ /:[[:space:]]*$/ { found=1; exit } END { exit !found }' \
+        >/dev/null 2>&1; then
+        log_error "Removing block-valued prometheusRuleConfig key '$key' requires yq" >&2
+        return 1
+    fi
+    if printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 ~ re { found=1; exit } END { exit !found }' \
+        >/dev/null 2>&1; then
+        printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 !~ re { print }'
+        return 0
+    fi
+    if printf '%s\n' "$blob" | jq -e . >/dev/null 2>&1; then
+        printf '%s\n' "$blob" | jq --arg key "$key" 'del(.[$key])' 2>/dev/null | rs_rule_config_json_to_yaml || return 1
+        return 0
+    fi
+    printf '%s\n' "$blob"
+}
+
+rs_rule_config_from_cluster() {
+    local cm="$1" namespace="$2"
+    $KUBE_CLI get configmap "$cm" -n "$namespace" \
+        -o jsonpath='{.data.prometheusRuleConfig}' --request-timeout=10s
+}
+
+rs_rule_config_from_file() {
+    local path="$1" value
+    [[ -f "$path" ]] || return 1
+
+    value=$(jq -er '.data.prometheusRuleConfig // empty' "$path" 2>/dev/null) || value=""
+    if [[ -n "$value" ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    if command -v yq >/dev/null 2>&1; then
+        value=$(yq -r '.data.prometheusRuleConfig // empty' "$path" 2>/dev/null) || value=""
+        if [[ -n "$value" ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
+
+    # Minimal fallback for a ConfigMap YAML artifact when yq is unavailable.
+    awk '
+        /^data:[[:space:]]*$/ { in_data=1; next }
+        in_data && /^[^[:space:]]/ { exit }
+        in_data && /^[[:space:]]+prometheusRuleConfig:[[:space:]]*\|[-+]?/ { in_blob=1; next }
+        in_blob && /^[[:space:]]{2,}/ { sub(/^[[:space:]]{2}/, ""); print; next }
+        in_blob { exit }
+    ' "$path"
+}
+
+rs_duration_ms() {
+    local value="$1" number unit multiplier
+    [[ "$value" =~ ^([0-9]+)(ms|s|m|h|d|w|y)$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    [[ "$number" =~ [1-9] ]] || return 1
+    case "$unit" in
+        ms) multiplier=1 ;;
+        s)  multiplier=1000 ;;
+        m)  multiplier=60000 ;;
+        h)  multiplier=3600000 ;;
+        d)  multiplier=86400000 ;;
+        w)  multiplier=604800000 ;;
+        y)  multiplier=31536000000 ;;
+    esac
+    awk -v number="$number" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", number * multiplier }'
+}
+
+rs_eval_interval_check() {
+    local value="$1" min="$2" max="$3" value_ms min_ms max_ms
+    [[ -z "$value" ]] && return 0
+    value_ms=$(rs_duration_ms "$value") || return 1
+    min_ms=$(rs_duration_ms "$min") || return 1
+    max_ms=$(rs_duration_ms "$max") || return 1
+    if (( value_ms < min_ms || value_ms > max_ms )); then
+        return 2
+    fi
+    return 0
 }
 
 release_is_50()  { [[ "$RS_RELEASE" == "5.0"  ]]; }

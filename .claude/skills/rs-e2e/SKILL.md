@@ -9,7 +9,7 @@ Run end-to-end validation of right-sizing resource lifecycle on the current clus
 - `--mode-switch` — Also test MCO-to-MCOA mode switching (adds phases 5-12, 15-16)
 - `--build mco|mcoa|both` — Build, push, and apply custom image(s) before running tests
 - `--image-override` — Apply existing `image-override.json` without building
-- `--phases 0-3,5,9a` — Run specific phases (comma-separated, ranges OK)
+- `--phases 0-3,5,9a` — Run specific phases (comma-separated, ranges OK; `--phases 10` selects 10 and 10a-10c)
 - `--data-plane` — Include data-plane validation phases 17-22 (deploy workloads, wait for Thanos metrics, validate)
 - `--skip-vm` — Skip VM workload phases (18, 21, 21a, 21b)
 - `--no-metrics-wait` — Skip the 20-minute metrics collection wait (phase 19)
@@ -33,6 +33,7 @@ Run `bin/rs-e2e` with the appropriate flags. The script is fully automated and h
 | Build both images then test | `bin/rs-e2e --build both --mode-switch` |
 | Deploy existing override then test | `bin/rs-e2e --image-override` |
 | Specific phases | `bin/rs-e2e --phases 0-3,5,9a` |
+| Evaluation interval checks | `bin/rs-e2e --phases 10a,10b,10c` |
 | Force MCOA mode | `bin/rs-e2e mcoa` |
 | Test 5.0 images on 2.17 cluster | `bin/rs-e2e --release 5.0 --skip-uninstall` |
 | Test 5.0 with data-plane + VMs | `bin/rs-e2e --release 5.0 --data-plane --yes` |
@@ -122,7 +123,7 @@ If the script fails or a phase reports FAIL:
    - Use yaml.v2 lowercased field names for OCM types: `requiredclusterselector`, `labelselector`, `matchlabels`
    - Validate filtering via ManifestWork PrometheusRule distribution, not PlacementDecisions
 
-4. **Phase 10 (ConfigMap propagation MCOA)**: ConfigMap data keys are YAML strings, not JSON. The script uses `jq gsub` on `.data.prometheusRuleConfig` to do string replacement.
+4. **Phases 10a-10c (evaluation intervals)**: Require detected ACM >= 5.1, or explicit `--release 5.1` opt-in; older releases skip even with a custom MCOA image. The explicit override selects only 10a-10c by default. The capability probe uses sentinel percentage `125` and a ManifestWork resourceVersion change; an unsupported MCOA fails the probe, while a dead pipeline fails. Case 1 in 10b restarts MCOA deliberately so the cold-cache fallback is deterministic. If the phases skip, check the release gate or `--data-plane` reason.
 
 5. **IsMCOTerminating stale state**: After MCO deletion, the operator caches a terminating flag in memory. The script detects this in phase 0 and restarts the operator pod.
 
@@ -151,6 +152,9 @@ Timeouts (set in `bin/rs-e2e` or `config.sh`):
 
 - `TIMEOUT_E2E_RECONCILE` — Seconds to wait after MCO spec patches (default: 90)
 - `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
+- `TIMEOUT_RS_INTERVAL_PROPAGATION` — Seconds to wait for interval propagation, probing, and write-back (default: 180)
+- `RS_EVAL_INTERVAL_TEST` — Rolling interval used by phase 10a (default: `10m`)
+- `RS_EVAL_INTERVAL_1D_TEST` — Daily interval used by phase 10a (default: `30m`)
 - `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 300)
 - `TIMEOUT_COO_INSTALL` — Seconds to wait for COO installation before checking Perses (default: 120, in `config.sh`)
 - `TIMEOUT_MW_STUCK` — Seconds before a deleting ManifestWork is considered stuck (default: 120, in `config.sh`)

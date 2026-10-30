@@ -46,6 +46,75 @@ usage() {
     echo "  - Spoke PrometheusRules and agent logs"
 }
 
+must_gather_config_blob() {
+    local dir="$1" cm="$2" json_file yaml_file
+    json_file="$dir/hub/resources/configmap-$cm.json"
+    yaml_file="$dir/hub/resources/configmap-$cm.yaml"
+    if [[ -f "$json_file" ]]; then
+        rs_rule_config_from_file "$json_file" && return 0
+    fi
+    if [[ -f "$yaml_file" ]]; then
+        rs_rule_config_from_file "$yaml_file" && return 0
+    fi
+    return 1
+}
+
+must_gather_rendered_interval() {
+    local dir="$1" cm="$2" kind="$3" rule_name suffix file value
+    [[ "$cm" == "rs-namespace-config" ]] && rule_name="acm-rs-namespace-prometheus-rules" || rule_name="acm-rs-virt-prometheus-rules"
+    [[ "$kind" == "rolling" ]] && suffix="-5m.rule" || suffix="-1d"
+    for file in "$dir"/hub/manifests/*.json; do
+        [[ -f "$file" ]] || continue
+        value=$(jq -r --arg rule "$rule_name" --arg suffix "$suffix" '
+            [ .spec.workload.manifests[]? | select(.kind == "PrometheusRule" and .metadata.name == $rule) |
+              .spec.groups[]? | select(.name | endswith($suffix)) | .interval ] | .[0] // empty
+        ' "$file" 2>/dev/null || true)
+        [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }
+    done
+    return 1
+}
+
+analyze_eval_config() {
+    local dir="$1" cm="$2" blob value value_1d rendered rendered_1d rc
+    blob=$(must_gather_config_blob "$dir" "$cm" 2>/dev/null || true)
+    [[ -n "$blob" ]] || return 0
+    value=$(rs_rule_config_get "$blob" evaluationInterval 2>/dev/null || true)
+    value_1d=$(rs_rule_config_get "$blob" evaluationInterval1d 2>/dev/null || true)
+    rendered=$(must_gather_rendered_interval "$dir" "$cm" rolling 2>/dev/null || true)
+    rendered_1d=$(must_gather_rendered_interval "$dir" "$cm" daily 2>/dev/null || true)
+    echo -e "  ${BOLD}$cm:${NC} evaluationInterval=${value:-$RS_EVAL_INTERVAL_DEFAULT}$( [[ -z "$value" ]] && echo ' (default)' )"
+    echo -e "  ${BOLD}$cm:${NC} evaluationInterval1d=${value_1d:-$RS_EVAL_INTERVAL_1D_DEFAULT}$( [[ -z "$value_1d" ]] && echo ' (default)' )"
+
+    if rs_eval_interval_check "$value" "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX"; then :; else
+        rc=$?
+        log_error "$cm evaluationInterval is invalid (allowed $RS_EVAL_INTERVAL_MIN to $RS_EVAL_INTERVAL_MAX; MCOA will revert it)"
+        ((findings++)) || true
+    fi
+    if rs_eval_interval_check "$value_1d" "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX"; then :; else
+        rc=$?
+        log_error "$cm evaluationInterval1d is invalid (allowed $RS_EVAL_INTERVAL_1D_MIN to $RS_EVAL_INTERVAL_1D_MAX; MCOA will revert it)"
+        ((findings++)) || true
+    fi
+    if [[ -n "$value" && -n "$value_1d" ]] && \
+        rs_eval_interval_check "$value" "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX" && \
+        rs_eval_interval_check "$value_1d" "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX" && \
+        (( $(rs_duration_ms "$value") > $(rs_duration_ms "$value_1d") )); then
+        log_warn "$cm uses wasteful ordering: evaluationInterval=$value is coarser than evaluationInterval1d=$value_1d"
+        ((warnings++)) || true
+    fi
+    local effective_value="${value:-$RS_EVAL_INTERVAL_DEFAULT}" effective_value_1d="${value_1d:-$RS_EVAL_INTERVAL_1D_DEFAULT}"
+    if [[ -n "$rendered" ]] && \
+        [[ "$(rs_duration_ms "$rendered" 2>/dev/null || echo -1)" != "$(rs_duration_ms "$effective_value" 2>/dev/null || echo -2)" ]]; then
+        log_warn "$cm rendered rolling interval $rendered differs from ConfigMap value/default $effective_value"
+        ((warnings++)) || true
+    fi
+    if [[ -n "$rendered_1d" ]] && \
+        [[ "$(rs_duration_ms "$rendered_1d" 2>/dev/null || echo -1)" != "$(rs_duration_ms "$effective_value_1d" 2>/dev/null || echo -2)" ]]; then
+        log_warn "$cm rendered daily interval $rendered_1d differs from ConfigMap value/default $effective_value_1d"
+        ((warnings++)) || true
+    fi
+}
+
 # =============================================================================
 # Analyze function — works on collected must-gather directory (no cluster needed)
 # =============================================================================
@@ -434,7 +503,51 @@ do_analyze() {
     fi
 
     # =====================================================================
-    # Check 7: Events
+    # Check 7: Configurable evaluation intervals
+    # =====================================================================
+    if [[ "$mode" == "mcoa" ]]; then
+        echo ""
+        log_step "Evaluation intervals"
+        analyze_eval_config "$dir" rs-namespace-config
+        analyze_eval_config "$dir" rs-virt-config
+
+        local mcoa_log="$dir/hub/logs/mcoa-addon-manager.log"
+        if [[ -f "$mcoa_log" ]] && ! grep -q "command failed" "$mcoa_log" 2>/dev/null; then
+            local interval_rejections ordering_lines live_bounds bound_line live_min live_max
+            interval_rejections=$(grep -i "Invalid evaluationInterval" "$mcoa_log" 2>/dev/null || true)
+            ordering_lines=$(grep -i "evaluationInterval.*coarser\|evaluationInterval.*daily\|ordering" "$mcoa_log" 2>/dev/null || true)
+            if [[ -n "$interval_rejections" ]]; then
+                log_warn "MCOA interval rejection log lines found (Logger.Info):"
+                echo "$interval_rejections" | tail -5 | while read -r line; do echo "    $(echo "$line" | cut -c1-160)"; done
+            else
+                log_info "No Invalid evaluationInterval line found; absence is not evidence (Logger.Info/LOG_LINES=500)."
+            fi
+            if [[ -n "$ordering_lines" ]]; then
+                log_info "MCOA evaluation ordering log line found (Logger.Info)."
+            else
+                log_info "No ordering warning found; absence is not evidence (Logger.Info/LOG_LINES=500)."
+            fi
+
+            live_bounds=$(grep -Eo 'outside the allowed range [^ ]+ to [^ ,"]+' "$mcoa_log" 2>/dev/null | tail -2 || true)
+            while IFS= read -r bound_line; do
+                [[ "$bound_line" =~ ^outside[[:space:]]+the[[:space:]]+allowed[[:space:]]+range[[:space:]]+([^[:space:]]+)[[:space:]]+to[[:space:]]+([^[:space:],\"]+) ]] || continue
+                live_min="${BASH_REMATCH[1]}"
+                live_max="${BASH_REMATCH[2]}"
+                case "$live_min:$live_max" in
+                    "$RS_EVAL_INTERVAL_MIN:$RS_EVAL_INTERVAL_MAX"|"$RS_EVAL_INTERVAL_1D_MIN:$RS_EVAL_INTERVAL_1D_MAX") ;;
+                    *)
+                    log_warn "MCOA live rejection bounds ($live_min to $live_max) differ from local constants"
+                    ((warnings++)) || true
+                    ;;
+                esac
+            done <<< "$live_bounds"
+        else
+            log_info "MCOA logs unavailable; interval log checks cannot distinguish absence from log trimming."
+        fi
+    fi
+
+    # =====================================================================
+    # Check 8: Events
     # =====================================================================
     echo ""
     log_step "Events (recent warnings)"
@@ -500,6 +613,14 @@ do_collect() {
         "$@" >> "$output_dir/$file" 2>&1 || echo "(command failed)" >> "$output_dir/$file"
     }
 
+    # Keep machine-readable snapshots valid JSON.  Human-readable captures
+    # retain the command/date header for diagnostics.
+    collect_json() {
+        local file="$1"
+        shift
+        "$@" > "$output_dir/$file" 2>&1 || echo "(command failed)" >> "$output_dir/$file"
+    }
+
     # =============================================================================
     # Hub Cluster
     # =============================================================================
@@ -550,6 +671,8 @@ do_collect() {
     for cm in rs-namespace-config rs-virt-config; do
         collect "hub/resources/configmap-$cm.yaml" \
             $KUBE_CLI get configmap "$cm" -n "$OBS_NAMESPACE" -o yaml
+        collect_json "hub/resources/configmap-$cm.json" \
+            $KUBE_CLI get configmap "$cm" -n "$OBS_NAMESPACE" -o json
     done
 
     log_substep "Policies"

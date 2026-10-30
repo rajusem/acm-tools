@@ -3390,14 +3390,15 @@ spoke_prometheus_group_interval_ok() {
 
 check_spoke_interval_groups() {
     local context="$1" rule_name="$2" interval="$3" errors=0 group
-    for group in "$@"; do :; done
     shift 3
+    if ! $KUBE_CLI --context="$context" cluster-info --request-timeout=10s >/dev/null 2>&1; then
+        log_info "  $context is unreachable; skipping direct spoke runtime check"
+        return 0
+    fi
     for group in "$@"; do
-        if ! $KUBE_CLI --context="$context" cluster-info --request-timeout=10s >/dev/null 2>&1; then
-            log_info "  $context is unreachable; skipping direct spoke runtime check"
-            return 0
-        fi
-        if spoke_prometheus_group_interval_ok "$context" "$rule_name" "$group" "$interval"; then
+        if wait_until "${TIMEOUT_RS_INTERVAL_PROPAGATION:-180}" 5 \
+            "$context: $rule_name/$group interval=$interval" \
+            spoke_prometheus_group_interval_ok "$context" "$rule_name" "$group" "$interval"; then
             log_success "  $context: $rule_name/$group interval=$interval, no Prometheus lastError"
         else
             log_error "  $context: $rule_name/$group was not admitted/running at interval=$interval"
@@ -3407,22 +3408,90 @@ check_spoke_interval_groups() {
     return "$errors"
 }
 
+# Parse a Go "N * time.Unit" expression (as seen in a Go const body) into milliseconds.
+# Only handles single-unit expressions; compound expressions (e.g. derived consts) return 1.
+_parse_go_time_expr_ms() {
+    local line="$1" n unit
+    n=$(printf '%s\n' "$line" | sed -nE 's/.*[^0-9]([0-9]+)[[:space:]]*\*[[:space:]]*time\.[A-Za-z]+.*/\1/p')
+    unit=$(printf '%s\n' "$line" | sed -nE 's/.*time\.([A-Za-z]+).*/\1/p')
+    [[ "$n" =~ ^[0-9]+$ && -n "$unit" ]] || return 1
+    case "$unit" in
+        Millisecond) printf '%s\n' $(( n )) ;;
+        Second)      printf '%s\n' $(( n * 1000 )) ;;
+        Minute)      printf '%s\n' $(( n * 60000 )) ;;
+        Hour)        printf '%s\n' $(( n * 3600000 )) ;;
+        Day)         printf '%s\n' $(( n * 86400000 )) ;;
+        *)           return 1 ;;
+    esac
+}
+
 check_mcoa_interval_source() {
     [[ "$BUILD_TARGET" == "mcoa" || "$BUILD_TARGET" == "both" ]] || return 0
     [[ -d "$MCOA_REPO_DIR" ]] || return 0
     command -v rg >/dev/null 2>&1 || return 0
+    local rulebuilder="$MCOA_REPO_DIR/internal/analytics/rightsizing/rulebuilder.go"
 
     if rg -n 'backfillConfigKeys' "$MCOA_REPO_DIR/internal" >/dev/null 2>&1; then
         PHASE_FAIL_REASON="MCOA source checkout still contains pre-#728 backfillConfigKeys; build the merged upstream #728 commit"
         return 1
     fi
-    if ! rg -n 'evaluationInterval' "$MCOA_REPO_DIR/internal/analytics/rightsizing/rulebuilder.go" >/dev/null 2>&1; then
+    if ! rg -n 'evaluationInterval' "$rulebuilder" >/dev/null 2>&1; then
         PHASE_FAIL_REASON="MCOA source checkout does not contain configurable evaluation interval support"
         return 1
     fi
-    if ! rg -n 'MaxEvaluationInterval|MaxEvaluationInterval1d' \
-        "$MCOA_REPO_DIR/internal/analytics/rightsizing/rulebuilder.go" >/dev/null 2>&1; then
-        log_warn "Could not find upstream derived interval-bound constants; verify local bounds against the MCOA build"
+
+    # Compare the four bound constants (two floors, two derived ceilings) against the local
+    # RS_EVAL_INTERVAL_* values to catch upstream bound drift (it happened once already).
+    local src_min_line src_min1d_line src_aw_line src_mspaw src_mdrpaw
+    local src_min_ms="" src_min1d_ms="" src_aw_ms="" src_max_ms="" src_max1d_ms=""
+    local local_min_ms local_min1d_ms local_max_ms local_max1d_ms
+
+    src_min_line=$(grep -E '^[[:space:]]*MinEvaluationInterval[[:space:]]*=' "$rulebuilder" | \
+        grep -v '1d' | grep 'time\.' | head -1 || true)
+    src_min1d_line=$(grep -E '^[[:space:]]*MinEvaluationInterval1d[[:space:]]*=' "$rulebuilder" | \
+        grep 'time\.' | head -1 || true)
+    src_aw_line=$(grep -E '^[[:space:]]*AggregationWindow[[:space:]]*=' "$rulebuilder" | \
+        grep 'time\.' | head -1 || true)
+    src_mspaw=$(grep -E '^[[:space:]]*MinSamplesPerAggregationWindow[[:space:]]*=[[:space:]]*[0-9]+' \
+        "$rulebuilder" | awk -F= '{n=$2; gsub(/[^0-9]/, "", n); print n}' | head -1 || true)
+    src_mdrpaw=$(grep -E '^[[:space:]]*MinDailyRunsPerAggregationWindow[[:space:]]*=[[:space:]]*[0-9]+' \
+        "$rulebuilder" | awk -F= '{n=$2; gsub(/[^0-9]/, "", n); print n}' | head -1 || true)
+
+    if [[ -n "$src_min_line" ]]; then
+        src_min_ms=$(_parse_go_time_expr_ms "$src_min_line" 2>/dev/null || true)
+    fi
+    if [[ -n "$src_min1d_line" ]]; then
+        src_min1d_ms=$(_parse_go_time_expr_ms "$src_min1d_line" 2>/dev/null || true)
+    fi
+    if [[ -n "$src_aw_line" ]]; then
+        src_aw_ms=$(_parse_go_time_expr_ms "$src_aw_line" 2>/dev/null || true)
+    fi
+    if [[ -n "$src_aw_ms" && -n "$src_mspaw" && "$src_mspaw" -gt 0 ]] 2>/dev/null; then
+        src_max_ms=$(( src_aw_ms / src_mspaw ))
+    fi
+    if [[ -n "$src_aw_ms" && -n "$src_mdrpaw" && "$src_mdrpaw" -gt 0 ]] 2>/dev/null; then
+        src_max1d_ms=$(( src_aw_ms / src_mdrpaw ))
+    fi
+
+    local_min_ms=$(rs_duration_ms "$RS_EVAL_INTERVAL_MIN" 2>/dev/null || true)
+    local_min1d_ms=$(rs_duration_ms "$RS_EVAL_INTERVAL_1D_MIN" 2>/dev/null || true)
+    local_max_ms=$(rs_duration_ms "$RS_EVAL_INTERVAL_MAX" 2>/dev/null || true)
+    local_max1d_ms=$(rs_duration_ms "$RS_EVAL_INTERVAL_1D_MAX" 2>/dev/null || true)
+
+    if [[ -n "$src_min_ms" && -n "$local_min_ms" && "$src_min_ms" != "$local_min_ms" ]]; then
+        log_warn "RS_EVAL_INTERVAL_MIN ($RS_EVAL_INTERVAL_MIN) differs from upstream MinEvaluationInterval; check bound drift"
+    fi
+    if [[ -n "$src_min1d_ms" && -n "$local_min1d_ms" && "$src_min1d_ms" != "$local_min1d_ms" ]]; then
+        log_warn "RS_EVAL_INTERVAL_1D_MIN ($RS_EVAL_INTERVAL_1D_MIN) differs from upstream MinEvaluationInterval1d; check bound drift"
+    fi
+    if [[ -n "$src_max_ms" && -n "$local_max_ms" && "$src_max_ms" != "$local_max_ms" ]]; then
+        log_warn "RS_EVAL_INTERVAL_MAX ($RS_EVAL_INTERVAL_MAX) differs from upstream-derived MaxEvaluationInterval; check bound drift"
+    fi
+    if [[ -n "$src_max1d_ms" && -n "$local_max1d_ms" && "$src_max1d_ms" != "$local_max1d_ms" ]]; then
+        log_warn "RS_EVAL_INTERVAL_1D_MAX ($RS_EVAL_INTERVAL_1D_MAX) differs from upstream-derived MaxEvaluationInterval1d; check bound drift"
+    fi
+    if [[ -z "$src_min_ms" && -z "$src_min1d_ms" ]]; then
+        log_warn "Could not parse upstream interval-bound constants from rulebuilder.go; verify local bounds manually"
     fi
     return 0
 }
@@ -3561,15 +3630,24 @@ phase_10b() {
     original_virt_interval=$(rs_rule_config_get "$original_virt" evaluationInterval 2>/dev/null || true)
     original_virt_interval="${original_virt_interval:-$RS_EVAL_INTERVAL_DEFAULT}"
 
-    log_substep "Case 1: cached invalid intervals are independently restored"
+    log_substep "Case 1: cold-cache defaults after MCOA restart"
     patch_rs_rule_config rs-namespace-config evaluationInterval 3m
     patch_rs_rule_config rs-namespace-config evaluationInterval1d 12h
-    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "rolling interval rejection" \
-        wait_rs_config_value rs-namespace-config evaluationInterval "$original_ns_interval" || ((errors++)) || true
-    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "daily interval rejection" \
-        wait_rs_config_value rs-namespace-config evaluationInterval1d "$original_ns_interval_1d" || ((errors++)) || true
+    kube_retry $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
+    $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
+        -n "$OBS_NAMESPACE" --timeout="${TIMEOUT_ROLLOUT}s" 2>/dev/null || \
+        log_warn "MCOA rollout status timed out — continuing"
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "cold-cache rolling interval default" \
+        wait_rs_config_value rs-namespace-config evaluationInterval "$RS_EVAL_INTERVAL_DEFAULT" || ((errors++)) || true
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "cold-cache daily interval default" \
+        wait_rs_config_value rs-namespace-config evaluationInterval1d "$RS_EVAL_INTERVAL_1D_DEFAULT" || ((errors++)) || true
     if mcoa_log_contains "Invalid evaluationInterval in ConfigMap"; then log_success "  rolling interval rejection logged"; else log_warn "  rolling rejection log not present (soft check)"; fi
     if mcoa_log_contains "Invalid evaluationInterval1d in ConfigMap"; then log_success "  daily interval rejection logged"; else log_warn "  daily rejection log not present (soft check)"; fi
+    patch_rs_rule_config rs-namespace-config evaluationInterval "$original_ns_interval"
+    patch_rs_rule_config rs-namespace-config evaluationInterval1d "$original_ns_interval_1d"
+    wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "hot-cache warm-up after restart" \
+        mcoa_manifestwork_rule_has_intervals acm-rs-namespace-prometheus-rules \
+        "$original_ns_interval" "$original_ns_interval_1d" || true
 
     log_substep "Case 2: compound duration is rejected and written back as YAML"
     patch_rs_rule_config rs-namespace-config evaluationInterval 1h30m
@@ -3584,6 +3662,10 @@ phase_10b() {
     patch_rs_rule_config rs-namespace-config evaluationInterval 10m
     wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "aggregator and interval validation" \
         wait_rs_config_value rs-namespace-config evaluationInterval 10m || ((errors++)) || true
+    if [[ -n "$original_cpu" ]]; then
+        wait_until "$TIMEOUT_RS_INTERVAL_PROPAGATION" 5 "cpuAggregator validation write-back" \
+            wait_rs_config_value rs-namespace-config cpuAggregator "$original_cpu" || ((errors++)) || true
+    fi
     actual=$(rs_rule_config_get "$(rs_rule_config_from_cluster rs-namespace-config "$OBS_NAMESPACE" 2>/dev/null || true)" cpuAggregator 2>/dev/null || true)
     [[ -z "$original_cpu" || "$actual" == "$original_cpu" ]] || { log_error "  cpuAggregator was not restored"; ((errors++)) || true; }
 

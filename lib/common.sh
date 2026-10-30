@@ -487,15 +487,24 @@ rs_duration_ms() {
 }
 
 rs_eval_interval_check() {
-    local value="$1" min="$2" max="$3" value_ms min_ms max_ms
+    local value="$1" min="$2" max="$3" value_ms min_ms max_ms rc
     [[ -z "$value" ]] && return 0
     value_ms=$(rs_duration_ms "$value") || return 1
     min_ms=$(rs_duration_ms "$min") || return 1
     max_ms=$(rs_duration_ms "$max") || return 1
-    if (( value_ms < min_ms || value_ms > max_ms )); then
-        return 2
+    # Keep the comparison in awk: Bash arithmetic is signed 64-bit and wraps
+    # for sufficiently large, otherwise well-formed durations. The operator
+    # rejects those values as overflow, so the local validator must not accept
+    # a wrapped value as being inside the configured range.
+    if awk -v value="$value_ms" -v minimum="$min_ms" -v maximum="$max_ms" \
+        'BEGIN { if (value < minimum || value > maximum) exit 2; exit 0 }' \
+        >/dev/null 2>&1; then
+        return 0
+    else
+        rc=$?
     fi
-    return 0
+    [[ "$rc" -eq 2 ]] && return 2
+    return 1
 }
 
 release_is_50()  { [[ "$RS_RELEASE" == "5.0"  ]]; }

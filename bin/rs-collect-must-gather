@@ -60,18 +60,30 @@ must_gather_config_blob() {
 }
 
 must_gather_rendered_interval() {
-    local dir="$1" cm="$2" kind="$3" rule_name suffix file value
+    local dir="$1" cm="$2" kind="$3" rule_name suffix file values value
+    local first="" first_ms="" value_ms
     [[ "$cm" == "rs-namespace-config" ]] && rule_name="acm-rs-namespace-prometheus-rules" || rule_name="acm-rs-virt-prometheus-rules"
     [[ "$kind" == "rolling" ]] && suffix="-5m.rule" || suffix="-1d"
     for file in "$dir"/hub/manifests/*.json; do
         [[ -f "$file" ]] || continue
-        value=$(jq -r --arg rule "$rule_name" --arg suffix "$suffix" '
+        values=$(jq -r --arg rule "$rule_name" --arg suffix "$suffix" '
             [ .spec.workload.manifests[]? | select(.kind == "PrometheusRule" and .metadata.name == $rule) |
-              .spec.groups[]? | select(.name | endswith($suffix)) | .interval ] | .[0] // empty
+              .spec.groups[]? | select(.name | endswith($suffix)) | .interval ] | .[]? | select(type == "string")
         ' "$file" 2>/dev/null || true)
-        [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }
+        while IFS= read -r value; do
+            [[ -n "$value" ]] || continue
+            value_ms=$(rs_duration_ms "$value" 2>/dev/null || true)
+            if [[ -z "$first" ]]; then
+                first="$value"
+                first_ms="$value_ms"
+            elif [[ "$value" != "$first" && ( -z "$first_ms" || -z "$value_ms" || "$value_ms" != "$first_ms" ) ]]; then
+                printf 'mixed(%s,%s)\n' "$first" "$value"
+                return 0
+            fi
+        done <<< "$values"
     done
-    return 1
+    [[ -n "$first" ]] || return 1
+    printf '%s\n' "$first"
 }
 
 analyze_eval_config() {

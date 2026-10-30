@@ -540,7 +540,7 @@ MCOA stores `prometheusRuleConfig` as YAML and supports two optional keys in bot
 
 Values must be a single Prometheus duration (`ms`, `s`, `m`, `h`, `d`, `w`, or `y`); bounds are inclusive, so `300s` equals `5m`. Empty or absent keys mean the default. Invalid values are written back to the last valid value (or the default after restart), and existing ConfigMaps are not backfilled. The operator logs rejections as `Logger.Info`; a GitOps owner can therefore overwrite the value again. The feature is MCOA-only; keys are inert in MCO Policy mode.
 
-`rs-status` displays both values, defaults, validation state, and normalized rendered-interval drift. `rs-status --json` exposes the same information under `rs_config.namespace` and `rs_config.virtualization`.
+`rs-status` displays both values, defaults, validation state, and normalized rendered-interval drift. `rs-status --json` exposes configured values, source, and rendered intervals under `rs_config.namespace` and `rs_config.virtualization`; a `mixed(...)` rendered value means collected groups or spokes disagree, and is shown as drift in the text view.
 
 **Environment variables:**
 

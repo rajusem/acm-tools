@@ -32,6 +32,8 @@ SPOKE="$NAMESPACE_SPOKE_CONTEXT"
 SPOKE_FILTER_SET=false
 WATCH_MODE=false
 JSON_MODE=false
+STATUS_MANIFESTWORKS_READY=false
+STATUS_RENDERED_INTERVALS=""
 
 status_config_value() {
     local cm="$1" key="$2" value
@@ -39,30 +41,66 @@ status_config_value() {
     printf '%s\n' "$value"
 }
 
-status_rendered_interval() {
-    local cm="$1" kind="$2" rule_name suffix mc_list mc mw value
-    if [[ "$cm" == "rs-namespace-config" ]]; then
-        rule_name="acm-rs-namespace-prometheus-rules"
-        [[ "$kind" == "rolling" ]] && suffix="-5m.rule" || suffix="-1d"
-    else
-        rule_name="acm-rs-virt-prometheus-rules"
-        [[ "$kind" == "rolling" ]] && suffix="-5m.rule" || suffix="-1d"
-    fi
+status_load_manifestworks() {
+    [[ "$STATUS_MANIFESTWORKS_READY" == "true" ]] && return 0
+    STATUS_RENDERED_INTERVALS=""
+    local mc_list mc mw mw_json values
     mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
     for mc in $mc_list; do
         for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
-            value=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null | jq -r \
-                --arg rule "$rule_name" --arg suffix "$suffix" '
-                [ .spec.workload.manifests[]? | select(.kind == "PrometheusRule" and .metadata.name == $rule) |
-                  .spec.groups[]? | select(.name | endswith($suffix)) | .interval ] | .[0] // empty
-            ' 2>/dev/null || true)
-            if [[ -n "$value" ]]; then
-                printf '%s\n' "$value"
-                return 0
+            mw_json=$($KUBE_CLI get "$mw" -n "$mc" -o json 2>/dev/null || echo "")
+            if [[ -n "$mw_json" ]] && jq -e . <<< "$mw_json" >/dev/null 2>&1; then
+                values=$(jq -r '
+                    [ .spec.workload.manifests[]? |
+                      select(.kind == "PrometheusRule") as $rule |
+                      $rule.spec.groups[]? | select(.interval | type == "string") |
+                      (if $rule.metadata.name == "acm-rs-namespace-prometheus-rules" and (.name | endswith("-5m.rule")) then "namespace_rolling"
+                       elif $rule.metadata.name == "acm-rs-namespace-prometheus-rules" and (.name | endswith("-1d")) then "namespace_daily"
+                       elif $rule.metadata.name == "acm-rs-virt-prometheus-rules" and (.name | endswith("-5m.rule")) then "virtualization_rolling"
+                       elif $rule.metadata.name == "acm-rs-virt-prometheus-rules" and (.name | endswith("-1d")) then "virtualization_daily"
+                       else empty end) as $slot |
+                      [$slot, .interval]
+                    ] | .[]? | @tsv
+                ' <<< "$mw_json" 2>/dev/null || true)
+                [[ -n "$values" ]] && STATUS_RENDERED_INTERVALS+="$values"$'\n'
             fi
         done
     done
-    return 1
+    STATUS_MANIFESTWORKS_READY=true
+}
+
+status_interval_summary() {
+    local values="$1" first="" first_ms="" value value_ms
+    while IFS= read -r value; do
+        [[ -n "$value" ]] || continue
+        value_ms=$(rs_duration_ms "$value" 2>/dev/null || true)
+        if [[ -z "$first" ]]; then
+            first="$value"
+            first_ms="$value_ms"
+        elif [[ "$value" != "$first" && ( -z "$first_ms" || -z "$value_ms" || "$value_ms" != "$first_ms" ) ]]; then
+            printf 'mixed(%s,%s)\n' "$first" "$value"
+            return 0
+        fi
+    done <<< "$values"
+    [[ -n "$first" ]] || return 1
+    printf '%s\n' "$first"
+}
+
+status_rendered_interval() {
+    local cm="$1" kind="$2" slot cached_slot cached_value values=""
+    case "$cm:$kind" in
+        rs-namespace-config:rolling) slot="namespace_rolling" ;;
+        rs-namespace-config:daily) slot="namespace_daily" ;;
+        rs-virt-config:rolling) slot="virtualization_rolling" ;;
+        rs-virt-config:daily) slot="virtualization_daily" ;;
+        *) return 1 ;;
+    esac
+    status_load_manifestworks
+    while IFS=$'\t' read -r cached_slot cached_value; do
+        [[ "$cached_slot" == "$slot" ]] || continue
+        values+="${values:+$'\n'}$cached_value"
+    done <<< "$STATUS_RENDERED_INTERVALS"
+    status_interval_summary "$values"
 }
 
 status_rs_config_json() {
@@ -129,6 +167,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 show_status() {
+    STATUS_MANIFESTWORKS_READY=false
+    STATUS_RENDERED_INTERVALS=""
     if [[ "$JSON_MODE" == "true" ]]; then
         show_status_json
         return

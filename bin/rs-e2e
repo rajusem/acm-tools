@@ -3408,99 +3408,6 @@ check_spoke_interval_groups() {
     return "$errors"
 }
 
-# Parse a Go "N * time.Unit" expression (as seen in a Go const body) into milliseconds.
-# Only handles single-unit expressions; compound expressions (e.g. derived consts) return 1.
-_parse_go_time_expr_ms() {
-    local line="$1" n unit
-    n=$(printf '%s\n' "$line" | sed -nE 's/.*[^0-9]([0-9]+)[[:space:]]*\*[[:space:]]*time\.[A-Za-z]+.*/\1/p')
-    unit=$(printf '%s\n' "$line" | sed -nE 's/.*time\.([A-Za-z]+).*/\1/p')
-    [[ "$n" =~ ^[0-9]+$ && -n "$unit" ]] || return 1
-    case "$unit" in
-        Millisecond) printf '%s\n' $(( n )) ;;
-        Second)      printf '%s\n' $(( n * 1000 )) ;;
-        Minute)      printf '%s\n' $(( n * 60000 )) ;;
-        Hour)        printf '%s\n' $(( n * 3600000 )) ;;
-        Day)         printf '%s\n' $(( n * 86400000 )) ;;
-        *)           return 1 ;;
-    esac
-}
-
-check_mcoa_interval_source() {
-    [[ -d "$MCOA_REPO_DIR" ]] || return 0
-    command -v rg >/dev/null 2>&1 || return 0
-    local rulebuilder="$MCOA_REPO_DIR/internal/analytics/rightsizing/rulebuilder.go"
-
-    # Always check for the pre-#728 backfill behavior: if present, the no-backfill
-    # assertion in 10c will fail with a confusing error rather than a clear message.
-    if rg -n 'backfillConfigKeys' "$MCOA_REPO_DIR/internal" >/dev/null 2>&1; then
-        PHASE_FAIL_REASON="MCOA source at $MCOA_REPO_DIR contains pre-#728 backfillConfigKeys; the no-backfill assertion requires the merged upstream #728 commit"
-        return 1
-    fi
-    if ! rg -in 'evaluationInterval' "$MCOA_REPO_DIR/internal/analytics/rightsizing" >/dev/null 2>&1; then
-        PHASE_FAIL_REASON="MCOA source checkout does not contain configurable evaluation interval support"
-        return 1
-    fi
-
-    # Bound comparison and detailed drift detection only make sense when the local
-    # source was used to build the deployed image.
-    [[ "$BUILD_TARGET" == "mcoa" || "$BUILD_TARGET" == "both" ]] || return 0
-
-    # Compare the four bound constants (two floors, two derived ceilings) against the local
-    # RS_EVAL_INTERVAL_* values to catch upstream bound drift (it happened once already).
-    local src_min_line src_min1d_line src_aw_line src_mspaw src_mdrpaw
-    local src_min_ms="" src_min1d_ms="" src_aw_ms="" src_max_ms="" src_max1d_ms=""
-    local local_min_ms local_min1d_ms local_max_ms local_max1d_ms
-
-    src_min_line=$(grep -E '^[[:space:]]*MinEvaluationInterval[[:space:]]*=' "$rulebuilder" | \
-        grep -v '1d' | grep 'time\.' | head -1 || true)
-    src_min1d_line=$(grep -E '^[[:space:]]*MinEvaluationInterval1d[[:space:]]*=' "$rulebuilder" | \
-        grep 'time\.' | head -1 || true)
-    src_aw_line=$(grep -E '^[[:space:]]*AggregationWindow[[:space:]]*=' "$rulebuilder" | \
-        grep 'time\.' | head -1 || true)
-    src_mspaw=$(grep -E '^[[:space:]]*MinSamplesPerAggregationWindow[[:space:]]*=[[:space:]]*[0-9]+' \
-        "$rulebuilder" | awk -F= '{n=$2; gsub(/[^0-9]/, "", n); print n}' | head -1 || true)
-    src_mdrpaw=$(grep -E '^[[:space:]]*MinDailyRunsPerAggregationWindow[[:space:]]*=[[:space:]]*[0-9]+' \
-        "$rulebuilder" | awk -F= '{n=$2; gsub(/[^0-9]/, "", n); print n}' | head -1 || true)
-
-    if [[ -n "$src_min_line" ]]; then
-        src_min_ms=$(_parse_go_time_expr_ms "$src_min_line" 2>/dev/null || true)
-    fi
-    if [[ -n "$src_min1d_line" ]]; then
-        src_min1d_ms=$(_parse_go_time_expr_ms "$src_min1d_line" 2>/dev/null || true)
-    fi
-    if [[ -n "$src_aw_line" ]]; then
-        src_aw_ms=$(_parse_go_time_expr_ms "$src_aw_line" 2>/dev/null || true)
-    fi
-    if [[ -n "$src_aw_ms" && -n "$src_mspaw" && "$src_mspaw" -gt 0 ]] 2>/dev/null; then
-        src_max_ms=$(( src_aw_ms / src_mspaw ))
-    fi
-    if [[ -n "$src_aw_ms" && -n "$src_mdrpaw" && "$src_mdrpaw" -gt 0 ]] 2>/dev/null; then
-        src_max1d_ms=$(( src_aw_ms / src_mdrpaw ))
-    fi
-
-    local_min_ms=$(rs_duration_ms "$RS_EVAL_INTERVAL_MIN" 2>/dev/null || true)
-    local_min1d_ms=$(rs_duration_ms "$RS_EVAL_INTERVAL_1D_MIN" 2>/dev/null || true)
-    local_max_ms=$(rs_duration_ms "$RS_EVAL_INTERVAL_MAX" 2>/dev/null || true)
-    local_max1d_ms=$(rs_duration_ms "$RS_EVAL_INTERVAL_1D_MAX" 2>/dev/null || true)
-
-    if [[ -n "$src_min_ms" && -n "$local_min_ms" && "$src_min_ms" != "$local_min_ms" ]]; then
-        log_warn "RS_EVAL_INTERVAL_MIN ($RS_EVAL_INTERVAL_MIN) differs from upstream MinEvaluationInterval; check bound drift"
-    fi
-    if [[ -n "$src_min1d_ms" && -n "$local_min1d_ms" && "$src_min1d_ms" != "$local_min1d_ms" ]]; then
-        log_warn "RS_EVAL_INTERVAL_1D_MIN ($RS_EVAL_INTERVAL_1D_MIN) differs from upstream MinEvaluationInterval1d; check bound drift"
-    fi
-    if [[ -n "$src_max_ms" && -n "$local_max_ms" && "$src_max_ms" != "$local_max_ms" ]]; then
-        log_warn "RS_EVAL_INTERVAL_MAX ($RS_EVAL_INTERVAL_MAX) differs from upstream-derived MaxEvaluationInterval; check bound drift"
-    fi
-    if [[ -n "$src_max1d_ms" && -n "$local_max1d_ms" && "$src_max1d_ms" != "$local_max1d_ms" ]]; then
-        log_warn "RS_EVAL_INTERVAL_1D_MAX ($RS_EVAL_INTERVAL_1D_MAX) differs from upstream-derived MaxEvaluationInterval1d; check bound drift"
-    fi
-    if [[ -z "$src_min_ms" && -z "$src_min1d_ms" ]]; then
-        log_warn "Could not parse upstream interval-bound constants from rulebuilder.go; verify local bounds manually"
-    fi
-    return 0
-}
-
 phase_10a() {
     rs_eval_interval_gate || return $?
     local errors=0 original_ns original_virt ns_5m ns_1d virt_5m virt_1d
@@ -3718,7 +3625,6 @@ phase_10b() {
 
 phase_10c() {
     rs_eval_interval_gate || return $?
-    check_mcoa_interval_source || return 1
     local errors=0 original_ns original_virt original_placement_ns original_placement_virt fresh removed rv_before rv_after
     local witness=123 actual
     capture_rs_rule_configs

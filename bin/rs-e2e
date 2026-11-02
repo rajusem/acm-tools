@@ -3436,7 +3436,7 @@ check_mcoa_interval_source() {
         PHASE_FAIL_REASON="MCOA source at $MCOA_REPO_DIR contains pre-#728 backfillConfigKeys; the no-backfill assertion requires the merged upstream #728 commit"
         return 1
     fi
-    if ! rg -n 'evaluationInterval' "$rulebuilder" >/dev/null 2>&1; then
+    if ! rg -in 'evaluationInterval' "$MCOA_REPO_DIR/internal/analytics/rightsizing" >/dev/null 2>&1; then
         PHASE_FAIL_REASON="MCOA source checkout does not contain configurable evaluation interval support"
         return 1
     fi

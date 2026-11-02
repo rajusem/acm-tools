@@ -127,7 +127,7 @@ Options:
   --no-metrics-wait      Skip the metrics collection wait (phase 19)
   --build mco|mcoa|both  Build, push, and apply custom images before tests
   --image-override       Apply existing image-override.json (no build)
-  --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a); phase 10 selects 10,10a,10b,10c
+  --phases PHASES        Run specific phases (comma-separated, ranges OK: 0-3,5,9a)
   --release 2.16|2.17|5.0|5.1  ACM release override (5.1 selects only interval phases by default)
   --skip-perses-check    Skip COO/Perses dashboard verification (incl. the 21b stat-panel check)
   --yes                  Auto-confirm destructive phases (no prompts)
@@ -144,7 +144,7 @@ Examples:
   $(basename "$0") --build mco --skip-uninstall
   $(basename "$0") --phases 0-3,5,13-16
   $(basename "$0") --release 5.0 --skip-uninstall   # Test 5.0 images on 2.17 cluster
-  $(basename "$0") --release 5.1                 # Run interval phases only (10a-10c)
+  $(basename "$0") --release 5.1                 # Run interval phases only (10b-10d)
   $(basename "$0") --mode-switch --yes    # Full run, no prompts
 EOF
 }
@@ -153,16 +153,16 @@ apply_release_phase_defaults() {
     [[ -n "$SELECTED_PHASES" ]] && return   # --phases wins
     if [[ "$RS_RELEASE" == "5.1" && -z "$RS_MCH_VERSION" ]]; then
         # An explicit --release 5.1 is an opt-in for just the interval tests.
-        SELECTED_PHASES="10a,10b,10c"
+        SELECTED_PHASES="10b,10c,10d"
     elif release_is_50; then
-        SELECTED_PHASES="0,0a,1,9a,9b,9c,9d,9e,10,10a,10b,10c"
+        SELECTED_PHASES="0,0a,1,9a,9b,9c,9d,9e,10a,10b,10c,10d"
     elif release_is_216; then
         SELECTED_PHASES="$( [[ "$SKIP_UNINSTALL" == "true" ]] && \
             echo "0,1,2a,2b,2c,2d,2e,3,4" || \
             echo "0,1,2a,2b,2c,2d,2e,3,4,13" )"
     else  # 2.17 — existing behavior
         if [[ "$SKIP_UNINSTALL" == "true" && "$MODE_SWITCH" == "true" ]]; then
-            SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4a,5,6,7,8,9a,9b,9c,9d,9e,10,11,12"
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4a,5,6,7,8,9a,9b,9c,9d,9e,10a,11,12"
         elif [[ "$SKIP_UNINSTALL" == "true" ]]; then
             SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4a"
         elif [[ "$MODE_SWITCH" == "false" ]]; then
@@ -2961,7 +2961,7 @@ PLACEMENTEOF
         auto_detected=true
         log_success "MCOA auto-detected ConfigMap change"
     else
-        log_warn "MCOA did not auto-detect ConfigMap change (same limitation as phase 10)"
+        log_warn "MCOA did not auto-detect ConfigMap change (same limitation as phase 10a)"
         log_substep "Restarting MCOA addon manager as fallback"
         kube_retry $KUBE_CLI rollout restart deployment/$MCOA_DEPLOY -n "$OBS_NAMESPACE" 2>/dev/null || true
         $KUBE_CLI rollout status deployment/$MCOA_DEPLOY \
@@ -3267,7 +3267,7 @@ phase_9e() {
 
 phase_4() {
     if release_is_50; then
-        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; ConfigMap propagation via phase 10)"
+        PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; ConfigMap propagation via phase 10a)"
         return 2
     fi
     local errors=0
@@ -3308,7 +3308,7 @@ phase_4() {
     return 0
 }
 
-phase_10() {
+phase_10a() {
     if release_is_216; then
         PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
         return 2
@@ -3362,7 +3362,7 @@ phase_10() {
 }
 
 # =============================================================================
-# Phases 10a-10c: Configurable evaluation intervals (MCOA)
+# Phases 10b-10d: Configurable evaluation intervals (MCOA)
 # =============================================================================
 
 spoke_prometheus_group_interval_ok() {
@@ -3408,7 +3408,7 @@ check_spoke_interval_groups() {
     return "$errors"
 }
 
-phase_10a() {
+phase_10b() {
     rs_eval_interval_gate || return $?
     local errors=0 original_ns original_virt ns_5m ns_1d virt_5m virt_1d
     if ! rs_eval_interval_check "$RS_EVAL_INTERVAL_TEST" "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX" || \
@@ -3521,7 +3521,7 @@ phase_10a() {
     return 0
 }
 
-phase_10b() {
+phase_10c() {
     rs_eval_interval_gate || return $?
     local errors=0 original_ns original_virt original_placement_ns original_placement_virt
     local original_cpu original_mem actual ns_before_virt
@@ -3623,7 +3623,7 @@ phase_10b() {
     return 0
 }
 
-phase_10c() {
+phase_10d() {
     rs_eval_interval_gate || return $?
     local errors=0 original_ns original_virt original_placement_ns original_placement_virt fresh removed rv_before rv_after
     local witness=123 actual
@@ -5460,10 +5460,10 @@ main() {
     run_phase "9c"  "Disable both (MCOA)"             phase_9c
     run_phase "9d"  "Re-enable both (MCOA)"           phase_9d
     run_phase "9e"  "NamespaceBinding change (MCOA)"  phase_9e
-    run_phase "10"  "ConfigMap propagation (MCOA)"    phase_10
-    run_phase "10a" "Evaluation interval propagation (MCOA)" phase_10a
-    run_phase "10b" "Evaluation interval validation/write-back (MCOA)" phase_10b
-    run_phase "10c" "Evaluation interval defaults/no-backfill (MCOA)" phase_10c
+    run_phase "10a" "ConfigMap propagation (MCOA)"    phase_10a
+    run_phase "10b" "Evaluation interval propagation (MCOA)" phase_10b
+    run_phase "10c" "Evaluation interval validation/write-back (MCOA)" phase_10c
+    run_phase "10d" "Evaluation interval defaults/no-backfill (MCOA)" phase_10d
     run_phase "11"  "MCOA -> MCO switch"              phase_11
     run_phase "12"  "Version mismatch"                phase_12
 

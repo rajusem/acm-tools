@@ -46,30 +46,71 @@ usage() {
     echo "  - Spoke PrometheusRules and agent logs"
 }
 
+# Print a collected JSON artifact without the "# Command:"/"# Collected:"
+# header lines that bundles from older versions of this tool put in front.
+# Args: path.
+# Stdout: the JSON document.
+# Returns: 0 the file holds valid JSON; 1 missing, empty or unparseable.
+must_gather_json() {
+    local path="$1" json
+    [[ -s "$path" ]] || return 1
+    json=$(sed -e '/^# Command: /d' -e '/^# Collected: /d' "$path")
+    jq -e . >/dev/null 2>&1 <<< "$json" || return 1
+    printf '%s\n' "$json"
+}
+
+# List the collected ManifestWork snapshots that are not valid JSON.
+# Args: bundle directory.
+# Stdout: space-separated file names (empty when all are readable).
+must_gather_unreadable_manifestworks() {
+    local dir="$1" file unreadable=""
+    for file in "$dir"/hub/manifests/*.json; do
+        [[ -f "$file" ]] || continue
+        must_gather_json "$file" >/dev/null || unreadable+="${unreadable:+ }$(basename "$file")"
+    done
+    printf '%s\n' "$unreadable"
+}
+
+# Print the prometheusRuleConfig blob of a right-sizing ConfigMap in the bundle.
+# Args: bundle directory, ConfigMap name. Reads configmap-<cm>.json and falls
+#   back to configmap-<cm>.yaml, which needs yq v4.
+# Stdout: the raw blob (empty when the key is unset).
+# Returns: 0 the ConfigMap was read; 1 no readable snapshot.
 must_gather_config_blob() {
-    local dir="$1" cm="$2" json_file yaml_file
-    json_file="$dir/hub/resources/configmap-$cm.json"
-    yaml_file="$dir/hub/resources/configmap-$cm.yaml"
-    if [[ -f "$json_file" ]]; then
-        rs_rule_config_from_file "$json_file" && return 0
+    local dir="$1" cm="$2" base json
+    base="$dir/hub/resources/configmap-$cm"
+    if json=$(must_gather_json "$base.json"); then
+        jq -r '.data.prometheusRuleConfig // ""' <<< "$json"
+        return 0
     fi
-    if [[ -f "$yaml_file" ]]; then
-        rs_rule_config_from_file "$yaml_file" && return 0
+    if [[ -s "$base.yaml" ]] && rs_have_yq && \
+        yq -e '.kind == "ConfigMap"' "$base.yaml" >/dev/null 2>&1; then
+        yq -r '.data.prometheusRuleConfig // ""' "$base.yaml"
+        return 0
     fi
     return 1
 }
 
+# Summarize the rendered interval of one ConfigMap's rolling or daily groups
+# across the collected ManifestWorks. Unreadable snapshots are skipped; the
+# caller reports them (must_gather_unreadable_manifestworks).
+# Args: bundle directory, ConfigMap name, kind (rolling|daily).
+# Stdout: the interval, or mixed(a,b) when groups disagree. Equal durations in
+#   different units (300s and 5m) count as the same value.
+# Returns: 0 printed; 1 no rendered group found.
 must_gather_rendered_interval() {
-    local dir="$1" cm="$2" kind="$3" rule_name suffix file values value
+    local dir="$1" cm="$2" kind="$3" rule_name group_pattern file json values value
     local first="" first_ms="" value_ms
     [[ "$cm" == "rs-namespace-config" ]] && rule_name="acm-rs-namespace-prometheus-rules" || rule_name="acm-rs-virt-prometheus-rules"
-    [[ "$kind" == "rolling" ]] && suffix="-5m.rule" || suffix="-1d"
+    # Rolling groups end in -5m.rule; daily groups end in -1d.rule or -1d.rules.
+    [[ "$kind" == "rolling" ]] && group_pattern='-5m\.rule$' || group_pattern='-1d\.rules?$'
     for file in "$dir"/hub/manifests/*.json; do
         [[ -f "$file" ]] || continue
-        values=$(jq -r --arg rule "$rule_name" --arg suffix "$suffix" '
-            [ .spec.workload.manifests[]? | select(.kind == "PrometheusRule" and .metadata.name == $rule) |
-              .spec.groups[]? | select(.name | endswith($suffix)) | .interval ] | .[]? | select(type == "string")
-        ' "$file" 2>/dev/null || true)
+        json=$(must_gather_json "$file") || continue
+        values=$(jq -r --arg rule "$rule_name" --arg pattern "$group_pattern" '
+            .spec.workload.manifests[]? | select(.kind == "PrometheusRule" and .metadata.name == $rule) |
+            .spec.groups[]? | select(.name | test($pattern)) | .interval | select(type == "string")
+        ' <<< "$json" 2>/dev/null || true)
         while IFS= read -r value; do
             [[ -n "$value" ]] || continue
             value_ms=$(rs_duration_ms "$value" 2>/dev/null || true)
@@ -86,24 +127,39 @@ must_gather_rendered_interval() {
     printf '%s\n' "$first"
 }
 
+# Report one ConfigMap's evaluation intervals from the bundle: values or
+# defaults, range errors, wasteful ordering, and drift from the rendered groups.
+# Args: bundle directory, ConfigMap name.
+# Globals: increments findings and warnings of the calling do_analyze.
+# Stdout: the report lines.
 analyze_eval_config() {
-    local dir="$1" cm="$2" blob value value_1d rendered rendered_1d rc
-    blob=$(must_gather_config_blob "$dir" "$cm" 2>/dev/null || true)
-    [[ -n "$blob" ]] || return 0
-    value=$(rs_rule_config_get "$blob" evaluationInterval 2>/dev/null || true)
-    value_1d=$(rs_rule_config_get "$blob" evaluationInterval1d 2>/dev/null || true)
+    local dir="$1" cm="$2" blob config_json value value_1d rendered rendered_1d
+    if ! blob=$(must_gather_config_blob "$dir" "$cm"); then
+        log_info "$cm: no readable ConfigMap snapshot; interval check skipped"
+        return 0
+    fi
+    if ! config_json=$(rs_rule_config_to_json "$blob" 2>/dev/null); then
+        if rs_have_yq; then
+            log_error "$cm prometheusRuleConfig is not a single YAML/JSON object"
+            ((findings++)) || true
+        else
+            log_warn "$cm prometheusRuleConfig is YAML; install yq v4 (brew install yq) to analyze it"
+            ((warnings++)) || true
+        fi
+        return 0
+    fi
+    value=$(rs_rule_config_get "$config_json" evaluationInterval || true)
+    value_1d=$(rs_rule_config_get "$config_json" evaluationInterval1d || true)
     rendered=$(must_gather_rendered_interval "$dir" "$cm" rolling 2>/dev/null || true)
     rendered_1d=$(must_gather_rendered_interval "$dir" "$cm" daily 2>/dev/null || true)
     echo -e "  ${BOLD}$cm:${NC} evaluationInterval=${value:-$RS_EVAL_INTERVAL_DEFAULT}$( [[ -z "$value" ]] && echo ' (default)' )"
     echo -e "  ${BOLD}$cm:${NC} evaluationInterval1d=${value_1d:-$RS_EVAL_INTERVAL_1D_DEFAULT}$( [[ -z "$value_1d" ]] && echo ' (default)' )"
 
-    if rs_eval_interval_check "$value" "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX"; then :; else
-        rc=$?
+    if ! rs_eval_interval_check "$value" "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX"; then
         log_error "$cm evaluationInterval is invalid (allowed $RS_EVAL_INTERVAL_MIN to $RS_EVAL_INTERVAL_MAX; MCOA will revert it)"
         ((findings++)) || true
     fi
-    if rs_eval_interval_check "$value_1d" "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX"; then :; else
-        rc=$?
+    if ! rs_eval_interval_check "$value_1d" "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX"; then
         log_error "$cm evaluationInterval1d is invalid (allowed $RS_EVAL_INTERVAL_1D_MIN to $RS_EVAL_INTERVAL_1D_MAX; MCOA will revert it)"
         ((findings++)) || true
     fi
@@ -355,9 +411,10 @@ do_analyze() {
         # Check for observedGeneration lag
         for mw_file in "$dir"/hub/manifests/*.json; do
             [[ -f "$mw_file" ]] || continue
-            local gen obs_gen spoke_name
-            gen=$(jq -r '.metadata.generation // 0' "$mw_file" 2>/dev/null || echo "0")
-            obs_gen=$(jq -r '.status.conditions[0].observedGeneration // 0' "$mw_file" 2>/dev/null || echo "0")
+            local gen obs_gen spoke_name mw_json
+            mw_json=$(must_gather_json "$mw_file") || continue
+            gen=$(jq -r '.metadata.generation // 0' <<< "$mw_json" 2>/dev/null || echo "0")
+            obs_gen=$(jq -r '.status.conditions[0].observedGeneration // 0' <<< "$mw_json" 2>/dev/null || echo "0")
             spoke_name=$(basename "$mw_file" | cut -d_ -f1)
             if [[ "$gen" != "$obs_gen" && "$gen" != "0" ]]; then
                 log_warn "$spoke_name ManifestWork: generation=$gen != observedGeneration=$obs_gen (work agent may be stale)"
@@ -520,6 +577,12 @@ do_analyze() {
     if [[ "$mode" == "mcoa" ]]; then
         echo ""
         log_step "Evaluation intervals"
+        local unreadable_mws
+        unreadable_mws=$(must_gather_unreadable_manifestworks "$dir")
+        if [[ -n "$unreadable_mws" ]]; then
+            log_warn "Rendered-interval drift check is incomplete; unreadable ManifestWork snapshot(s): $unreadable_mws"
+            ((warnings++)) || true
+        fi
         analyze_eval_config "$dir" rs-namespace-config
         analyze_eval_config "$dir" rs-virt-config
 
@@ -625,12 +688,19 @@ do_collect() {
         "$@" >> "$output_dir/$file" 2>&1 || echo "(command failed)" >> "$output_dir/$file"
     }
 
-    # Keep machine-readable snapshots valid JSON.  Human-readable captures
-    # retain the command/date header for diagnostics.
+    # Capture a machine-readable snapshot: stdout goes to the file as clean
+    # JSON, stderr to "<file>.stderr" (removed when empty). Human-readable
+    # captures (collect) keep the command/date header instead.
+    # Args: output path relative to the bundle, then the command and its arguments.
+    # Returns: the command's status. An empty output file of a failed command is
+    #   removed, so the analyzer reports the resource as not collected.
     collect_json() {
-        local file="$1"
+        local file="$1" rc=0
         shift
-        "$@" > "$output_dir/$file" 2>&1 || echo "(command failed)" >> "$output_dir/$file"
+        "$@" > "$output_dir/$file" 2> "$output_dir/$file.stderr" || rc=$?
+        [[ -s "$output_dir/$file.stderr" ]] || rm -f "$output_dir/$file.stderr"
+        [[ "$rc" -eq 0 || -s "$output_dir/$file" ]] || rm -f "$output_dir/$file"
+        return "$rc"
     }
 
     # =============================================================================
@@ -684,7 +754,8 @@ do_collect() {
         collect "hub/resources/configmap-$cm.yaml" \
             $KUBE_CLI get configmap "$cm" -n "$OBS_NAMESPACE" -o yaml
         collect_json "hub/resources/configmap-$cm.json" \
-            $KUBE_CLI get configmap "$cm" -n "$OBS_NAMESPACE" -o json
+            $KUBE_CLI get configmap "$cm" -n "$OBS_NAMESPACE" -o json || \
+            log_warn "Could not collect ConfigMap $cm as JSON (see hub/resources/configmap-$cm.json.stderr)"
     done
 
     log_substep "Policies"
@@ -724,8 +795,9 @@ do_collect() {
     for spoke_ns in $($KUBE_CLI get managedcluster -o name 2>/dev/null | sed 's|managedcluster.cluster.open-cluster-management.io/||'); do
         for mw in $($KUBE_CLI get manifestwork -n "$spoke_ns" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
             mw_basename=$(basename "$mw")
-            collect "hub/manifests/${spoke_ns}_${mw_basename}.json" \
-                $KUBE_CLI get "$mw" -n "$spoke_ns" -o json
+            collect_json "hub/manifests/${spoke_ns}_${mw_basename}.json" \
+                $KUBE_CLI get "$mw" -n "$spoke_ns" -o json || \
+                log_warn "Could not collect ManifestWork $spoke_ns/$mw_basename"
         done
     done
 

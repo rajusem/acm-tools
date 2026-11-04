@@ -126,7 +126,7 @@ If the script fails or a phase reports FAIL:
    - Use yaml.v2 lowercased field names for OCM types: `requiredclusterselector`, `labelselector`, `matchlabels`
    - Validate filtering via ManifestWork PrometheusRule distribution, not PlacementDecisions
 
-4. **Phases 10b-10d (evaluation intervals)**: Require detected ACM >= 5.1, or explicit `--release 5.1` opt-in; older releases skip even with a custom MCOA image. The explicit override selects only 10b-10d by default. The capability probe uses sentinel percentage `125` and a ManifestWork resourceVersion change; an unsupported MCOA fails the probe, while a dead pipeline fails. Case 1 in 10c restarts MCOA deliberately so the cold-cache fallback is deterministic. If the phases skip, check the release gate or `--data-plane` reason.
+4. **Phases 10b-10d (evaluation intervals)**: Require detected ACM >= 5.1, or explicit `--release 5.1` opt-in; older releases skip even with a custom MCOA image. The explicit override selects only 10b-10d by default. They need `yq` v4 to edit the YAML `prometheusRuleConfig` and fail without it. The capability probe sets sentinel percentage `125` with intervals `10m`/`30m` and polls until every expected namespace target (MCOA ManifestWork + OpenShift vendor + placement match) renders all three; an unsupported MCOA or a dead pipeline fails the probe. Case 1 in 10c removes the interval keys and restarts MCOA, so the new pod has no cached last-valid value and the cold-cache fallback to the defaults is deterministic. If the phases skip, check the release gate or `--data-plane` reason.
 
 5. **IsMCOTerminating stale state**: After MCO deletion, the operator caches a terminating flag in memory. The script detects this in phase 0 and restarts the operator pod.
 

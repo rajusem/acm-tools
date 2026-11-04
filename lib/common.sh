@@ -235,16 +235,6 @@ detect_acm_namespace() {
 RS_RELEASE="${RS_RELEASE:-}"
 RS_MCH_VERSION="${RS_MCH_VERSION:-}"
 
-# Right-sizing evaluation interval bounds.  Keep these in one place so the
-# e2e checks, status dashboard, and must-gather analysis agree with the MCOA
-# contract.
-export RS_EVAL_INTERVAL_DEFAULT="${RS_EVAL_INTERVAL_DEFAULT:-5m}"
-export RS_EVAL_INTERVAL_MIN="${RS_EVAL_INTERVAL_MIN:-5m}"
-export RS_EVAL_INTERVAL_MAX="${RS_EVAL_INTERVAL_MAX:-1h}"
-export RS_EVAL_INTERVAL_1D_DEFAULT="${RS_EVAL_INTERVAL_1D_DEFAULT:-15m}"
-export RS_EVAL_INTERVAL_1D_MIN="${RS_EVAL_INTERVAL_1D_MIN:-15m}"
-export RS_EVAL_INTERVAL_1D_MAX="${RS_EVAL_INTERVAL_1D_MAX:-6h}"
-
 # detect_release — sets RS_RELEASE from MCH status.currentVersion.
 # Short-circuits if RS_RELEASE already set (--release flag or parent export wins).
 # Exports RS_RELEASE so subprocess calls (setup-observability, rs-mode-switch) inherit.
@@ -277,9 +267,10 @@ detect_release() {
     log_info "Release: $RS_RELEASE (auto-detected from MCH $version)"
 }
 
-# Numeric comparison for the exact MCH version fetched by detect_release.
-# Returns 1 for an unknown/unparseable version so callers can distinguish an
-# unknown release from one known to be below the minimum supported version.
+# Compare the exact MCH version fetched by detect_release (RS_MCH_VERSION)
+# with a required major.minor, e.g. release_at_least 5.1.
+# Return 0 when the exact MCH major/minor meets the requirement.
+# Return 1 when it is older, unavailable, or unparseable.
 release_at_least() {
     local required="$1" version_major version_minor required_major required_minor
 
@@ -299,175 +290,138 @@ release_at_least() {
     (( 10#$version_minor >= 10#$required_minor ))
 }
 
-# Read a scalar top-level key from either the YAML representation used by
-# MCOA or the legacy JSON representation.  The YAML expression is anchored so
-# evaluationInterval cannot accidentally match evaluationInterval1d.
-rs_rule_config_get() {
-    local blob="$1" key="$2" value line yaml_key_re
-    [[ -n "$blob" ]] || return 1
+# --- Right-sizing prometheusRuleConfig helpers -------------------------------
+# MCOA stores prometheusRuleConfig as YAML; older configurations may be JSON.
+# JSON is read with jq alone. YAML needs yq v4, which README lists
+# as a prerequisite. The helpers never fall back to line-based YAML parsing:
+# quoted scalars and flow lists ([a, b]) would be misread.
 
-    yaml_key_re="^[[:space:]]*${key}:[[:space:]]*"
-    line=$(printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '
-        $0 ~ re { print; found=1; exit }
-        END { if (!found) exit 1 }
-    ' 2>/dev/null) || line=""
-    if [[ -n "$line" ]]; then
-        value="${line#*:}"
-        value="${value#${value%%[![:space:]]*}}"
-        value="${value%%[[:space:]]*}"
-        # Remove a trailing YAML comment only when it is separated by space.
-        value="${value%%[[:space:]]#*}"
-        if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^'(.*)'$ ]]; then
-            value="${BASH_REMATCH[1]}"
+# Detect yq v4 or newer (Python yq and yq v3 use another syntax).
+# Caches the answer in RS_YQ_V4 ("yes"/"no") for the current shell.
+# Returns: 0 available; 1 missing or incompatible. Produces no output.
+rs_have_yq() {
+    local version version_re='version v?([0-9]+)\.'
+    if [[ -z "${RS_YQ_V4:-}" ]]; then
+        RS_YQ_V4=no
+        version=$(yq --version 2>/dev/null || true)
+        if [[ "$version" == *mikefarah* && "$version" =~ $version_re ]] && \
+            (( ${BASH_REMATCH[1]} >= 4 )); then
+            RS_YQ_V4=yes
         fi
-        if [[ -n "$value" ]]; then
-            printf '%s\n' "$value"
-            return 0
-        fi
-        # YAML arrays and objects are commonly emitted as block values.  Return
-        # a compact JSON representation for those values so callers can compare
-        # them semantically instead of losing the field at the blank key line.
-        if command -v yq >/dev/null 2>&1; then
-            value=$(printf '%s\n' "$blob" | yq -o=json '.' 2>/dev/null | jq -cer --arg key "$key" \
-                'if type == "object" and has($key) and .[$key] != null then .[$key] else empty end' \
-                2>/dev/null) || value=""
-            [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }
-        fi
+    fi
+    [[ "$RS_YQ_V4" == "yes" ]]
+}
+
+# Normalize a prometheusRuleConfig blob (YAML or JSON) to one compact JSON object.
+# Args: blob. An empty or comment-only blob is {} (MCOA then uses its defaults).
+# Stdout: the compact JSON object.
+# Returns: 0 ok; 1 not a single YAML/JSON object, or YAML without yq v4.
+#   The reason goes to stderr.
+rs_rule_config_to_json() {
+    local blob="$1" json yaml_json
+    local to_object='
+        if length == 0 or (length == 1 and .[0] == null) then {}
+        elif length == 1 and (.[0] | type) == "object" then .[0]
+        else error("not a single object") end'
+
+    if [[ -z "${blob//[[:space:]]/}" ]]; then
+        printf '{}\n'
+        return 0
+    fi
+    if json=$(printf '%s\n' "$blob" | jq -cs "$to_object" 2>/dev/null); then
+        printf '%s\n' "$json"
+        return 0
+    fi
+    if ! rs_have_yq; then
+        log_error "Reading YAML prometheusRuleConfig requires yq v4 (brew install yq)"
         return 1
     fi
+    # Two steps instead of one pipeline: without pipefail a failed yq would
+    # hand jq an empty stream, which reads as {}.
+    if yaml_json=$(printf '%s\n' "$blob" | yq -o=json -I=0 '.' 2>/dev/null) && \
+        json=$(printf '%s\n' "$yaml_json" | jq -cs "$to_object" 2>/dev/null); then
+        printf '%s\n' "$json"
+        return 0
+    fi
+    log_error "prometheusRuleConfig is not a single YAML/JSON object"
+    return 1
+}
 
-    value=$(printf '%s\n' "$blob" | jq -er --arg key "$key" \
-        'if type == "object" and has($key) and .[$key] != null then .[$key] | if type == "string" then . else tostring end else empty end' \
-        2>/dev/null) || return 1
+# Read one top-level key from a prometheusRuleConfig blob (YAML or JSON).
+# Args: blob, key.
+# Stdout: the value. Strings print raw; numbers and booleans print as-is;
+#   lists and maps print as compact JSON, e.g. ["Max OverAll","P90"].
+# Returns: 0 value printed; 1 key missing, null, or empty;
+#   2 blob unreadable (see rs_rule_config_to_json; the reason goes to stderr).
+rs_rule_config_get() {
+    local blob="$1" key="$2" json value
+    json=$(rs_rule_config_to_json "$blob") || return 2
+    value=$(printf '%s\n' "$json" | jq -r --arg key "$key" '
+        if has($key) and .[$key] != null
+        then .[$key] | if type == "string" then . else tojson end
+        else empty end') || return 2
     [[ -n "$value" ]] || return 1
     printf '%s\n' "$value"
 }
 
-# Convert a JSON object to YAML when yq is available.  YAML callers already
-# have a stable, human-readable representation and are edited in place below.
-rs_rule_config_json_to_yaml() {
-    if command -v yq >/dev/null 2>&1; then
-        yq -P '.' 2>/dev/null
-    else
-        # Keep the helper usable on installations without yq for scalar-only
-        # callers; callers that need to edit JSON receive an explicit error.
+# Apply a jq filter to a prometheusRuleConfig blob and print the result as YAML.
+# Args: blob, jq filter, then extra jq arguments (e.g. --arg key K).
+# Stdout: block-style YAML, the format MCOA writes; key order is kept.
+# Returns: 0 ok; 1 unreadable blob, failed filter, or yq v4 unavailable.
+rs_rule_config_edit() {
+    local blob="$1" filter="$2" json
+    shift 2
+    if ! rs_have_yq; then
+        log_error "Editing prometheusRuleConfig requires yq v4 (brew install yq)"
         return 1
     fi
+    json=$(rs_rule_config_to_json "$blob") || return 1
+    json=$(printf '%s\n' "$json" | jq -c "$@" "$filter") || return 1
+    printf '%s\n' "$json" | yq -P '.'
 }
 
+# Set one top-level key in a prometheusRuleConfig blob.
+# Args: blob (YAML or JSON, may be empty), key, value. The value is read as
+#   YAML: 125 is a number, 10m a string, [a, b] a list; '125' forces a string.
+# Stdout: the updated blob as block-style YAML.
+# Returns: 0 ok; 1 unreadable blob or value, or yq v4 unavailable.
 rs_rule_config_set() {
-    local blob="$1" key="$2" value="$3" yaml_key_re normalized value_json json_blob updated
-    normalized="$value"
-    if [[ "$normalized" =~ ^\"(.*)\"$ || "$normalized" =~ ^'(.*)'$ ]]; then
-        normalized="${BASH_REMATCH[1]}"
-    fi
-
-    # Use a typed YAML round-trip whenever yq is available.  This preserves
-    # numeric fields and block-list fields from legacy JSON/YAML blobs; a
-    # string-only jq assignment would turn recommendationPercentage into a
-    # quoted YAML string and leave orphaned list items behind.
-    if command -v yq >/dev/null 2>&1; then
-        value_json=$(printf 'value: %s\n' "$normalized" | yq -o=json '.value' 2>/dev/null) || return 1
-        json_blob=$(printf '%s\n' "$blob" | yq -o=json '.' 2>/dev/null) || return 1
-        updated=$(printf '%s\n' "$json_blob" | jq --arg key "$key" --argjson value "$value_json" \
-            '.[$key] = $value' 2>/dev/null) || return 1
-        printf '%s\n' "$updated" | rs_rule_config_json_to_yaml
-        return $?
-    fi
-
-    yaml_key_re="^[[:space:]]*${key}:"
-    if printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 ~ re && $0 ~ /:[[:space:]]*$/ { found=1; exit } END { exit !found }' \
-        >/dev/null 2>&1; then
-        log_error "Editing block-valued prometheusRuleConfig key '$key' requires yq" >&2
+    local blob="$1" key="$2" value="$3" value_json
+    if ! rs_have_yq; then
+        log_error "Editing prometheusRuleConfig requires yq v4 (brew install yq)"
         return 1
     fi
-    if printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 ~ re { found=1; exit } END { exit !found }' \
-        >/dev/null 2>&1; then
-        printf '%s\n' "$blob" | awk -v re="$yaml_key_re" -v key="$key" -v value="$normalized" '
-            $0 ~ re { print key ": " value; replaced=1; next }
-            { print }
-            END { if (!replaced) print key ": " value }
-        '
-        return 0
-    fi
-
-    if printf '%s\n' "$blob" | jq -e . >/dev/null 2>&1; then
-        normalized=$(printf '%s\n' "$blob" | jq --arg key "$key" --arg value "$normalized" '.[$key] = $value' 2>/dev/null) || return 1
-        printf '%s\n' "$normalized" | rs_rule_config_json_to_yaml || {
-            log_error "Editing JSON prometheusRuleConfig requires yq for YAML normalization" >&2
-            return 1
-        }
-        return 0
-    fi
-
-    if [[ -n "$blob" ]]; then
-        printf '%s\n' "$blob"
-    fi
-    printf '%s: %s\n' "$key" "$normalized"
+    value_json=$(printf 'value: %s\n' "$value" | yq -o=json -I=0 '.value' 2>/dev/null) || {
+        log_error "Cannot read '$value' as a YAML value for prometheusRuleConfig key '$key'"
+        return 1
+    }
+    rs_rule_config_edit "$blob" '.[$key] = $value' --arg key "$key" --argjson value "$value_json"
 }
 
+# Remove one top-level key from a prometheusRuleConfig blob.
+# Args: blob (YAML or JSON, may be empty), key.
+# Stdout: the updated blob as block-style YAML ({} when no key remains).
+# Returns: 0 ok; 1 unreadable blob or yq v4 unavailable.
 rs_rule_config_unset() {
-    local blob="$1" key="$2" yaml_key_re json_blob updated
-    [[ -n "$blob" ]] || { printf '\n'; return 0; }
-    if command -v yq >/dev/null 2>&1; then
-        json_blob=$(printf '%s\n' "$blob" | yq -o=json '.' 2>/dev/null) || return 1
-        updated=$(printf '%s\n' "$json_blob" | jq --arg key "$key" 'del(.[$key])' 2>/dev/null) || return 1
-        printf '%s\n' "$updated" | rs_rule_config_json_to_yaml
-        return $?
-    fi
-
-    yaml_key_re="^[[:space:]]*${key}:"
-    if printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 ~ re && $0 ~ /:[[:space:]]*$/ { found=1; exit } END { exit !found }' \
-        >/dev/null 2>&1; then
-        log_error "Removing block-valued prometheusRuleConfig key '$key' requires yq" >&2
-        return 1
-    fi
-    if printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 ~ re { found=1; exit } END { exit !found }' \
-        >/dev/null 2>&1; then
-        printf '%s\n' "$blob" | awk -v re="$yaml_key_re" '$0 !~ re { print }'
-        return 0
-    fi
-    if printf '%s\n' "$blob" | jq -e . >/dev/null 2>&1; then
-        printf '%s\n' "$blob" | jq --arg key "$key" 'del(.[$key])' 2>/dev/null | rs_rule_config_json_to_yaml || return 1
-        return 0
-    fi
-    printf '%s\n' "$blob"
+    rs_rule_config_edit "$1" 'del(.[$key])' --arg key "$2"
 }
 
+# Print the live prometheusRuleConfig blob of a right-sizing ConfigMap.
+# Args: ConfigMap name, namespace.
+# Stdout: the raw blob (empty when the key is not set).
+# Returns: the oc/kubectl status (non-zero when the ConfigMap is missing or the
+#   API is unreachable).
 rs_rule_config_from_cluster() {
     local cm="$1" namespace="$2"
     $KUBE_CLI get configmap "$cm" -n "$namespace" \
         -o jsonpath='{.data.prometheusRuleConfig}' --request-timeout=10s
 }
 
-rs_rule_config_from_file() {
-    local path="$1" value
-    [[ -f "$path" ]] || return 1
-
-    value=$(jq -er '.data.prometheusRuleConfig // empty' "$path" 2>/dev/null) || value=""
-    if [[ -n "$value" ]]; then
-        printf '%s\n' "$value"
-        return 0
-    fi
-
-    if command -v yq >/dev/null 2>&1; then
-        value=$(yq -r '.data.prometheusRuleConfig // empty' "$path" 2>/dev/null) || value=""
-        if [[ -n "$value" ]]; then
-            printf '%s\n' "$value"
-            return 0
-        fi
-    fi
-
-    # Minimal fallback for a ConfigMap YAML artifact when yq is unavailable.
-    awk '
-        /^data:[[:space:]]*$/ { in_data=1; next }
-        in_data && /^[^[:space:]]/ { exit }
-        in_data && /^[[:space:]]+prometheusRuleConfig:[[:space:]]*\|[-+]?/ { in_blob=1; next }
-        in_blob && /^[[:space:]]{2,}/ { sub(/^[[:space:]]{2}/, ""); print; next }
-        in_blob { exit }
-    ' "$path"
-}
-
+# Convert a single-unit Prometheus duration to milliseconds.
+# Args: duration such as 300s, 5m or 1h (units ms, s, m, h, d, w, y).
+#   Compound durations (1h30m) are rejected, matching MCOA's pattern; so is zero.
+# Stdout: the number of milliseconds.
+# Returns: 0 ok; 1 not a valid single-unit duration.
 rs_duration_ms() {
     local value="$1" number unit multiplier
     [[ "$value" =~ ^([0-9]+)(ms|s|m|h|d|w|y)$ ]] || return 1
@@ -486,6 +440,10 @@ rs_duration_ms() {
     awk -v number="$number" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", number * multiplier }'
 }
 
+# Validate an optional duration against inclusive minimum/maximum bounds.
+# Args: value, minimum, maximum (single-unit durations).
+# Returns: 0 valid/empty; 1 parsing failure; 2 outside bounds.
+# Produces no output and does not access or modify the cluster.
 rs_eval_interval_check() {
     local value="$1" min="$2" max="$3" value_ms min_ms max_ms rc
     [[ -z "$value" ]] && return 0

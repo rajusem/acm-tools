@@ -6,7 +6,7 @@ CLI utilities for managing ACM (Advanced Cluster Management) observability and r
 
 - `oc` or `kubectl` in PATH
 - `jq` for JSON processing
-- `yq` for safely editing and normalizing right-sizing ConfigMap YAML/JSON blobs
+- `yq` v4 for safely editing and normalizing right-sizing ConfigMap YAML/JSON blobs; required by `rs-e2e` phases 10b-10d
 - `podman` or `docker` for image builds (used by config auto-detection)
 - Kubeconfig contexts configured for hub and spoke clusters
 
@@ -494,7 +494,7 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 9d | Re-enable both (MCOA) | Same as 2d but in MCOA mode — verifies MCOA restores all RS resources including ManifestWorks and all 4 Perses dashboards. |
 | 9e | NamespaceBinding change (MCOA) | Patches `namespaceBinding` in MCOA mode — verifies no Policies created in either namespace (MCOA uses ManifestWorks, not Policies). Verifies ManifestWorks and ConfigMaps unaffected. |
 | 10a | ConfigMap propagation (MCOA) | Same as phase 4 but in MCOA mode — modifies ConfigMap, verifies ManifestWork PrometheusRules update with new value. Tests MCOA's ConfigMap→ManifestWork pipeline. |
-| 10b | Evaluation interval propagation (MCOA) | On ACM >= 5.1, or after explicit `--release 5.1` opt-in, verifies rolling/daily group intervals, PromQL lookbacks, inclusive maxima, seconds-unit values, and live spoke Prometheus admission/runtime. Without the override, skips on older/unknown releases; also skips with `--data-plane`. |
+| 10b | Evaluation interval propagation (MCOA) | On ACM >= 5.1, or after explicit `--release 5.1` opt-in, verifies rolling/daily group intervals and PromQL lookbacks on every expected ManifestWork target at the test values and at the inclusive minima, then inclusive maxima, seconds-unit values, and the interval the live spoke Prometheus has loaded (admission/runtime). Without the override, skips on older/unknown releases; also skips with `--data-plane`. |
 | 10c | Evaluation interval validation/write-back (MCOA) | Verifies per-key range/shape rejection, cold-cache defaults after an MCOA restart, write-back, aggregator preservation, and per-ConfigMap cache isolation. |
 | 10d | Evaluation interval defaults/no-backfill (MCOA) | Verifies defaults on a newly recreated ConfigMap, no backfill on an existing ConfigMap, and legal but wasteful interval ordering. |
 

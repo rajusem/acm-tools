@@ -582,7 +582,8 @@ preflight_mce_csv_channel() {
     local expected_channel="${1:-}"
     [[ -z "$expected_channel" ]] && return 0
     local csv_names expected_ver csv_name leftover
-    csv_names=$($KUBE_CLI get csv -n multicluster-engine --no-headers \
+    # Skip CSVs OLM copies from AllNamespaces operators (e.g. COO); they are not MCE.
+    csv_names=$($KUBE_CLI get csv -n multicluster-engine -l '!olm.copiedFrom' --no-headers \
         -o custom-columns=NAME:.metadata.name --request-timeout=15s 2>/dev/null || true)
     [[ -z "$csv_names" ]] && return 0
     expected_ver="${expected_channel#stable-}"

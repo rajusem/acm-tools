@@ -80,7 +80,7 @@ If phases fail, diagnose using the troubleshooting tables below and attempt a fi
 | 2d | Re-enable both features (MCO) | — | 2.16, 2.17 |
 | 2e | NamespaceBinding change (MCO) | — | 2.16, 2.17 |
 | 3 | Spoke PrometheusRule validation (MCO) | — | 2.16, 2.17 |
-| 4 | ConfigMap propagation (MCO) | — | 2.16, 2.17 |
+| 4 | ConfigMap propagation (MCO) | yq v4 | 2.16, 2.17 |
 | 4a | ConfigMap coexistence (MCO+MCOA) | — | **2.17 only** |
 | 5 | MCO → MCOA switch + Perses dashboards | `--mode-switch` | **2.17 only** |
 | 6 | SpecHash freshness after ADC change | `--mode-switch` | 2.17, 5.0 |
@@ -91,10 +91,10 @@ If phases fail, diagnose using the troubleshooting tables below and attempt a fi
 | 9c | Disable both (MCOA) | `--mode-switch` | 2.17, 5.0 |
 | 9d | Re-enable both (MCOA) | `--mode-switch` | 2.17, 5.0 |
 | 9e | NamespaceBinding change (MCOA) | `--mode-switch` | 2.17, 5.0 |
-| 10a | ConfigMap propagation (MCOA) | `--mode-switch` | 2.17, 5.0 |
-| 10b | Evaluation interval propagation (MCOA) | `--release 5.1` | **5.1 only** |
-| 10c | Evaluation interval validation/write-back (MCOA) | `--release 5.1` | **5.1 only** |
-| 10d | Evaluation interval defaults/no-backfill (MCOA) | `--release 5.1` | **5.1 only** |
+| 10a | ConfigMap propagation (MCOA) | `--mode-switch`, yq v4 | 2.17, 5.0 |
+| 10b | Evaluation interval propagation (MCOA) | `--release 5.1`, yq v4 | **5.1 only** |
+| 10c | Evaluation interval validation/write-back (MCOA) | `--release 5.1`, yq v4 | **5.1 only** |
+| 10d | Evaluation interval defaults/no-backfill (MCOA) | `--release 5.1`, yq v4 | **5.1 only** |
 | 11 | MCOA → MCO switch | `--mode-switch` | **2.17 only** |
 | 12 | Version mismatch (any annotation value) | `--mode-switch` | **2.17 only** |
 | 13 | Uninstall cleanup — MCO mode | Destructive (prompts) | 2.16, 2.17 |

@@ -37,7 +37,7 @@
 #   10c  Evaluation interval validation/write-back (MCOA)
 #   10d  Evaluation interval defaults/no-backfill (MCOA)
 #   --phases 10 selects 10a-10d; --release 5.1 defaults to 10b-10d.
-#   10b-10d need ACM 5.1+ (or --release 5.1) and yq v4.
+#   4 and 10a-10d need yq v4; 10b-10d also need ACM 5.1+ (or --release 5.1).
 #
 #   Group 3: Mode round-trip tests
 #   11   MCOA -> MCO switch            (--mode-switch)
@@ -3562,7 +3562,8 @@ phase_9e() {
 
 # Phase 4 (MCO mode): recommendationPercentage=120 in rs-namespace-config must
 # reach the PrometheusRule in rs-prom-rules-policy as "(120/100)". Not
-# applicable to ACM 5.0 (MCOA only; see phase 10a).
+# applicable to ACM 5.0 (MCOA only; see phase 10a). Fails before any cluster
+# change when yq v4 is missing.
 # Cluster changes: may switch to MCO mode; edits rs-namespace-config through the
 #   shared prometheusRuleConfig helpers, then writes back the run's original.
 # Globals: captures the E2E_CAPTURED_* originals once per run
@@ -3572,6 +3573,10 @@ phase_4() {
     if release_is_50; then
         PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; ConfigMap propagation via phase 10a)"
         return 2
+    fi
+    if ! rs_have_yq; then
+        PHASE_FAIL_REASON="Phase 4 needs yq v4 to edit the YAML prometheusRuleConfig (brew install yq)"
+        return 1
     fi
     local errors=0
 
@@ -3613,7 +3618,8 @@ phase_4() {
 
 # Phase 10a (MCOA mode; was phase 10): recommendationPercentage=120 in
 # rs-namespace-config must reach a PrometheusRule in an MCOA ManifestWork as
-# "(120/100)". Not applicable to ACM 2.16 (MCO only).
+# "(120/100)". Not applicable to ACM 2.16 (MCO only). Fails before any cluster
+# change when yq v4 is missing.
 # Cluster changes: may switch to MCOA mode; edits rs-namespace-config through
 #   the shared prometheusRuleConfig helpers, then writes back the run's original.
 # Globals: captures the E2E_CAPTURED_* originals once per run
@@ -3623,6 +3629,10 @@ phase_10a() {
     if release_is_216; then
         PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
         return 2
+    fi
+    if ! rs_have_yq; then
+        PHASE_FAIL_REASON="Phase 10a needs yq v4 to edit the YAML prometheusRuleConfig (brew install yq)"
+        return 1
     fi
     local errors=0
 
@@ -3676,6 +3686,24 @@ phase_10a() {
 # Phases 10b-10d: Configurable evaluation intervals (MCOA)
 # =============================================================================
 
+# Print a spoke Prometheus's /api/v1/rules response, read through the
+# prometheus-k8s route with the context's bearer token. A kubeconfig without a
+# token (for example a client certificate) sends no Authorization header, and
+# the route's auth proxy refuses the request.
+# Args: kube context.
+# Stdout: the response body.
+# Returns: 0 the request completed (any HTTP status); 1 no route, or curl failed.
+spoke_prometheus_rules_response() {
+    local context="$1" route_host token
+    local -a curl_args=(-ks --connect-timeout 5 --max-time 10)
+    route_host=$($KUBE_CLI --context="$context" get route prometheus-k8s -n openshift-monitoring \
+        -o jsonpath='{.spec.host}' --request-timeout=10s 2>/dev/null || echo "")
+    [[ -n "$route_host" ]] || return 1
+    token=$($KUBE_CLI --context="$context" whoami -t 2>/dev/null || echo "")
+    [[ -n "$token" ]] && curl_args+=(-H "Authorization: Bearer $token")
+    curl "${curl_args[@]}" "https://${route_host}/api/v1/rules" 2>/dev/null
+}
+
 # Succeed when a spoke's live Prometheus runs one rule group at the expected
 # interval: the PrometheusRule CR declares it, and /api/v1/rules reports the
 # group at that interval (in seconds) with rules and no lastError. This checks
@@ -3683,8 +3711,7 @@ phase_10a() {
 # Args: kube context, PrometheusRule name, group name, interval (e.g. 1800s).
 # Returns: 0 loaded and healthy; 1 otherwise, including read failures.
 spoke_prometheus_group_interval_ok() {
-    local context="$1" rule_name="$2" group_name="$3" expected_interval="$4" response route_host token expected_ms
-    local -a curl_args=(-ks --connect-timeout 5 --max-time 10)
+    local context="$1" rule_name="$2" group_name="$3" expected_interval="$4" response expected_ms
     expected_ms=$(rs_duration_ms "$expected_interval") || return 1
     response=$($KUBE_CLI --context="$context" get prometheusrule -n openshift-monitoring \
         "$rule_name" -o json --request-timeout=10s 2>/dev/null || echo "")
@@ -3693,13 +3720,7 @@ spoke_prometheus_group_interval_ok() {
         [ .spec.groups[]? | select(.name == $group) | .interval ] | index($interval) != null
     ' >/dev/null 2>&1 || return 1
 
-    route_host=$($KUBE_CLI --context="$context" get route prometheus-k8s -n openshift-monitoring \
-        -o jsonpath='{.spec.host}' --request-timeout=10s 2>/dev/null || echo "")
-    [[ -n "$route_host" ]] || return 1
-    token=$($KUBE_CLI --context="$context" whoami -t 2>/dev/null || echo "")
-    [[ -n "$token" ]] && curl_args+=(-H "Authorization: Bearer $token")
-    curl "${curl_args[@]}" \
-        "https://${route_host}/api/v1/rules" 2>/dev/null | \
+    spoke_prometheus_rules_response "$context" | \
         jq -e --arg group "$group_name" --argjson expected_ms "$expected_ms" '
             [ .data.groups[]? | select(.name == $group) ] as $groups |
             .status == "success" and ($groups | length) > 0 and
@@ -3713,7 +3734,10 @@ spoke_prometheus_group_interval_ok() {
 
 # Check rule groups on a spoke's live Prometheus with
 # spoke_prometheus_group_interval_ok, polling each group up to
-# TIMEOUT_RS_INTERVAL_PROPAGATION. An unreachable context is skipped.
+# TIMEOUT_RS_INTERVAL_PROPAGATION. The check is skipped, with a message, when
+# the context is unreachable or its rules API cannot be read (no
+# prometheus-k8s route, bearer token or permission): polling would then only
+# wait out the timeout for each group and fail.
 # Args: kube context, PrometheusRule name, interval, group name(s).
 # Returns: the number of groups that failed (0 when all passed or skipped).
 check_spoke_interval_groups() {
@@ -3721,6 +3745,10 @@ check_spoke_interval_groups() {
     shift 3
     if ! $KUBE_CLI --context="$context" cluster-info --request-timeout=10s >/dev/null 2>&1; then
         log_info "  $context is unreachable; skipping direct spoke runtime check"
+        return 0
+    fi
+    if ! spoke_prometheus_rules_response "$context" | jq -e '.status == "success"' >/dev/null 2>&1; then
+        log_warn "  $context: cannot read Prometheus /api/v1/rules (no prometheus-k8s route, bearer token or permission); skipping direct spoke runtime check"
         return 0
     fi
     for group in "$@"; do

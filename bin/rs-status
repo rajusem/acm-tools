@@ -38,7 +38,8 @@ STATUS_RENDERED_INTERVALS=""
 # Read a right-sizing ConfigMap's prometheusRuleConfig as one compact JSON object.
 # Args: ConfigMap name (in OBS_NAMESPACE).
 # Stdout: the JSON object ({} when the key is unset) or, on failure, a short reason.
-# Returns: 0 ok; 1 the ConfigMap or its blob could not be read.
+# Returns: 0 ok; 1 the ConfigMap or its blob could not be read; 2 the blob is
+#   YAML and yq v4 is not installed on this host.
 status_config_json() {
     local cm="$1" blob
     if ! blob=$(rs_rule_config_from_cluster "$cm" "$OBS_NAMESPACE" 2>/dev/null); then
@@ -48,10 +49,10 @@ status_config_json() {
     rs_rule_config_to_json "$blob" 2>/dev/null && return 0
     if rs_have_yq; then
         echo "not a single YAML/JSON object"
-    else
-        echo "YAML needs yq v4 (brew install yq)"
+        return 1
     fi
-    return 1
+    echo "YAML needs yq v4 (brew install yq)"
+    return 2
 }
 
 # Collect the rendered right-sizing rule-group intervals from every MCOA
@@ -316,11 +317,18 @@ show_status() {
     for cm in rs-namespace-config rs-virt-config; do
         if resource_exists configmap "$cm" "$OBS_NAMESPACE"; then
             echo -e "    ${GREEN}$cm: exists${NC}"
-            local cm_json cm_eval cm_eval_1d rendered rendered_1d
+            local cm_json cm_eval cm_eval_1d rendered rendered_1d config_rc=0
             rendered=$(status_rendered_interval "$cm" rolling 2>/dev/null || true)
             rendered_1d=$(status_rendered_interval "$cm" daily 2>/dev/null || true)
-            if ! cm_json=$(status_config_json "$cm"); then
-                echo -e "      ${RED}prometheusRuleConfig unreadable: ${cm_json}${NC}"
+            cm_json=$(status_config_json "$cm") || config_rc=$?
+            if [[ "$config_rc" -ne 0 ]]; then
+                # Without yq v4 the configured values are unknown, but the
+                # ConfigMap itself is fine: a warning, not an error.
+                if [[ "$config_rc" -eq 2 ]]; then
+                    echo -e "      ${YELLOW}prometheusRuleConfig not shown: ${cm_json}${NC}"
+                else
+                    echo -e "      ${RED}prometheusRuleConfig unreadable: ${cm_json}${NC}"
+                fi
                 echo -e "      rendered: evaluationInterval=${rendered:-none} evaluationInterval1d=${rendered_1d:-none}"
                 continue
             fi

@@ -6,7 +6,7 @@ CLI utilities for managing ACM (Advanced Cluster Management) observability and r
 
 - `oc` or `kubectl` in PATH
 - `jq` for JSON processing
-- `yq` v4 for safely editing and normalizing right-sizing ConfigMap YAML/JSON blobs; required by `rs-e2e` phases 10b-10d
+- `yq` v4 to read and edit the YAML right-sizing ConfigMap blobs: required by `rs-e2e` phases 4 and 10a-10d. Optional elsewhere: without it, `rs-status` and `rs-collect-must-gather` skip the configured intervals of a YAML blob, and `rs-e2e` phases 20 and 21 assume a `recommendationPercentage` of 110 for a YAML blob
 - `podman` or `docker` for image builds (used by config auto-detection)
 - Kubeconfig contexts configured for hub and spoke clusters
 
@@ -527,7 +527,7 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 21b | Stopped VM exclusion + Perses stat check (ACM-41141, MCOA #620/#621/#623) | Checks that the hub Thanos query path returns data, waits until the hub counts `fedora-vm-2` as running, stops it, and verifies it is excluded from the running-VM-filtered stat/table queries. In MCOA mode it also reads the deployed `acm-rightsizing-openshift-virtualization` PersesDashboard: all 4 stat panels must be pinned with `@ end()`, the query path must keep `@ end()` fixed over a 1-week range, and the CPU/Memory overestimation stat queries — run as range queries, the way Perses runs stat panels — must count the stopped VM nowhere, while the pre-fix query (no `@ end()`) still shows its stale value. The VM is restarted on exit, including after Ctrl-C. Skipped with `--skip-vm`; the Perses part is skipped in MCO mode and with `--skip-perses-check`. See [TROUBLESHOOTING](docs/TROUBLESHOOTING.md#phase-21b-perses-stat-panel-check-mcoa-620621623). |
 | 22 | Data-plane cleanup | Deletes workload namespaces from spoke clusters. Robust to unreachable spokes. |
 
-Phases 5-12, 15-16 require `--mode-switch`. Phases 10b-10d run only when the detected ACM version is >= 5.1 or the operator explicitly opts in with `--release 5.1`; custom image overrides alone do not bypass the release gate. The explicit 5.1 override defaults to only phases 10b-10d. These phases run in MCOA mode only and skip with `--data-plane` because interval changes perturb the data-plane's settling profiles. Phases 17-22 require `--data-plane`. Both can be combined with explicit `--phases` selection. Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.
+Phases 5-12, 15-16 require `--mode-switch`. Phases 10b-10d run only when the detected ACM version is >= 5.1 or the operator explicitly opts in with `--release 5.1`; custom image overrides alone do not bypass the release gate. The explicit 5.1 override defaults to only phases 10b-10d. Phases 4 and 10a-10d need `yq` v4 and fail before any cluster change without it. Phases 10b-10d run in MCOA mode only and skip with `--data-plane` because interval changes perturb the data-plane's settling profiles. Phases 17-22 require `--data-plane`. Both can be combined with explicit `--phases` selection. Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.
 
 #### Configurable MCOA evaluation intervals
 

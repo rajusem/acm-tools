@@ -235,9 +235,14 @@ detect_acm_namespace() {
 RS_RELEASE="${RS_RELEASE:-}"
 RS_MCH_VERSION="${RS_MCH_VERSION:-}"
 
-# detect_release — sets RS_RELEASE from MCH status.currentVersion.
-# Short-circuits if RS_RELEASE already set (--release flag or parent export wins).
-# Exports RS_RELEASE so subprocess calls (setup-observability, rs-mode-switch) inherit.
+# detect_release — sets RS_RELEASE from MCH status.currentVersion, and
+# RS_MCH_VERSION to that exact version (release_at_least compares it).
+# Any 5.x MCH maps to RS_RELEASE=5.0; an unrecognized version defaults to 2.17
+# with a warning.
+# Short-circuits if RS_RELEASE already set (--release flag or parent export wins):
+# RS_MCH_VERSION is then empty, and an unrecognized RS_RELEASE exits 1.
+# Exports RS_RELEASE and RS_MCH_VERSION so subprocess calls (setup-observability,
+# rs-mode-switch) inherit.
 # Must be called after init_acm_tools() (needs $KUBE_CLI and $ACM_NAMESPACE).
 detect_release() {
     # An explicit --release is intentionally only a coarse behaviour token.
@@ -578,6 +583,10 @@ cleanup_mce_leftovers() {
 }
 
 # Fail install if an existing MCE CSV major.minor does not match the target channel (T3).
+# CSVs that OLM copies into multicluster-engine from AllNamespaces operators
+# (label olm.copiedFrom, e.g. COO) are not MCE and are ignored.
+# Args: target channel (stable-X.Y); empty skips the check.
+# Returns: 0 no mismatch; 1 a leftover MCE CSV of another version (logged).
 preflight_mce_csv_channel() {
     local expected_channel="${1:-}"
     [[ -z "$expected_channel" ]] && return 0

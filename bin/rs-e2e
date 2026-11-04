@@ -117,6 +117,7 @@ E2E_START_TIME=0
 # CLI
 # =============================================================================
 
+# Print the command-line help to stdout.
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [options] [mco|mcoa]
@@ -151,6 +152,12 @@ Examples:
 EOF
 }
 
+# Pick the default phase list when --phases was not given: an explicit
+# --release 5.1 (no MCH version detected) selects only 10b-10d, 5.0 the MCOA
+# phases, 2.16 and 2.17 their existing sets; --data-plane appends 17-22.
+# Globals: reads RS_RELEASE, RS_MCH_VERSION, SKIP_UNINSTALL, MODE_SWITCH and
+#   DATA_PLANE; sets SELECTED_PHASES (expanded), or leaves it empty to run
+#   every phase.
 apply_release_phase_defaults() {
     [[ -n "$SELECTED_PHASES" ]] && return   # --phases wins
     if [[ "$RS_RELEASE" == "5.1" && -z "$RS_MCH_VERSION" ]]; then
@@ -179,6 +186,11 @@ apply_release_phase_defaults() {
     fi
 }
 
+# Parse the command line into the option globals (SKIP_UNINSTALL, MODE_SWITCH,
+# DATA_PLANE, SKIP_VM, NO_METRICS_WAIT, BUILD_TARGET, IMAGE_OVERRIDE_ONLY,
+# SKIP_PERSES_CHECK, AUTO_CONFIRM, SELECTED_PHASES, RS_RELEASE, FORCE_MODE).
+# Args: the script arguments.
+# Exits 0 after --help, 1 on an unknown option or a missing or invalid value.
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -908,7 +920,8 @@ rs_eval_interval_probe() {
 # features enabled, captures the original feature flags and ConfigMaps for
 # restoration, and runs rs_eval_interval_probe once per run.
 # Cluster changes: may switch to MCOA mode and enable both right-sizing
-#   features; e2e_on_exit restores the captured state.
+#   features; e2e_on_exit restores the captured feature flags and ConfigMaps
+#   but leaves the mode as it is.
 # Globals: sets PHASE_SKIP_REASON or PHASE_FAIL_REASON; reads and, through the
 #   probe, sets RS_EVAL_INTERVAL_SUPPORT.
 # Returns: 0 run the phase; 1 fail it; 2 skip it (pass the status on with
@@ -3174,6 +3187,14 @@ phase_7() {
 # Phase 8: Placement Filter
 # =============================================================================
 
+# Phase 8: a placement filter in rs-namespace-config limits the namespace
+# PrometheusRules to one labeled spoke and leaves the virtualization rules in
+# place; resetting it restores the default cluster set. MCOA is restarted as a
+# fallback when it does not pick up a ConfigMap change within 60s.
+# Cluster changes: may switch to MCOA mode; labels a spoke rs-e2e-filter=selected
+#   (removed again) and rewrites placementConfiguration, ending with the
+#   default placement.
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (sets PHASE_SKIP_REASON).
 phase_8() {
     if release_is_216; then
         PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
@@ -3536,9 +3557,17 @@ phase_9e() {
 }
 
 # =============================================================================
-# Phase 4 & 10: ConfigMap Propagation
+# Phase 4 & 10a: ConfigMap Propagation
 # =============================================================================
 
+# Phase 4 (MCO mode): recommendationPercentage=120 in rs-namespace-config must
+# reach the PrometheusRule in rs-prom-rules-policy as "(120/100)". Not
+# applicable to ACM 5.0 (MCOA only; see phase 10a).
+# Cluster changes: may switch to MCO mode; edits rs-namespace-config through the
+#   shared prometheusRuleConfig helpers, then writes back the run's original.
+# Globals: captures the E2E_CAPTURED_* originals once per run
+#   (capture_rs_rule_configs); sets CURRENT_MODE=mco.
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (sets PHASE_SKIP_REASON).
 phase_4() {
     if release_is_50; then
         PHASE_SKIP_REASON="Not applicable to ACM 5.0 (MCOA-only; ConfigMap propagation via phase 10a)"
@@ -3582,6 +3611,14 @@ phase_4() {
     return 0
 }
 
+# Phase 10a (MCOA mode; was phase 10): recommendationPercentage=120 in
+# rs-namespace-config must reach a PrometheusRule in an MCOA ManifestWork as
+# "(120/100)". Not applicable to ACM 2.16 (MCO only).
+# Cluster changes: may switch to MCOA mode; edits rs-namespace-config through
+#   the shared prometheusRuleConfig helpers, then writes back the run's original.
+# Globals: captures the E2E_CAPTURED_* originals once per run
+#   (capture_rs_rule_configs); sets CURRENT_MODE=mcoa.
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (sets PHASE_SKIP_REASON).
 phase_10a() {
     if release_is_216; then
         PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
@@ -3752,6 +3789,9 @@ check_rs_interval_rule_groups() {
 # at the inclusive minima, then the inclusive maxima render, then seconds-unit
 # values (1800s/3600s) render and run on reachable spokes. Restores the
 # captured ConfigMaps at the end.
+# Cluster changes: rs_eval_interval_gate's, plus prometheusRuleConfig edits to
+#   both RS ConfigMaps.
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (from the gate).
 phase_10b() {
     rs_eval_interval_gate || return $?
     local errors=0 original_ns original_virt ns_5m ns_1d virt_5m virt_1d
@@ -3871,7 +3911,10 @@ phase_10b() {
 # written back as plain YAML. Case 3 expects an aggregator rejection to keep a
 # valid interval from the same patch. Case 4 expects a virtualization
 # rejection to leave rs-namespace-config alone. Restores the captured
-# ConfigMaps at the end. Cluster changes include an MCOA rollout restart.
+# ConfigMaps at the end.
+# Cluster changes: rs_eval_interval_gate's, plus edits to both RS ConfigMaps
+#   and an MCOA rollout restart.
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (from the gate).
 phase_10c() {
     rs_eval_interval_gate || return $?
     local errors=0 original_ns original_virt original_placement_ns original_placement_virt
@@ -4055,6 +4098,10 @@ phase_10c() {
 # wasteful ordering (rolling 30m, daily 15m) must be accepted. Restores the
 # captured ConfigMaps; e2e_on_exit also covers an interruption while
 # rs-namespace-config is deleted.
+# Cluster changes: rs_eval_interval_gate's, plus toggling namespace
+#   right-sizing in the MCO CR (MCO deletes and recreates rs-namespace-config)
+#   and edits to rs-namespace-config.
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (from the gate).
 phase_10d() {
     rs_eval_interval_gate || return $?
     local errors=0 original_ns fresh removed rv_before rv_after witness=123 actual
@@ -4523,6 +4570,14 @@ phase_19() {
     return 0
 }
 
+# Phase 20 (--data-plane): hub Thanos has the acm_rs:namespace:* metrics of
+# each phase 17 namespace, and their CPU and memory recommendations classify
+# as expected. A failed hub classification is re-checked against the spoke's
+# tier-1 metrics, with the recommendation computed from usage and the
+# recommendationPercentage of rs-namespace-config (110 when unset or unreadable).
+# Cluster changes: none; switches to the hub context and may start a local
+#   Thanos port-forward (stopped at the end).
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (sets PHASE_SKIP_REASON).
 phase_20() {
     if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
         PHASE_SKIP_REASON="Use --data-plane to enable"
@@ -4663,6 +4718,15 @@ phase_20() {
     return 0
 }
 
+# Phase 21 (--data-plane, not with --skip-vm): hub Thanos has the
+# acm_rs_vm:namespace:* metrics of each phase 18 VM, and their CPU and memory
+# recommendations classify as expected. A failed hub classification is
+# re-checked against the spoke's tier-1 metrics, with the recommendation
+# computed from usage and the recommendationPercentage of rs-virt-config (110
+# when unset or unreadable).
+# Cluster changes: none; switches to the hub context and may start a local
+#   Thanos port-forward (stopped at the end).
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (sets PHASE_SKIP_REASON).
 phase_21() {
     if [[ "$DATA_PLANE" != "true" && -z "$SELECTED_PHASES" ]]; then
         PHASE_SKIP_REASON="Use --data-plane to enable"
@@ -5873,6 +5937,12 @@ print_summary() {
 # Main
 # =============================================================================
 
+# Parse the options, detect the release and default phase list, run the
+# optional build or image-override pre-phase, then every selected phase in
+# order, and print the summary. The EXIT trap (e2e_on_exit) restores what the
+# phases captured.
+# Args: the script arguments.
+# Returns: 0 when no phase failed; 1 otherwise (exits 1 if a pre-phase fails).
 main() {
     parse_args "$@"
 

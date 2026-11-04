@@ -211,6 +211,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Print the right-sizing dashboard: mode, MCO CR flags, AddOnDeploymentConfig,
+# RS ConfigMaps with their configured and rendered intervals, mode-specific
+# resources, spoke PrometheusRules (unless --hub-only), operator pods,
+# COO/Perses and images. With --json, prints show_status_json instead.
+# Each call is one --watch refresh.
+# Globals: resets STATUS_MANIFESTWORKS_READY and STATUS_RENDERED_INTERVALS;
+#   caches RS_YQ_V4 (rs_have_yq) for the helpers below.
+# Stdout: the dashboard. Reads the cluster only.
 show_status() {
     # Reset the ManifestWork cache so every --watch refresh rescans, and probe
     # yq once here so the $(...) helpers below inherit the cached answer.
@@ -555,6 +563,12 @@ show_status() {
     print_separator
 }
 
+# Print the right-sizing state as one JSON object: mode, release, the MCO
+# mode annotation, the MCO CR feature flags, the AddOnDeploymentConfig
+# variables (MCOA mode) and rs_config for both RS ConfigMaps (null when a
+# ConfigMap is missing; see status_rs_config_json).
+# Globals: loads STATUS_RENDERED_INTERVALS (status_load_manifestworks).
+# Stdout: the JSON object. Reads the cluster only.
 show_status_json() {
     local annotation="" ns_enabled virt_enabled ns_adc virt_adc ns_config_json virt_config_json
 

@@ -186,6 +186,14 @@ analyze_eval_config() {
 # =============================================================================
 # Analyze function — works on collected must-gather directory (no cluster needed)
 # =============================================================================
+
+# Analyze a collected bundle offline: operator health, ADC consistency,
+# mode-specific resources, spoke PrometheusRules, log errors, ConfigMap
+# presence, evaluation intervals (MCOA mode) and events, then a summary.
+# Args: bundle directory.
+# Stdout: the report.
+# Returns: 1 when the directory does not exist; otherwise 0 (findings are
+#   reported, not returned).
 do_analyze() {
     local dir="$1"
 
@@ -661,6 +669,14 @@ do_analyze() {
 # =============================================================================
 # Collect function (original collection logic)
 # =============================================================================
+
+# Collect a diagnostic bundle: hub logs, resources and manifests, JSON
+# snapshots of the RS ConfigMaps and MCOA ManifestWorks for the analyzer, spoke
+# data unless skipped, and SUMMARY.txt.
+# Args: output directory, spoke context, log line count, skip-spoke flag
+#   (true|false).
+# Globals: initializes the hub context and RS_RELEASE (detect_release).
+# Stdout: progress messages. Reads the cluster only.
 do_collect() {
     local output_dir="$1"
     local spoke_context="$2"

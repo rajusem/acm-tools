@@ -233,22 +233,32 @@ detect_acm_namespace() {
 # variable would exit immediately; this form preserves any value exported by a parent
 # process (e.g. rs-e2e → setup-observability) while defaulting to empty if unset.
 RS_RELEASE="${RS_RELEASE:-}"
+RS_MCH_VERSION="${RS_MCH_VERSION:-}"
 
-# detect_release — sets RS_RELEASE from MCH status.currentVersion.
-# Short-circuits if RS_RELEASE already set (--release flag or parent export wins).
-# Exports RS_RELEASE so subprocess calls (setup-observability, rs-mode-switch) inherit.
+# detect_release — sets RS_RELEASE from MCH status.currentVersion, and
+# RS_MCH_VERSION to that exact version (release_at_least compares it).
+# Any 5.x MCH maps to RS_RELEASE=5.0; an unrecognized version defaults to 2.17
+# with a warning.
+# Short-circuits if RS_RELEASE already set (--release flag or parent export wins):
+# RS_MCH_VERSION is then empty, and an unrecognized RS_RELEASE exits 1.
+# Exports RS_RELEASE and RS_MCH_VERSION so subprocess calls (setup-observability,
+# rs-mode-switch) inherit.
 # Must be called after init_acm_tools() (needs $KUBE_CLI and $ACM_NAMESPACE).
 detect_release() {
+    # An explicit --release is intentionally only a coarse behaviour token.
+    # There is no exact MCH version to compare in this path.
+    RS_MCH_VERSION=""
     if [[ -n "$RS_RELEASE" ]]; then
-        [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0)$ ]] || {
+        [[ "$RS_RELEASE" =~ ^(2\.16|2\.17|5\.0|5\.1)$ ]] || {
             log_error "Inherited RS_RELEASE='$RS_RELEASE' is not a recognized release — set --release or unset RS_RELEASE"
             exit 1
         }
-        export RS_RELEASE; return
+        export RS_RELEASE RS_MCH_VERSION; return
     fi
     local version major minor
     version=$(get_resource_field mch multiclusterhub "$ACM_NAMESPACE" \
         '{.status.currentVersion}' 2>/dev/null || echo "")
+    RS_MCH_VERSION="$version"
     major=$(echo "$version" | cut -d. -f1)
     minor=$(echo "$version" | cut -d. -f2)
     if   [[ "$major" == "5"  ]];                    then RS_RELEASE="5.0"
@@ -258,8 +268,206 @@ detect_release() {
         log_warn "MCH version '${version:-<not found>}' not recognized — defaulting to 2.17; use --release to override"
         RS_RELEASE="2.17"
     fi
-    export RS_RELEASE
+    export RS_RELEASE RS_MCH_VERSION
     log_info "Release: $RS_RELEASE (auto-detected from MCH $version)"
+}
+
+# Compare the exact MCH version fetched by detect_release (RS_MCH_VERSION)
+# with a required major.minor, e.g. release_at_least 5.1.
+# Return 0 when the exact MCH major/minor meets the requirement.
+# Return 1 when it is older, unavailable, or unparseable.
+release_at_least() {
+    local required="$1" version_major version_minor required_major required_minor
+
+    [[ "$required" =~ ^([0-9]+)\.([0-9]+)$ ]] || return 1
+    required_major="${BASH_REMATCH[1]}"
+    required_minor="${BASH_REMATCH[2]}"
+    [[ "$RS_MCH_VERSION" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?([+-].*)?$ ]] || return 1
+    version_major="${BASH_REMATCH[1]}"
+    version_minor="${BASH_REMATCH[2]}"
+
+    if (( 10#$version_major > 10#$required_major )); then
+        return 0
+    fi
+    if (( 10#$version_major < 10#$required_major )); then
+        return 1
+    fi
+    (( 10#$version_minor >= 10#$required_minor ))
+}
+
+# --- Right-sizing prometheusRuleConfig helpers -------------------------------
+# MCOA stores prometheusRuleConfig as YAML; older configurations may be JSON.
+# JSON is read with jq alone. YAML needs yq v4, which README lists
+# as a prerequisite. The helpers never fall back to line-based YAML parsing:
+# quoted scalars and flow lists ([a, b]) would be misread.
+
+# Detect yq v4 or newer (Python yq and yq v3 use another syntax).
+# Caches the answer in RS_YQ_V4 ("yes"/"no") for the current shell.
+# Returns: 0 available; 1 missing or incompatible. Produces no output.
+rs_have_yq() {
+    local version version_re='version v?([0-9]+)\.'
+    if [[ -z "${RS_YQ_V4:-}" ]]; then
+        RS_YQ_V4=no
+        version=$(yq --version 2>/dev/null || true)
+        if [[ "$version" == *mikefarah* && "$version" =~ $version_re ]] && \
+            (( ${BASH_REMATCH[1]} >= 4 )); then
+            RS_YQ_V4=yes
+        fi
+    fi
+    [[ "$RS_YQ_V4" == "yes" ]]
+}
+
+# Normalize a prometheusRuleConfig blob (YAML or JSON) to one compact JSON object.
+# Args: blob. An empty or comment-only blob is {} (MCOA then uses its defaults).
+# Stdout: the compact JSON object.
+# Returns: 0 ok; 1 not a single YAML/JSON object, or YAML without yq v4.
+#   The reason goes to stderr.
+rs_rule_config_to_json() {
+    local blob="$1" json yaml_json
+    local to_object='
+        if length == 0 or (length == 1 and .[0] == null) then {}
+        elif length == 1 and (.[0] | type) == "object" then .[0]
+        else error("not a single object") end'
+
+    if [[ -z "${blob//[[:space:]]/}" ]]; then
+        printf '{}\n'
+        return 0
+    fi
+    if json=$(printf '%s\n' "$blob" | jq -cs "$to_object" 2>/dev/null); then
+        printf '%s\n' "$json"
+        return 0
+    fi
+    if ! rs_have_yq; then
+        log_error "Reading YAML prometheusRuleConfig requires yq v4 (brew install yq)"
+        return 1
+    fi
+    # Two steps instead of one pipeline: without pipefail a failed yq would
+    # hand jq an empty stream, which reads as {}.
+    if yaml_json=$(printf '%s\n' "$blob" | yq -o=json -I=0 '.' 2>/dev/null) && \
+        json=$(printf '%s\n' "$yaml_json" | jq -cs "$to_object" 2>/dev/null); then
+        printf '%s\n' "$json"
+        return 0
+    fi
+    log_error "prometheusRuleConfig is not a single YAML/JSON object"
+    return 1
+}
+
+# Read one top-level key from a prometheusRuleConfig blob (YAML or JSON).
+# Args: blob, key.
+# Stdout: the value. Strings print raw; numbers and booleans print as-is;
+#   lists and maps print as compact JSON, e.g. ["Max OverAll","P90"].
+# Returns: 0 value printed; 1 key missing, null, or empty;
+#   2 blob unreadable (see rs_rule_config_to_json; the reason goes to stderr).
+rs_rule_config_get() {
+    local blob="$1" key="$2" json value
+    json=$(rs_rule_config_to_json "$blob") || return 2
+    value=$(printf '%s\n' "$json" | jq -r --arg key "$key" '
+        if has($key) and .[$key] != null
+        then .[$key] | if type == "string" then . else tojson end
+        else empty end') || return 2
+    [[ -n "$value" ]] || return 1
+    printf '%s\n' "$value"
+}
+
+# Apply a jq filter to a prometheusRuleConfig blob and print the result as YAML.
+# Args: blob, jq filter, then extra jq arguments (e.g. --arg key K).
+# Stdout: block-style YAML, the format MCOA writes; key order is kept.
+# Returns: 0 ok; 1 unreadable blob, failed filter, or yq v4 unavailable.
+rs_rule_config_edit() {
+    local blob="$1" filter="$2" json
+    shift 2
+    if ! rs_have_yq; then
+        log_error "Editing prometheusRuleConfig requires yq v4 (brew install yq)"
+        return 1
+    fi
+    json=$(rs_rule_config_to_json "$blob") || return 1
+    json=$(printf '%s\n' "$json" | jq -c "$@" "$filter") || return 1
+    printf '%s\n' "$json" | yq -P '.'
+}
+
+# Set one top-level key in a prometheusRuleConfig blob.
+# Args: blob (YAML or JSON, may be empty), key, value. The value is read as
+#   YAML: 125 is a number, 10m a string, [a, b] a list; '125' forces a string.
+# Stdout: the updated blob as block-style YAML.
+# Returns: 0 ok; 1 unreadable blob or value, or yq v4 unavailable.
+rs_rule_config_set() {
+    local blob="$1" key="$2" value="$3" value_json
+    if ! rs_have_yq; then
+        log_error "Editing prometheusRuleConfig requires yq v4 (brew install yq)"
+        return 1
+    fi
+    value_json=$(printf 'value: %s\n' "$value" | yq -o=json -I=0 '.value' 2>/dev/null) || {
+        log_error "Cannot read '$value' as a YAML value for prometheusRuleConfig key '$key'"
+        return 1
+    }
+    rs_rule_config_edit "$blob" '.[$key] = $value' --arg key "$key" --argjson value "$value_json"
+}
+
+# Remove one top-level key from a prometheusRuleConfig blob.
+# Args: blob (YAML or JSON, may be empty), key.
+# Stdout: the updated blob as block-style YAML ({} when no key remains).
+# Returns: 0 ok; 1 unreadable blob or yq v4 unavailable.
+rs_rule_config_unset() {
+    rs_rule_config_edit "$1" 'del(.[$key])' --arg key "$2"
+}
+
+# Print the live prometheusRuleConfig blob of a right-sizing ConfigMap.
+# Args: ConfigMap name, namespace.
+# Stdout: the raw blob (empty when the key is not set).
+# Returns: the oc/kubectl status (non-zero when the ConfigMap is missing or the
+#   API is unreachable).
+rs_rule_config_from_cluster() {
+    local cm="$1" namespace="$2"
+    $KUBE_CLI get configmap "$cm" -n "$namespace" \
+        -o jsonpath='{.data.prometheusRuleConfig}' --request-timeout=10s
+}
+
+# Convert a single-unit Prometheus duration to milliseconds.
+# Args: duration such as 300s, 5m or 1h (units ms, s, m, h, d, w, y).
+#   Compound durations (1h30m) are rejected, matching MCOA's pattern; so is zero.
+# Stdout: the number of milliseconds.
+# Returns: 0 ok; 1 not a valid single-unit duration.
+rs_duration_ms() {
+    local value="$1" number unit multiplier
+    [[ "$value" =~ ^([0-9]+)(ms|s|m|h|d|w|y)$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    [[ "$number" =~ [1-9] ]] || return 1
+    case "$unit" in
+        ms) multiplier=1 ;;
+        s)  multiplier=1000 ;;
+        m)  multiplier=60000 ;;
+        h)  multiplier=3600000 ;;
+        d)  multiplier=86400000 ;;
+        w)  multiplier=604800000 ;;
+        y)  multiplier=31536000000 ;;
+    esac
+    awk -v number="$number" -v multiplier="$multiplier" 'BEGIN { printf "%.0f\n", number * multiplier }'
+}
+
+# Validate an optional duration against inclusive minimum/maximum bounds.
+# Args: value, minimum, maximum (single-unit durations).
+# Returns: 0 valid/empty; 1 parsing failure; 2 outside bounds.
+# Produces no output and does not access or modify the cluster.
+rs_eval_interval_check() {
+    local value="$1" min="$2" max="$3" value_ms min_ms max_ms rc
+    [[ -z "$value" ]] && return 0
+    value_ms=$(rs_duration_ms "$value") || return 1
+    min_ms=$(rs_duration_ms "$min") || return 1
+    max_ms=$(rs_duration_ms "$max") || return 1
+    # Keep the comparison in awk: Bash arithmetic is signed 64-bit and wraps
+    # for sufficiently large, otherwise well-formed durations. The operator
+    # rejects those values as overflow, so the local validator must not accept
+    # a wrapped value as being inside the configured range.
+    if awk -v value="$value_ms" -v minimum="$min_ms" -v maximum="$max_ms" \
+        'BEGIN { if (value < minimum || value > maximum) exit 2; exit 0 }' \
+        >/dev/null 2>&1; then
+        return 0
+    else
+        rc=$?
+    fi
+    [[ "$rc" -eq 2 ]] && return 2
+    return 1
 }
 
 release_is_50()  { [[ "$RS_RELEASE" == "5.0"  ]]; }
@@ -375,11 +583,16 @@ cleanup_mce_leftovers() {
 }
 
 # Fail install if an existing MCE CSV major.minor does not match the target channel (T3).
+# CSVs that OLM copies into multicluster-engine from AllNamespaces operators
+# (label olm.copiedFrom, e.g. COO) are not MCE and are ignored.
+# Args: target channel (stable-X.Y); empty skips the check.
+# Returns: 0 no mismatch; 1 a leftover MCE CSV of another version (logged).
 preflight_mce_csv_channel() {
     local expected_channel="${1:-}"
     [[ -z "$expected_channel" ]] && return 0
     local csv_names expected_ver csv_name leftover
-    csv_names=$($KUBE_CLI get csv -n multicluster-engine --no-headers \
+    # Skip CSVs OLM copies from AllNamespaces operators (e.g. COO); they are not MCE.
+    csv_names=$($KUBE_CLI get csv -n multicluster-engine -l '!olm.copiedFrom' --no-headers \
         -o custom-columns=NAME:.metadata.name --request-timeout=15s 2>/dev/null || true)
     [[ -z "$csv_names" ]] && return 0
     expected_ver="${expected_channel#stable-}"

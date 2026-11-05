@@ -32,6 +32,169 @@ SPOKE="$NAMESPACE_SPOKE_CONTEXT"
 SPOKE_FILTER_SET=false
 WATCH_MODE=false
 JSON_MODE=false
+STATUS_MANIFESTWORKS_READY=false
+STATUS_RENDERED_INTERVALS=""
+
+# Read a right-sizing ConfigMap's prometheusRuleConfig as one compact JSON object.
+# Args: ConfigMap name (in OBS_NAMESPACE).
+# Stdout: the JSON object ({} when the key is unset) or, on failure, a short reason.
+# Returns: 0 ok; 1 the ConfigMap or its blob could not be read; 2 the blob is
+#   YAML and yq v4 is not installed on this host.
+status_config_json() {
+    local cm="$1" blob
+    if ! blob=$(rs_rule_config_from_cluster "$cm" "$OBS_NAMESPACE" 2>/dev/null); then
+        echo "ConfigMap read failed"
+        return 1
+    fi
+    rs_rule_config_to_json "$blob" 2>/dev/null && return 0
+    if rs_have_yq; then
+        echo "not a single YAML/JSON object"
+        return 1
+    fi
+    echo "YAML needs yq v4 (brew install yq)"
+    return 2
+}
+
+# Collect the rendered right-sizing rule-group intervals from every MCOA
+# ManifestWork, once per refresh. Call it in the parent shell before any
+# $(status_rendered_interval ...): a load inside $(...) is lost on return.
+# Globals: sets STATUS_RENDERED_INTERVALS ("slot<TAB>interval" lines; slots are
+#   namespace_rolling, namespace_daily, virtualization_rolling and
+#   virtualization_daily) and STATUS_MANIFESTWORKS_READY=true.
+status_load_manifestworks() {
+    [[ "$STATUS_MANIFESTWORKS_READY" == "true" ]] && return 0
+    STATUS_RENDERED_INTERVALS=""
+    local mc_list mc mws_json values
+    mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' \
+        --request-timeout=10s 2>/dev/null || echo "")
+    for mc in $mc_list; do
+        mws_json=$($KUBE_CLI get manifestwork -n "$mc" -o json --request-timeout=10s 2>/dev/null || echo "")
+        jq -e . >/dev/null 2>&1 <<< "$mws_json" || continue
+        # Rolling groups end in -5m.rule; daily groups end in -1d.rule or
+        # -1d.rules (acm-right-sizing-namespace-1d.rules).
+        values=$(jq -r --arg pattern "$MCOA_MW_PATTERN" '
+            .items[]? | select(.metadata.name | test($pattern)) |
+            .spec.workload.manifests[]? | select(.kind == "PrometheusRule") |
+            .metadata.name as $rule | .spec.groups[]? | select(.interval | type == "string") |
+            (if $rule == "acm-rs-namespace-prometheus-rules" then "namespace"
+             elif $rule == "acm-rs-virt-prometheus-rules" then "virtualization"
+             else empty end) as $owner |
+            (if (.name | test("-5m\\.rule$")) then "rolling"
+             elif (.name | test("-1d\\.rules?$")) then "daily"
+             else empty end) as $kind |
+            [$owner + "_" + $kind, .interval] | @tsv
+        ' <<< "$mws_json" 2>/dev/null || true)
+        [[ -n "$values" ]] && STATUS_RENDERED_INTERVALS+="$values"$'\n'
+    done
+    STATUS_MANIFESTWORKS_READY=true
+}
+
+# Collapse interval values into one value, or mixed(a,b) when they disagree.
+# Args: newline-separated intervals. Equal durations in different units
+#   (300s and 5m) count as the same value.
+# Stdout: the first value, or mixed(first,other).
+# Returns: 0 printed; 1 no values.
+status_interval_summary() {
+    local values="$1" first="" first_ms="" value value_ms
+    while IFS= read -r value; do
+        [[ -n "$value" ]] || continue
+        value_ms=$(rs_duration_ms "$value" 2>/dev/null || true)
+        if [[ -z "$first" ]]; then
+            first="$value"
+            first_ms="$value_ms"
+        elif [[ "$value" != "$first" && ( -z "$first_ms" || -z "$value_ms" || "$value_ms" != "$first_ms" ) ]]; then
+            printf 'mixed(%s,%s)\n' "$first" "$value"
+            return 0
+        fi
+    done <<< "$values"
+    [[ -n "$first" ]] || return 1
+    printf '%s\n' "$first"
+}
+
+# Summarize the rendered interval of one ConfigMap's rolling or daily groups
+# across all MCOA ManifestWorks.
+# Args: ConfigMap name (rs-namespace-config|rs-virt-config), kind (rolling|daily).
+# Stdout: see status_interval_summary. Loads the ManifestWork cache if needed.
+# Returns: 0 printed; 1 unknown arguments or no rendered group.
+status_rendered_interval() {
+    local cm="$1" kind="$2" slot cached_slot cached_value values=""
+    case "$cm:$kind" in
+        rs-namespace-config:rolling) slot="namespace_rolling" ;;
+        rs-namespace-config:daily) slot="namespace_daily" ;;
+        rs-virt-config:rolling) slot="virtualization_rolling" ;;
+        rs-virt-config:daily) slot="virtualization_daily" ;;
+        *) return 1 ;;
+    esac
+    status_load_manifestworks
+    while IFS=$'\t' read -r cached_slot cached_value; do
+        [[ "$cached_slot" == "$slot" ]] || continue
+        values+="${values:+$'\n'}$cached_value"
+    done <<< "$STATUS_RENDERED_INTERVALS"
+    status_interval_summary "$values"
+}
+
+# Build the rs_config JSON for one ConfigMap: configured intervals, their
+# source, and the rendered intervals.
+# Args: ConfigMap name.
+# Stdout: a JSON object. source is default, custom, mixed or unreadable; error
+#   holds the reason when the configuration could not be read, else null.
+status_rs_config_json() {
+    local cm="$1" config_json value="" value_1d="" rendered rendered_1d source error=""
+    if config_json=$(status_config_json "$cm"); then
+        value=$(rs_rule_config_get "$config_json" evaluationInterval || true)
+        value_1d=$(rs_rule_config_get "$config_json" evaluationInterval1d || true)
+        source="mixed"
+        [[ -z "$value" && -z "$value_1d" ]] && source="default"
+        [[ -n "$value" && -n "$value_1d" ]] && source="custom"
+    else
+        source="unreadable"
+        error="$config_json"
+    fi
+    rendered=$(status_rendered_interval "$cm" rolling 2>/dev/null || true)
+    rendered_1d=$(status_rendered_interval "$cm" daily 2>/dev/null || true)
+    jq -n --arg value "$value" --arg value1d "$value_1d" \
+        --arg source "$source" --arg error "$error" \
+        --arg rendered "$rendered" --arg rendered1d "$rendered_1d" '{
+          evaluation_interval: (if $value == "" then null else $value end),
+          evaluation_interval_1d: (if $value1d == "" then null else $value1d end),
+          source: $source,
+          error: (if $error == "" then null else $error end),
+          rendered: {evaluation_interval: (if $rendered == "" then null else $rendered end), evaluation_interval_1d: (if $rendered1d == "" then null else $rendered1d end)}
+        }'
+}
+
+# Print one interval line of the text dashboard: the value (or its default),
+# validation state, and rendered value with drift detection.
+# Args: ConfigMap, label, configured value (empty = default), default,
+#   minimum, maximum, rendered value (empty = not rendered).
+# Stdout: one colored line.
+status_print_interval() {
+    local cm="$1" label="$2" value="$3" default="$4" min="$5" max="$6" rendered="$7" rc color suffix
+    local shown="${value:-$default}"
+    suffix=""
+    [[ -z "$value" ]] && suffix=" (default)"
+    if rs_eval_interval_check "$value" "$min" "$max"; then
+        color="$GREEN"
+    else
+        rc=$?
+        color="$RED"
+        if [[ "$rc" -eq 2 ]]; then
+            suffix=" (invalid: allowed $min to $max; MCOA will revert)"
+        else
+            suffix=" (invalid: expected a single duration $min to $max; MCOA will revert)"
+        fi
+    fi
+    if [[ -n "$rendered" ]]; then
+        if rs_eval_interval_check "$value" "$min" "$max" && \
+            [[ "$(rs_duration_ms "${value:-$default}")" == "$(rs_duration_ms "$rendered")" ]]; then
+            suffix="$suffix rendered=$rendered"
+        else
+            suffix="$suffix rendered=$rendered (DRIFT)"
+            color="$RED"
+        fi
+    fi
+    echo -e "      ${color}${label}=${shown}${suffix}${NC}"
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,7 +212,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Print the right-sizing dashboard: mode, MCO CR flags, AddOnDeploymentConfig,
+# RS ConfigMaps with their configured and rendered intervals, mode-specific
+# resources, spoke PrometheusRules (unless --hub-only), operator pods,
+# COO/Perses and images. With --json, prints show_status_json instead.
+# Each call is one --watch refresh.
+# Globals: resets STATUS_MANIFESTWORKS_READY and STATUS_RENDERED_INTERVALS;
+#   caches RS_YQ_V4 (rs_have_yq) for the helpers below.
+# Stdout: the dashboard. Reads the cluster only.
 show_status() {
+    # Reset the ManifestWork cache so every --watch refresh rescans, and probe
+    # yq once here so the $(...) helpers below inherit the cached answer.
+    STATUS_MANIFESTWORKS_READY=false
+    STATUS_RENDERED_INTERVALS=""
+    rs_have_yq || true
     if [[ "$JSON_MODE" == "true" ]]; then
         show_status_json
         return
@@ -137,9 +313,38 @@ show_status() {
     # ── ConfigMaps ──
     echo ""
     echo -e "${BOLD}  ConfigMaps (${OBS_NAMESPACE}):${NC}"
+    status_load_manifestworks
     for cm in rs-namespace-config rs-virt-config; do
         if resource_exists configmap "$cm" "$OBS_NAMESPACE"; then
             echo -e "    ${GREEN}$cm: exists${NC}"
+            local cm_json cm_eval cm_eval_1d rendered rendered_1d config_rc=0
+            rendered=$(status_rendered_interval "$cm" rolling 2>/dev/null || true)
+            rendered_1d=$(status_rendered_interval "$cm" daily 2>/dev/null || true)
+            cm_json=$(status_config_json "$cm") || config_rc=$?
+            if [[ "$config_rc" -ne 0 ]]; then
+                # Without yq v4 the configured values are unknown, but the
+                # ConfigMap itself is fine: a warning, not an error.
+                if [[ "$config_rc" -eq 2 ]]; then
+                    echo -e "      ${YELLOW}prometheusRuleConfig not shown: ${cm_json}${NC}"
+                else
+                    echo -e "      ${RED}prometheusRuleConfig unreadable: ${cm_json}${NC}"
+                fi
+                echo -e "      rendered: evaluationInterval=${rendered:-none} evaluationInterval1d=${rendered_1d:-none}"
+                continue
+            fi
+            cm_eval=$(rs_rule_config_get "$cm_json" evaluationInterval || true)
+            cm_eval_1d=$(rs_rule_config_get "$cm_json" evaluationInterval1d || true)
+            status_print_interval "$cm" "evaluationInterval" "$cm_eval" "$RS_EVAL_INTERVAL_DEFAULT" \
+                "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX" "$rendered"
+            status_print_interval "$cm" "evaluationInterval1d" "$cm_eval_1d" "$RS_EVAL_INTERVAL_1D_DEFAULT" \
+                "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX" "$rendered_1d"
+            if [[ -n "$cm_eval" && -n "$cm_eval_1d" ]] && \
+                rs_eval_interval_check "$cm_eval" "$RS_EVAL_INTERVAL_MIN" "$RS_EVAL_INTERVAL_MAX" && \
+                rs_eval_interval_check "$cm_eval_1d" "$RS_EVAL_INTERVAL_1D_MIN" "$RS_EVAL_INTERVAL_1D_MAX"; then
+                if (( $(rs_duration_ms "$cm_eval") > $(rs_duration_ms "$cm_eval_1d") )); then
+                    echo -e "      ${YELLOW}warning: evaluationInterval is coarser than evaluationInterval1d${NC}"
+                fi
+            fi
         else
             echo -e "    ${RED}$cm: not found${NC}"
         fi
@@ -366,8 +571,14 @@ show_status() {
     print_separator
 }
 
+# Print the right-sizing state as one JSON object: mode, release, the MCO
+# mode annotation, the MCO CR feature flags, the AddOnDeploymentConfig
+# variables (MCOA mode) and rs_config for both RS ConfigMaps (null when a
+# ConfigMap is missing; see status_rs_config_json).
+# Globals: loads STATUS_RENDERED_INTERVALS (status_load_manifestworks).
+# Stdout: the JSON object. Reads the cluster only.
 show_status_json() {
-    local annotation="" ns_enabled virt_enabled ns_adc virt_adc
+    local annotation="" ns_enabled virt_enabled ns_adc virt_adc ns_config_json virt_config_json
 
     annotation=$($KUBE_CLI get mco "$MCO_NAME" \
         -o jsonpath="{.metadata.annotations.${RS_ANNOTATION//./\\.}}" 2>/dev/null || echo "")
@@ -392,6 +603,16 @@ show_status_json() {
         virt_adc=$(echo "$adc_json" | jq -r '.spec.customizedVariables[]? | select(.name=="platformVirtualizationRightSizing") | .value' 2>/dev/null || echo "null")
     fi
 
+    ns_config_json="null"
+    virt_config_json="null"
+    status_load_manifestworks
+    if resource_exists configmap rs-namespace-config "$OBS_NAMESPACE"; then
+        ns_config_json=$(status_rs_config_json rs-namespace-config)
+    fi
+    if resource_exists configmap rs-virt-config "$OBS_NAMESPACE"; then
+        virt_config_json=$(status_rs_config_json rs-virt-config)
+    fi
+
     jq -n \
         --arg mode "$mode" \
         --arg release "$RS_RELEASE" \
@@ -400,6 +621,8 @@ show_status_json() {
         --arg virt_enabled "$virt_enabled" \
         --arg ns_adc "${ns_adc:-null}" \
         --arg virt_adc "${virt_adc:-null}" \
+        --argjson ns_config "$ns_config_json" \
+        --argjson virt_config "$virt_config_json" \
         '{
             mode: $mode,
             release: $release,
@@ -411,6 +634,10 @@ show_status_json() {
             adc: {
                 namespace: (if $ns_adc == "null" then null else $ns_adc end),
                 virtualization: (if $virt_adc == "null" then null else $virt_adc end)
+            },
+            rs_config: {
+                namespace: $ns_config,
+                virtualization: $virt_config
             }
         }'
 }

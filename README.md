@@ -6,6 +6,7 @@ CLI utilities for managing ACM (Advanced Cluster Management) observability and r
 
 - `oc` or `kubectl` in PATH
 - `jq` for JSON processing
+- `yq` v4 to read and edit the YAML right-sizing ConfigMap blobs: required by `rs-e2e` phases 4 and 10a-10d. Optional elsewhere: without it, `rs-status` and `rs-collect-must-gather` skip the configured intervals of a YAML blob, and `rs-e2e` phases 20 and 21 assume a `recommendationPercentage` of 110 for a YAML blob
 - `podman` or `docker` for image builds (used by config auto-detection)
 - Kubeconfig contexts configured for hub and spoke clusters
 
@@ -451,9 +452,10 @@ bin/rs-e2e --skip-uninstall                  # Phases 0-4a only (no MCO deletion
 bin/rs-e2e --skip-uninstall --data-plane     # Control-plane + data-plane validation
 bin/rs-e2e --mode-switch --data-plane --yes  # All phases + data-plane, auto-confirm
 bin/rs-e2e --release 5.0 --data-plane --yes  # Test 5.0 images on 2.17 cluster + data-plane
-bin/rs-e2e --release 5.0 --skip-uninstall    # 5.0 control-plane only (phases 0,0a,1,9a-9e,10)
+bin/rs-e2e --release 5.0 --skip-uninstall    # 5.0 control-plane; interval phases skip below 5.1
 bin/rs-e2e --phases 0-3,5,9a                 # Run specific phases (ranges OK)
 bin/rs-e2e --phases 17-22 --skip-vm          # Data-plane only, no VMs
+bin/rs-e2e --release 5.1                     # Run only evaluation interval tests (10b-10d)
 bin/rs-e2e --build mco                       # Build MCO image, then run tests
 bin/rs-e2e --build both                      # Build MCO + MCOA images, then run tests
 bin/rs-e2e --image-override                  # Apply image-override.json, then run tests
@@ -461,7 +463,7 @@ bin/rs-e2e --skip-perses-check               # Skip COO/Perses dashboard checks 
 bin/rs-e2e mcoa                              # Force testing in MCOA mode
 ```
 
-Runs automated test phases that validate the full right-sizing resource lifecycle. The `--release` flag overrides the auto-detected ACM version (from MCH), allowing you to test 5.0 custom images on a 2.17 cluster — each release selects a different default phase set (2.16: MCO-only, 2.17: MCO+MCOA, 5.0: MCOA-only). Phases are grouped to minimize mode switches:
+Runs automated test phases that validate the full right-sizing resource lifecycle. The `--release` flag overrides the auto-detected ACM version (from MCH), allowing you to test 5.0 custom images on a 2.17 cluster — each release selects a different default phase set (2.16: MCO-only, 2.17: MCO+MCOA, 5.0: MCOA-only). Explicit `--release 5.1` is an opt-in that selects only evaluation interval phases 10b–10d by default. Without a detected ACM 5.1+ version or this explicit override, those phases log a skip reason even when custom images are installed. Explicit `--phases` still takes precedence:
 
 **Group 1: MCO-mode tests** (default run)
 
@@ -478,7 +480,7 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 4 | ConfigMap propagation (MCO) | Modifies `rs-namespace-config` ConfigMap (recommendationPercentage 110→120), verifies Policy updates with new value, then reverts. Tests MCO's ConfigMap→Policy pipeline. |
 | 4a | ConfigMap coexistence (MCO+MCOA) | Enables incident detection to trigger MCOA deployment while RS stays in MCO mode. Verifies RS ConfigMaps survive, no ManifestWork PrometheusRules or Perses dashboards created, and ADC `rightSizingDelegated=false`. Tests delegation signal. |
 
-**Group 2: MCOA-mode tests** (`--mode-switch` required)
+**Group 2: MCOA-mode tests** (phases 5–12 require `--mode-switch` when selected; the 5.x default set also includes the interval checks)
 
 | Phase | Test | What it validates |
 |-------|------|-------------------|
@@ -491,7 +493,10 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 9c | Disable both (MCOA) | Same as 2c but in MCOA mode — verifies MCOA cleans up all RS resources and all 4 Perses dashboards are absent. Placements may persist due to addon framework InstallStrategy (logged as warning, not failure). |
 | 9d | Re-enable both (MCOA) | Same as 2d but in MCOA mode — verifies MCOA restores all RS resources including ManifestWorks and all 4 Perses dashboards. |
 | 9e | NamespaceBinding change (MCOA) | Patches `namespaceBinding` in MCOA mode — verifies no Policies created in either namespace (MCOA uses ManifestWorks, not Policies). Verifies ManifestWorks and ConfigMaps unaffected. |
-| 10 | ConfigMap propagation (MCOA) | Same as phase 4 but in MCOA mode — modifies ConfigMap, verifies ManifestWork PrometheusRules update with new value. Tests MCOA's ConfigMap→ManifestWork pipeline. |
+| 10a | ConfigMap propagation (MCOA) | Same as phase 4 but in MCOA mode — modifies ConfigMap, verifies ManifestWork PrometheusRules update with new value. Tests MCOA's ConfigMap→ManifestWork pipeline. |
+| 10b | Evaluation interval propagation (MCOA) | On ACM >= 5.1, or after explicit `--release 5.1` opt-in, verifies rolling/daily group intervals and PromQL lookbacks on every expected ManifestWork target at the test values and at the inclusive minima, then inclusive maxima, seconds-unit values, and the interval the live spoke Prometheus has loaded (admission/runtime). Without the override, skips on older/unknown releases; also skips with `--data-plane`. |
+| 10c | Evaluation interval validation/write-back (MCOA) | Verifies per-key range/shape rejection, cold-cache defaults after an MCOA restart, write-back, aggregator preservation, and per-ConfigMap cache isolation. |
+| 10d | Evaluation interval defaults/no-backfill (MCOA) | Verifies defaults on a newly recreated ConfigMap, no backfill on an existing ConfigMap, and legal but wasteful interval ordering. |
 
 **Group 3: Mode round-trip tests** (`--mode-switch` required)
 
@@ -522,12 +527,28 @@ Runs automated test phases that validate the full right-sizing resource lifecycl
 | 21b | Stopped VM exclusion + Perses stat check (ACM-41141, MCOA #620/#621/#623) | Checks that the hub Thanos query path returns data, waits until the hub counts `fedora-vm-2` as running, stops it, and verifies it is excluded from the running-VM-filtered stat/table queries. In MCOA mode it also reads the deployed `acm-rightsizing-openshift-virtualization` PersesDashboard: all 4 stat panels must be pinned with `@ end()`, the query path must keep `@ end()` fixed over a 1-week range, and the CPU/Memory overestimation stat queries — run as range queries, the way Perses runs stat panels — must count the stopped VM nowhere, while the pre-fix query (no `@ end()`) still shows its stale value. The VM is restarted on exit, including after Ctrl-C. Skipped with `--skip-vm`; the Perses part is skipped in MCO mode and with `--skip-perses-check`. See [TROUBLESHOOTING](docs/TROUBLESHOOTING.md#phase-21b-perses-stat-panel-check-mcoa-620621623). |
 | 22 | Data-plane cleanup | Deletes workload namespaces from spoke clusters. Robust to unreachable spokes. |
 
-Phases 5-12, 15-16 require `--mode-switch`. Phases 17-22 require `--data-plane`. Both can be combined with explicit `--phases` selection. Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.
+Phases 5-12, 15-16 require `--mode-switch`. Phases 10b-10d run only when the detected ACM version is >= 5.1 or the operator explicitly opts in with `--release 5.1`; custom image overrides alone do not bypass the release gate. The explicit 5.1 override defaults to only phases 10b-10d. Phases 4 and 10a-10d need `yq` v4 and fail before any cluster change without it. Phases 10b-10d run in MCOA mode only and skip with `--data-plane` because interval changes perturb the data-plane's settling profiles. Phases 17-22 require `--data-plane`. Both can be combined with explicit `--phases` selection. Destructive phases (13, 14, 15) prompt for confirmation unless `--yes` is passed. All phases auto-install MCO if not present and switch to the required mode before running.
+
+#### Configurable MCOA evaluation intervals
+
+MCOA stores `prometheusRuleConfig` as YAML and supports two optional keys in both `rs-namespace-config` and `rs-virt-config`:
+
+| Key | Default | Inclusive range | Effect |
+|-----|---------|-----------------|--------|
+| `evaluationInterval` | `5m` | `5m`–`1h` | Rolling-window rule-group interval and rolling PromQL subquery lookback. |
+| `evaluationInterval1d` | `15m` | `15m`–`6h` | Daily-aggregation rule-group interval; the `[1d]` aggregation window is unchanged. |
+
+Values must be a single Prometheus duration (`ms`, `s`, `m`, `h`, `d`, `w`, or `y`); bounds are inclusive, so `300s` equals `5m`. Empty or absent keys mean the default. Invalid values are written back to the last valid value (or the default after restart), and existing ConfigMaps are not backfilled. The operator logs rejections as `Logger.Info`; a GitOps owner can therefore overwrite the value again. The feature is MCOA-only; keys are inert in MCO Policy mode.
+
+`rs-status` displays both values, defaults, validation state, and normalized rendered-interval drift. `rs-status --json` exposes configured values, source, and rendered intervals under `rs_config.namespace` and `rs_config.virtualization`; a `mixed(...)` rendered value means collected groups or spokes disagree, and is shown as drift in the text view.
 
 **Environment variables:**
 
 - `TIMEOUT_E2E_RECONCILE` — Seconds to wait after MCO spec patches (default: 90)
 - `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
+- `TIMEOUT_RS_INTERVAL_PROPAGATION` — Seconds to wait for MCOA interval probe/write-back (default: 180)
+- `RS_EVAL_INTERVAL_TEST` — Rolling interval used by phase 10b (default: `10m`)
+- `RS_EVAL_INTERVAL_1D_TEST` — Daily interval used by phase 10b (default: `30m`)
 - `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 60)
 - `TIMEOUT_METRICS_WAIT` — Seconds to wait for Thanos metric ingestion (default: 1200)
 - `TIMEOUT_VM_BOOT` — Seconds to wait for VM workloads to boot (default: 600)
@@ -549,7 +570,7 @@ bin/rs-collect-must-gather --skip-spoke             # Hub only
 bin/rs-collect-must-gather --log-lines 1000         # More log lines
 ```
 
-Collects MCO/MCOA operator logs, resource states (MCO CR, CMA, ADC, ConfigMaps, Policies, Placements, ManifestWorks), events, spoke PrometheusRules, and agent logs into a timestamped directory.
+Collects MCO/MCOA operator logs, resource states (MCO CR, CMA, ADC, ConfigMaps, Policies, Placements, ManifestWorks), events, spoke PrometheusRules, and agent logs into a timestamped directory. ConfigMaps are saved as both YAML and machine-readable JSON so `analyze` can validate evaluation intervals and normalized ManifestWork drift offline.
 
 ### cluster-diagnose
 

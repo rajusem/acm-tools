@@ -30,6 +30,31 @@ kubectl rollout restart deployment/multicluster-observability-addon-manager \
 
 **Fix**: If the `placementConfiguration` key in the config ConfigMaps has restrictive label selectors, verify that the target ManagedCluster objects have the required labels. If MCOA hasn't reconciled, restart the addon manager deployment.
 
+## Evaluation interval not taking effect
+
+**Symptom**: `evaluationInterval` or `evaluationInterval1d` keeps reverting, or the rendered PrometheusRule groups remain at their defaults.
+
+**Supported values** (MCOA mode, ACM 5.1+):
+
+- `evaluationInterval`: single Prometheus duration from `5m` through `1h`, inclusive.
+- `evaluationInterval1d`: single Prometheus duration from `15m` through `6h`, inclusive.
+- Empty or absent keys mean `5m` and `15m` respectively. `300s` and `5m` are equivalent values.
+
+`1h30m` is rejected because it is a compound duration. `90m` is also rejected for `evaluationInterval` because its ceiling is `1h`; it is legal only for `evaluationInterval1d`. A bare YAML number such as `evaluationInterval: 5` is rejected because MCOA expects a duration string.
+
+**Diagnosis**:
+
+```bash
+oc get configmap rs-namespace-config rs-virt-config \
+  -n open-cluster-management-observability -o yaml
+oc logs deploy/multicluster-observability-addon-manager \
+  -n open-cluster-management-observability --tail=500 | \
+  grep -i 'Invalid evaluationInterval\|outside the allowed range'
+bin/rs-status
+```
+
+The MCOA log messages are `Logger.Info` lines, not status conditions or events, and `rs-collect-must-gather` collects 500 log lines by default. Their absence is therefore not proof that no rejection or ordering warning occurred. A stock pre-5.1 MCOA image silently ignores these keys; use ACM 5.1+ for normal interval-test runs. To deliberately test a custom MCOA before 5.1, pass `--release 5.1` to `rs-e2e`; this opts into phases 10b-10d only by default, and the capability probe still verifies the deployed image. A custom image alone does not bypass the release gate. If a GitOps or policy owner manages the ConfigMap, it may fight the operator's write-back and make a valid value appear to revert.
+
 ---
 
 ## ManifestWork Not Being Applied (observedGeneration Lag)

@@ -33,6 +33,7 @@ Run `bin/rs-e2e` with the appropriate flags. The script is fully automated and h
 | Build both images then test | `bin/rs-e2e --build both --mode-switch` |
 | Deploy existing override then test | `bin/rs-e2e --image-override` |
 | Specific phases | `bin/rs-e2e --phases 0-3,5,9a` |
+| Evaluation interval checks | `bin/rs-e2e --phases 10b,10c,10d` |
 | Force MCOA mode | `bin/rs-e2e mcoa` |
 | Test 5.0 images on 2.17 cluster | `bin/rs-e2e --release 5.0 --skip-uninstall` |
 | Test 5.0 with data-plane + VMs | `bin/rs-e2e --release 5.0 --data-plane --yes` |
@@ -79,7 +80,7 @@ If phases fail, diagnose using the troubleshooting tables below and attempt a fi
 | 2d | Re-enable both features (MCO) | — | 2.16, 2.17 |
 | 2e | NamespaceBinding change (MCO) | — | 2.16, 2.17 |
 | 3 | Spoke PrometheusRule validation (MCO) | — | 2.16, 2.17 |
-| 4 | ConfigMap propagation (MCO) | — | 2.16, 2.17 |
+| 4 | ConfigMap propagation (MCO) | yq v4 | 2.16, 2.17 |
 | 4a | ConfigMap coexistence (MCO+MCOA) | — | **2.17 only** |
 | 5 | MCO → MCOA switch + Perses dashboards | `--mode-switch` | **2.17 only** |
 | 6 | SpecHash freshness after ADC change | `--mode-switch` | 2.17, 5.0 |
@@ -90,7 +91,10 @@ If phases fail, diagnose using the troubleshooting tables below and attempt a fi
 | 9c | Disable both (MCOA) | `--mode-switch` | 2.17, 5.0 |
 | 9d | Re-enable both (MCOA) | `--mode-switch` | 2.17, 5.0 |
 | 9e | NamespaceBinding change (MCOA) | `--mode-switch` | 2.17, 5.0 |
-| 10 | ConfigMap propagation (MCOA) | `--mode-switch` | 2.17, 5.0 |
+| 10a | ConfigMap propagation (MCOA) | `--mode-switch`, yq v4 | 2.17, 5.0 |
+| 10b | Evaluation interval propagation (MCOA) | `--release 5.1`, yq v4 | **5.1 only** |
+| 10c | Evaluation interval validation/write-back (MCOA) | `--release 5.1`, yq v4 | **5.1 only** |
+| 10d | Evaluation interval defaults/no-backfill (MCOA) | `--release 5.1`, yq v4 | **5.1 only** |
 | 11 | MCOA → MCO switch | `--mode-switch` | **2.17 only** |
 | 12 | Version mismatch (any annotation value) | `--mode-switch` | **2.17 only** |
 | 13 | Uninstall cleanup — MCO mode | Destructive (prompts) | 2.16, 2.17 |
@@ -122,7 +126,7 @@ If the script fails or a phase reports FAIL:
    - Use yaml.v2 lowercased field names for OCM types: `requiredclusterselector`, `labelselector`, `matchlabels`
    - Validate filtering via ManifestWork PrometheusRule distribution, not PlacementDecisions
 
-4. **Phase 10 (ConfigMap propagation MCOA)**: ConfigMap data keys are YAML strings, not JSON. The script uses `jq gsub` on `.data.prometheusRuleConfig` to do string replacement.
+4. **Phases 10b-10d (evaluation intervals)**: Require detected ACM >= 5.1, or explicit `--release 5.1` opt-in; older releases skip even with a custom MCOA image. The explicit override selects only 10b-10d by default. They need `yq` v4 to edit the YAML `prometheusRuleConfig` and fail without it. The capability probe sets sentinel percentage `125` with intervals `10m`/`30m` and polls until every expected namespace target (MCOA ManifestWork + OpenShift vendor + placement match) renders all three; an unsupported MCOA or a dead pipeline fails the probe. Case 1 in 10c removes the interval keys and restarts MCOA, so the new pod has no cached last-valid value and the cold-cache fallback to the defaults is deterministic. If the phases skip, check the release gate or `--data-plane` reason.
 
 5. **IsMCOTerminating stale state**: After MCO deletion, the operator caches a terminating flag in memory. The script detects this in phase 0 and restarts the operator pod.
 
@@ -151,6 +155,9 @@ Timeouts (set in `bin/rs-e2e` or `config.sh`):
 
 - `TIMEOUT_E2E_RECONCILE` — Seconds to wait after MCO spec patches (default: 90)
 - `TIMEOUT_E2E_MODE_SWITCH` — Seconds to wait after annotation changes (default: 60)
+- `TIMEOUT_RS_INTERVAL_PROPAGATION` — Seconds to wait for interval propagation, probing, and write-back (default: 180)
+- `RS_EVAL_INTERVAL_TEST` — Rolling interval used by phase 10b (default: `10m`)
+- `RS_EVAL_INTERVAL_1D_TEST` — Daily interval used by phase 10b (default: `30m`)
 - `TIMEOUT_PERSES_DASHBOARD` — Seconds to wait for Perses dashboard convergence (default: 300)
 - `TIMEOUT_COO_INSTALL` — Seconds to wait for COO installation before checking Perses (default: 120, in `config.sh`)
 - `TIMEOUT_MW_STUCK` — Seconds before a deleting ManifestWork is considered stuck (default: 120, in `config.sh`)

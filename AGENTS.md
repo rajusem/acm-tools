@@ -50,7 +50,8 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 | `add-managed-cluster` | Import/re-import managed clusters (klusterlet cleanup, pull secret sync) |
 | `sno-virt` | Enable/validate OpenShift Virtualization on an AWS SNO cluster (EC2 nested virt) |
 
-Stand-alone helpers (Python, no cluster access) live in `utility/`; see `utility/README.md`.
+Stand-alone helpers (Python) live in `utility/`; see `utility/README.md`. They do not use
+`lib/common.sh` or `config.sh`. `rotate-pool-aws-credentials.py` reads and updates hub Secrets.
 
 ## Configuration
 

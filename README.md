@@ -589,11 +589,12 @@ The `analyze` subcommand examines collected data offline (no cluster connection 
 
 ## Utilities
 
-Stand-alone helpers in `utility/`. They never connect to a cluster. Usage: [utility/README.md](utility/README.md).
+Stand-alone helpers in `utility/`, including AWS credential rotation for Hive cluster pools. See [utility/README.md](utility/README.md) for usage.
 
 | Utility | Purpose |
 |---------|---------|
 | `konflux-pr-image.py` | Find the Konflux image built for a GitHub PR: build status, image, quay.io expiry, and `image-override.json` entries |
+| `rotate-pool-aws-credentials.py` | Rotate AWS credentials for Hive cluster pools. See the [reviewed Hive preview and apply commands](utility/README.md#limited-hive-rotation). |
 
 ## Claude Code Skills
 

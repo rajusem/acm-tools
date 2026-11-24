@@ -5,7 +5,10 @@ manifests/*.yaml
 must-gather-*/
 
 # Secrets (keep .example, ignore actual secrets)
-install-custom-acm/pull-secret.json
+# Glob rather than exact names: pull secrets arrive under several prefixes
+# (pull-secret.json, art-pull-secret.json, ...) and an exact-match entry
+# silently leaves the new one committable.
+install-custom-acm/*pull-secret*.json
 *.kubeconfig
 auto-import-secret*
 
@@ -23,6 +26,10 @@ Thumbs.db
 .idea/
 .vscode/
 *.code-workspace
+
+# Local AI agent tooling (not .claude/, which holds shared skills)
+.agents/
+.codex/
 
 # Logs
 *.log

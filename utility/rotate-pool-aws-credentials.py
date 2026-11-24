@@ -84,6 +84,9 @@ def command_failure_reason(stderr):
         ("the server connection timed out", ("i/o timeout", "deadline exceeded", "timed out")),
         ("the server connection failed", ("connection refused", "connection reset", "no route to host", "network is unreachable")),
         ("the kubeconfig login helper failed", ("error getting credentials", "exec: executable", "exec plugin")),
+        # A failed JSON patch test, such as a Secret resourceVersion that changed after it was read, is a 422.
+        ("the server rejected the request as invalid. If a Secret changed after it was read, rerun the plan",
+         ("the request is invalid",)),
     )
     for reason, fragments in errors:
         if any(fragment in diagnostic for fragment in fragments):

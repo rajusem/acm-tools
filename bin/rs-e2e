@@ -32,11 +32,13 @@
 #   9b   Swap features (MCOA)          (--mode-switch)
 #   9c   Disable both (MCOA)           (--mode-switch)
 #   9d   Re-enable both (MCOA)         (--mode-switch)
+#   9e   NamespaceBinding change (MCOA) (--mode-switch)
+#   9f   Non-OpenShift vendor rendering + probe (ACM-48483, ACM-48626)
 #   10a  ConfigMap propagation (MCOA)  (--mode-switch)
 #   10b  Evaluation interval propagation (MCOA)
 #   10c  Evaluation interval validation/write-back (MCOA)
 #   10d  Evaluation interval defaults/no-backfill (MCOA)
-#   --phases 10 selects 10a-10d; --release 5.1 defaults to 10b-10d.
+#   --phases 9 selects 9a-9f; --phases 10 selects 10a-10d; --release 5.1 defaults to 10b-10d.
 #   4 and 10a-10d need yq v4; 10b-10d also need ACM 5.1+ (or --release 5.1).
 #
 #   Group 3: Mode round-trip tests
@@ -164,14 +166,14 @@ apply_release_phase_defaults() {
         # An explicit --release 5.1 is an opt-in for just the interval tests.
         SELECTED_PHASES="10b,10c,10d"
     elif release_is_50; then
-        SELECTED_PHASES="0,0a,1,9a,9b,9c,9d,9e,10a,10b,10c,10d"
+        SELECTED_PHASES="0,0a,1,9a,9b,9c,9d,9e,9f,10a,10b,10c,10d"
     elif release_is_216; then
         SELECTED_PHASES="$( [[ "$SKIP_UNINSTALL" == "true" ]] && \
             echo "0,1,2a,2b,2c,2d,2e,3,4" || \
             echo "0,1,2a,2b,2c,2d,2e,3,4,13" )"
     else  # 2.17 — existing behavior
         if [[ "$SKIP_UNINSTALL" == "true" && "$MODE_SWITCH" == "true" ]]; then
-            SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4a,5,6,7,8,9a,9b,9c,9d,9e,10a,11,12"
+            SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4a,5,6,7,8,9a,9b,9c,9d,9e,9f,10a,11,12"
         elif [[ "$SKIP_UNINSTALL" == "true" ]]; then
             SELECTED_PHASES="0,1,2a,2b,2c,2d,2e,3,4a"
         elif [[ "$MODE_SWITCH" == "false" ]]; then
@@ -397,17 +399,111 @@ perses_dashboard_exists() {
     $KUBE_CLI get persesdashboard "$1" -n "$ANALYTICS_NAMESPACE" &>/dev/null
 }
 
+# wait_until predicate for verify_uiplugin_acm_config: true once the monitoring
+# UIPlugin carries a complete, correct ACM block. A read failure or a missing
+# instance is false here; verify_uiplugin_acm_config re-reads afterwards and
+# decides whether that means "not applicable" or a real failure.
+uiplugin_acm_block_ok() {
+    $KUBE_CLI get uiplugin "$RS_UIPLUGIN_NAME" -o json --request-timeout=20s 2>/dev/null | \
+        jq -e --arg am "$RS_UIPLUGIN_ALERTMANAGER_URL" --arg th "$RS_UIPLUGIN_THANOS_URL" \
+            '(.spec.monitoring.acm.enabled == true) and
+             (.spec.monitoring.acm.alertmanager.url == $am) and
+             (.spec.monitoring.acm.thanosQuerier.url == $th)' >/dev/null 2>&1
+}
+
+# ACM-48605: the monitoring UIPlugin must carry the ACM block whenever Perses
+# is enabled. The Helm template gated that block on metrics.enabled instead of
+# perses, so on an analytics-only hub — right-sizing on, platform metrics
+# collection off — the ACM console lost the Alertmanager and Thanos endpoints.
+# Checked only while Perses is enabled: with every analytics feature off MCOA
+# drops the UIPlugin, and its absence is then correct rather than a regression.
+# Globals: reads RS_UIPLUGIN_NAME, RS_UIPLUGIN_ALERTMANAGER_URL,
+#   RS_UIPLUGIN_THANOS_URL and TIMEOUT_UIPLUGIN_ACM. Changes nothing on the cluster.
+# Returns: 0 pass or not applicable; the number of failed assertions otherwise.
+verify_uiplugin_acm_config() {
+    local json="" perses acm_enabled am_url thanos_url errors=0 rc=0
+
+    log_substep "Checking monitoring UIPlugin ACM block (ACM-48605)"
+    # --ignore-not-found separates the two reasons for an empty result: a
+    # missing instance exits 0 with no output, while a missing UIPlugin CRD or
+    # a failed API call exits non-zero. Without that split a transient error
+    # would read as "not applicable" and quietly skip the check for good.
+    json=$($KUBE_CLI get uiplugin "$RS_UIPLUGIN_NAME" -o json --ignore-not-found \
+        --request-timeout=20s 2>/dev/null) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        log_warn "  Could not read uiplugin/$RS_UIPLUGIN_NAME (no UIPlugin CRD, or the API call failed)" \
+            "— ACM block not checked"
+        return 0
+    fi
+    if [[ -z "$json" ]]; then
+        log_info "  uiplugin/$RS_UIPLUGIN_NAME not present — ACM block check not applicable"
+        return 0
+    fi
+
+    perses=$(jq -r '.spec.monitoring.perses.enabled // false' <<< "$json" 2>/dev/null || echo "false")
+    if [[ "$perses" != "true" ]]; then
+        log_info "  uiplugin/$RS_UIPLUGIN_NAME: Perses disabled — ACM block not expected"
+        return 0
+    fi
+
+    # Callers reach this straight after toggling an analytics feature, and MCOA
+    # rewrites the whole UIPlugin spec in one reconcile. Give that reconcile the
+    # same convergence budget the dashboard checks below get, so a mid-reconcile
+    # read reports a stale spec as a regression. Only the failing case waits.
+    if ! uiplugin_acm_block_ok; then
+        wait_until "$TIMEOUT_UIPLUGIN_ACM" 5 "UIPlugin ACM block" uiplugin_acm_block_ok || true
+        json=$($KUBE_CLI get uiplugin "$RS_UIPLUGIN_NAME" -o json --ignore-not-found \
+            --request-timeout=20s 2>/dev/null) || json=""
+        [[ -n "$json" ]] || json='{}'
+    fi
+
+    acm_enabled=$(jq -r '.spec.monitoring.acm.enabled // false' <<< "$json" 2>/dev/null || echo "false")
+    if [[ "$acm_enabled" == "true" ]]; then
+        log_success "  uiplugin/$RS_UIPLUGIN_NAME: ACM block enabled"
+    else
+        log_error "  uiplugin/$RS_UIPLUGIN_NAME: ACM block missing while Perses is enabled (ACM-48605)"
+        ((errors++)) || true
+    fi
+
+    am_url=$(jq -r '.spec.monitoring.acm.alertmanager.url // ""' <<< "$json" 2>/dev/null || echo "")
+    if [[ "$am_url" == "$RS_UIPLUGIN_ALERTMANAGER_URL" ]]; then
+        log_success "  uiplugin/$RS_UIPLUGIN_NAME: alertmanager.url correct"
+    else
+        log_error "  uiplugin/$RS_UIPLUGIN_NAME: alertmanager.url '$am_url' (expected '$RS_UIPLUGIN_ALERTMANAGER_URL')"
+        ((errors++)) || true
+    fi
+
+    thanos_url=$(jq -r '.spec.monitoring.acm.thanosQuerier.url // ""' <<< "$json" 2>/dev/null || echo "")
+    if [[ "$thanos_url" == "$RS_UIPLUGIN_THANOS_URL" ]]; then
+        log_success "  uiplugin/$RS_UIPLUGIN_NAME: thanosQuerier.url correct"
+    else
+        log_error "  uiplugin/$RS_UIPLUGIN_NAME: thanosQuerier.url '$thanos_url' (expected '$RS_UIPLUGIN_THANOS_URL')"
+        ((errors++)) || true
+    fi
+
+    return $errors
+}
+
 verify_perses_dashboards() {
     local ns_enabled="$1" virt_enabled="$2"
     local errors=0
 
-    if [[ "$SKIP_PERSES_CHECK" == "true" ]]; then
-        log_info "  Perses dashboard check skipped (--skip-perses-check)"
+    if [[ "$CURRENT_MODE" != "mcoa" ]]; then
         return 0
     fi
 
-    if [[ "$CURRENT_MODE" != "mcoa" ]]; then
-        return 0
+    # ACM-48605 is checked ahead of --skip-perses-check on purpose. That flag is
+    # an escape hatch for clusters where COO or the dashboards are unavailable,
+    # and this check already self-skips on exactly those clusters: no UIPlugin
+    # CRD, or no instance, both return early. Gating it on the flag would retire
+    # the check on every run that uses the escape hatch for an unrelated reason.
+    local uiplugin_errors=0
+    verify_uiplugin_acm_config || uiplugin_errors=$?
+    ((errors += uiplugin_errors)) || true
+
+    if [[ "$SKIP_PERSES_CHECK" == "true" ]]; then
+        log_info "  Perses dashboard check skipped (--skip-perses-check)"
+        return $errors
     fi
 
     log_substep "Checking COO installation"
@@ -569,12 +665,201 @@ manifestwork_contains() {
 # Cached result of rs_eval_interval_probe: unknown (not probed yet), yes or no.
 RS_EVAL_INTERVAL_SUPPORT="unknown"
 
+# IsOpenShiftVendor (MCOA internal/addon/common/managedcluster.go): a non-empty
+# mcoa-override-vendor annotation decides; otherwise the vendor label, the
+# openshiftVersion label or the id.openshift.io claim. Shared by the
+# target-scoped checks of phases 10b-10d, by mc_openshift_names and by phase 9f,
+# so the override that phase 9f applies is understood everywhere.
+# Input: an object with .labels, .annotations and .claims.
+MCOA_VENDOR_JQ='
+def is_openshift:
+    (.annotations["mcoa-override-vendor"] // "") as $override |
+    if $override != "" then $override == "OpenShift"
+    else .labels.vendor == "OpenShift" or (.labels | has("openshiftVersion")) or
+        any(.claims[]; .name == "id.openshift.io")
+    end;
+'
+
+# Names of the ManagedClusters that MCOA treats as OpenShift, one per line.
+# MCOA renders right-sizing PrometheusRules only for these, so the rule
+# counters must not expect any from the rest (see count_mw_prometheusrules).
+# A read failure is reported through the exit status rather than as an empty
+# list: silently returning nothing would reclassify the whole fleet as
+# non-OpenShift, and the counters would then blame every healthy cluster for
+# carrying rules it is supposed to carry.
+# Stdout: cluster names, newline-separated (may legitimately be empty).
+# Returns: 0 the fleet was read; 1 the read or jq failed.
+mc_openshift_names() {
+    local json
+    json=$($KUBE_CLI get managedcluster -o json --request-timeout=20s 2>/dev/null) || return 1
+    [[ -n "$json" ]] || return 1
+    jq -r "$MCOA_VENDOR_JQ"'
+            .items[]? |
+            {name: .metadata.name, labels: (.metadata.labels // {}),
+             annotations: (.metadata.annotations // {}),
+             claims: (.status.clusterClaims // [])} |
+            select(is_openshift) | .name' <<< "$json" 2>/dev/null || return 1
+}
+
+# Whether MCOA would treat one ManagedCluster as an OpenShift vendor.
+# Args: cluster name.
+# Returns: 0 OpenShift; 1 not OpenShift, or the cluster could not be read.
+mc_is_openshift() {
+    $KUBE_CLI get managedcluster "$1" -o json --request-timeout=20s 2>/dev/null | \
+        jq -e "$MCOA_VENDOR_JQ"'
+            {labels: (.metadata.labels // {}), annotations: (.metadata.annotations // {}),
+             claims: (.status.clusterClaims // [])} | is_openshift' >/dev/null 2>&1
+}
+
+# The MCOA addon ManifestWorks of one cluster, as a single JSON array.
+# Args: cluster name. Stdout: a JSON array ([] when the read or jq fails).
+mcoa_mw_json() {
+    local out
+    out=$($KUBE_CLI get manifestwork -n "$1" -o json --request-timeout=20s 2>/dev/null | \
+        jq -c --arg pattern "$MCOA_MW_PATTERN" \
+            '[.items[]? | select(.metadata.name | contains($pattern))]' 2>/dev/null)
+    # jq exits 0 on empty input, so a failed read reaches here as an empty
+    # string rather than through the pipeline's exit status. Normalise it.
+    [[ -n "$out" ]] || out="[]"
+    echo "$out"
+}
+
+# Everything the vendor-dependent rendering checks of phase 9f compare, read
+# from one cluster's MCOA addon ManifestWorks in a single pass.
+#
+# The OpenShift-only set is every resource commit 0361eb4 re-gated on
+# isOpenShiftVendor: the kube-rbac-proxy sidecar and its TLS volume, the metrics
+# Service that carries the service-CA annotation, the ServiceMonitor that
+# scrapes it, and the metrics ClusterRole/ClusterRoleBinding pair. There is
+# deliberately no Secret entry: endpoint-monitoring-operator-tls is minted by
+# the OpenShift service-CA operator from the Service annotation, so the chart
+# never ships a Secret and counting them can only ever return zero.
+# emo_deployments is the positive control — the endpoint-monitoring-operator
+# Deployment stays rendered on non-OpenShift clusters, and is what keeps the
+# addon probe green there, so an all-zeros render is a failure, not a pass.
+# bind_addrs shows whether the metrics endpoint is behind kube-rbac-proxy
+# (127.0.0.1) or exposed directly (0.0.0.0).
+# Args: cluster name.
+# Stdout: {rules, proxy_containers, proxy_volumes, serving_cert_services,
+#   metrics_servicemonitors, metrics_rbac, emo_deployments, bind_addrs},
+#   or {} when the read or jq fails.
+mcoa_mw_vendor_summary() {
+    local out
+    out=$(mcoa_mw_json "$1" | jq -c '
+        [.[].spec.workload.manifests[]?] as $m |
+        {rules: ([$m[] | select(.kind == "PrometheusRule" and
+                    ((.metadata.name // "") | startswith("acm-rs-"))) | .metadata.name] | sort),
+         proxy_containers: ([$m[] | select(.kind == "Deployment") |
+                    .spec.template.spec.containers[]? |
+                    select(.name == "kube-rbac-proxy") | .name] | length),
+         proxy_volumes: ([$m[] | select(.kind == "Deployment") |
+                    .spec.template.spec.volumes[]? |
+                    select((.name // "") | test("kube-rbac-proxy")) | .name] | length),
+         serving_cert_services: ([$m[] | select(.kind == "Service") |
+                    select(((.metadata.annotations // {}) |
+                        has("service.beta.openshift.io/serving-cert-secret-name"))) |
+                    .metadata.name] | sort),
+         metrics_servicemonitors: ([$m[] | select(.kind == "ServiceMonitor") |
+                    select((.metadata.name // "") | test("endpoint-monitoring-operator")) |
+                    .metadata.name] | sort),
+         metrics_rbac: ([$m[] |
+                    select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding") |
+                    select((.metadata.name // "") | test("endpoint-monitoring-operator-metrics")) |
+                    .metadata.name] | sort),
+         emo_deployments: ([$m[] | select(.kind == "Deployment") |
+                    select((.metadata.name // "") == "endpoint-monitoring-operator") |
+                    .metadata.name] | length),
+         bind_addrs: ([$m[] | select(.kind == "Deployment") |
+                    .spec.template.spec.containers[]?.args[]? |
+                    select(type == "string" and test("--metrics-bind-address="))] | sort)}' \
+        2>/dev/null)
+    [[ -n "$out" ]] || out="{}"
+    echo "$out"
+}
+
+# Number of right-sizing PrometheusRules in one cluster's MCOA ManifestWorks.
+# Args: cluster name. Stdout: the count, or -1 when it could not be read.
+mcoa_mw_rule_count() {
+    local out
+    out=$(mcoa_mw_vendor_summary "$1" | \
+        jq -r 'if has("rules") then (.rules | length) else -1 end' 2>/dev/null)
+    [[ -n "$out" ]] || out="-1"
+    echo "$out"
+}
+
+# wait_until predicates over mcoa_mw_rule_count.
+# Args: cluster name, and for _is the expected count.
+mcoa_mw_rules_absent() { [[ "$(mcoa_mw_rule_count "$1")" == "0" ]]; }
+mcoa_mw_rule_count_is() { [[ "$(mcoa_mw_rule_count "$1")" == "$2" ]]; }
+
+# Distinct statusFeedback value names the spoke reported back for one cluster's
+# MCOA addon ManifestWorks — the fieldResults addon-framework hands to the
+# HealthChecker.
+# Args: cluster name. Stdout: names, newline-separated.
+mcoa_mw_feedback_names() {
+    mcoa_mw_json "$1" | \
+        jq -r '[.[].status.resourceStatus.manifests[]?.statusFeedback.values[]?.name] |
+               unique | .[]' 2>/dev/null || true
+}
+
+# Available condition of the MCOA ManagedClusterAddOn on one cluster.
+# Args: cluster name. Stdout: "<status>/<reason>", or "unknown/unknown" when the
+#   addon has no Available condition or could not be read.
+mcoa_mca_available() {
+    local out
+    out=$($KUBE_CLI get managedclusteraddon "$MCOA_NAME" -n "$1" -o json --request-timeout=20s 2>/dev/null | \
+        jq -r '[.status.conditions[]? | select(.type == "Available")] | last |
+               if . == null then "unknown/unknown" else "\(.status)/\(.reason)" end' \
+        2>/dev/null)
+    [[ -n "$out" ]] || out="unknown/unknown"
+    echo "$out"
+}
+
+mcoa_mca_is_available() { [[ "$(mcoa_mca_available "$1")" == "True/ProbeAvailable" ]]; }
+
+# One count out of an mcoa_mw_vendor_summary document.
+# Args: the summary JSON, a top-level field name (array or number).
+# Stdout: the count, or -1 when the summary is empty, malformed, or lacks the
+#   field — all of which mean "not read", never "absent".
+# The field is looked up by name rather than by a caller-supplied jq expression
+# on purpose: `(.rules // []) | length` yields 0 on a summary that has no rules
+# key at all, which reads as a clean non-OpenShift render when in truth the
+# ManifestWork could not be read. has() tells the two apart.
+summary_count() {
+    local out
+    out=$(jq -r --arg f "$2" '
+        if (has($f) | not) then -1
+        elif (.[$f] | type) == "array"  then (.[$f] | length)
+        elif (.[$f] | type) == "number" then .[$f]
+        else -1 end' <<< "$1" 2>/dev/null)
+    [[ "$out" =~ ^-?[0-9]+$ ]] || out="-1"
+    echo "$out"
+}
+
+# Assert that a counted rendering element is absent. A negative count means the
+# summary could not be read, which is a failure rather than an absence.
+# Args: actual count, description for the log line.
+# Returns: 0 the count is 0; 1 otherwise.
+assert_count_is_zero() {
+    local actual="$1" what="$2"
+    if [[ "$actual" == "0" ]]; then
+        log_success "  $what: 0"
+        return 0
+    fi
+    if [[ "$actual" == "-1" ]]; then
+        log_error "  $what: could not be read from the ManifestWork"
+    else
+        log_error "  $what: $actual (expected 0)"
+    fi
+    return 1
+}
+
 # jq definitions for the target-scoped ManifestWork checks of phases 10b-10d.
 # They mirror how MCOA picks the clusters that render a right-sizing rule:
 # IsOpenShiftVendor (internal/addon/common/managedcluster.go) and
 # clusterMatchesPlacement (internal/analytics/rightsizing/handlers/handler.go).
 # The program input is the snapshot printed by mcoa_rs_snapshot.
-MCOA_RS_TARGETS_JQ='
+MCOA_RS_TARGETS_JQ="$MCOA_VENDOR_JQ"'
 # A struct field matched case-insensitively, as Go encoding/json does (the last
 # matching key wins). Null when absent or when the input is not an object.
 def field($name):
@@ -638,16 +923,6 @@ def predicate_matches($cluster):
     field("requiredClusterSelector") as $selector |
     ($selector | field("labelSelector") | labels_match($cluster.labels)) and
     ($selector | field("claimSelector") | claims_match($cluster.claims));
-
-# IsOpenShiftVendor: a non-empty mcoa-override-vendor annotation decides;
-# otherwise the vendor label, the openshiftVersion label or the
-# id.openshift.io claim.
-def is_openshift:
-    (.annotations["mcoa-override-vendor"] // "") as $override |
-    if $override != "" then $override == "OpenShift"
-    else .labels.vendor == "OpenShift" or (.labels | has("openshiftVersion")) or
-        any(.claims[]; .name == "id.openshift.io")
-    end;
 
 # Clusters expected to render one rule: they have an MCOA addon ManifestWork,
 # an OpenShift vendor, and a match of the rule ConfigMap placement predicates
@@ -1389,14 +1664,38 @@ verify_adc_delegation() {
     return 0
 }
 
+# Count the right-sizing PrometheusRules across every MCOA addon ManifestWork.
+# Only OpenShift-vendor clusters render them, so a non-OpenShift cluster is
+# expected to carry zero whatever the caller asked for, and carrying any is an
+# error in its own right (ACM-48483: non-OpenShift clusters must not get the
+# OpenShift-only right-sizing stack). Vendor is resolved the way MCOA resolves
+# it, so the override phase 9f applies is honoured here too.
+# Args: expect_zero ("true" when the caller expects no rules anywhere).
+# Globals: sets MW_PR_COUNT (total rules) and MW_PR_ERRORS (failed clusters).
+# Returns: MW_PR_ERRORS (0 when every cluster met its expectation).
 count_mw_prometheusrules() {
     local expect_zero="${1:-false}"
     MW_PR_COUNT=0
     MW_PR_ERRORS=0
-    local mc_list
+    local mc_list ocp_set ocp_names vendor_known=true
     mc_list=$($KUBE_CLI get managedcluster -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+    if ocp_names=$(mc_openshift_names); then
+        ocp_set=" $(tr '\n' ' ' <<< "$ocp_names")"
+    else
+        # Could not resolve vendors. Fall back to the pre-vendor-aware behaviour
+        # — treat every cluster as OpenShift — rather than inverting the whole
+        # fleet's expectations on the strength of one failed read.
+        vendor_known=false
+        ocp_set=""
+        log_warn "    Could not read ManagedCluster vendors — assuming every cluster is OpenShift"
+    fi
 
     for mc in $mc_list; do
+        local is_ocp=true mc_expect_zero="$expect_zero"
+        if [[ "$vendor_known" == "true" && "$ocp_set" != *" $mc "* ]]; then
+            is_ocp=false
+            mc_expect_zero=true
+        fi
         local count=0
         for mw in $($KUBE_CLI get manifestwork -n "$mc" -o name 2>/dev/null | grep "$MCOA_MW_PATTERN" || true); do
             local mw_json
@@ -1404,7 +1703,7 @@ count_mw_prometheusrules() {
             local deleting
             deleting=$(echo "$mw_json" | jq -r '.metadata.deletionTimestamp // empty' 2>/dev/null)
             if [[ -n "$deleting" ]]; then
-                if [[ "$expect_zero" == "true" ]]; then
+                if [[ "$mc_expect_zero" == "true" ]]; then
                     log_info "    $mc: ManifestWork terminating (deletionTimestamp=$deleting)"
                 else
                     log_error "    $mc: ManifestWork stuck terminating (deletionTimestamp=$deleting)"
@@ -1420,8 +1719,15 @@ count_mw_prometheusrules() {
         done
         MW_PR_COUNT=$((MW_PR_COUNT + count))
         if [[ $count -gt 0 ]]; then
-            log_success "    $mc: $count RS PrometheusRule(s)"
-        elif [[ "$expect_zero" == "true" ]]; then
+            if [[ "$is_ocp" == "false" ]]; then
+                log_error "    $mc: $count RS PrometheusRule(s) on a non-OpenShift cluster (expected 0)"
+                ((MW_PR_ERRORS++)) || true
+            else
+                log_success "    $mc: $count RS PrometheusRule(s)"
+            fi
+        elif [[ "$is_ocp" == "false" ]]; then
+            log_success "    $mc: 0 RS PrometheusRules (non-OpenShift vendor)"
+        elif [[ "$mc_expect_zero" == "true" ]]; then
             log_success "    $mc: 0 RS PrometheusRules (clean)"
         else
             log_error "    $mc: 0 RS PrometheusRules"
@@ -1566,13 +1872,72 @@ stop_thanos_port_forward() {
 # "context|namespace|vm" while phase 21b has a VM stopped, so e2e_on_exit can restart it.
 E2E_STOPPED_VM=""
 
-# Single EXIT handler. Restores the right-sizing state the phases captured (feature flags first,
+# ManagedCluster whose vendor phase 9f is currently overriding, so e2e_on_exit
+# can undo it. Left behind, the override would silently keep right-sizing off
+# for that spoke for the rest of the run and beyond.
+E2E_VENDOR_OVERRIDE_CLUSTER=""
+
+# Undo the phase 9f vendor override. Order matters: the annotation goes first
+# because removing the trigger label is what raises the re-render event — MCOA
+# registers AgentDeployTriggerClusterFilter on labels only — so by the time
+# MCOA re-renders, the real vendor is already back.
+# Cluster changes: removes RS_VENDOR_OVERRIDE_ANNOTATION and
+#   RS_VENDOR_TRIGGER_LABEL from E2E_VENDOR_OVERRIDE_CLUSTER; does nothing when
+#   no override is outstanding.
+# Globals: reads E2E_VENDOR_OVERRIDE_CLUSTER, and clears it only once the
+#   cluster has been read back clean. Clearing it up front would mean a Ctrl-C
+#   landing between the two kubectl calls left the override in place with
+#   nothing left to tell e2e_on_exit about it; the removals are idempotent, so
+#   letting the trap repeat the work costs nothing.
+# Returns: 0 always — it runs from the EXIT trap, so problems are logged and
+#   the caller is told what to clear by hand.
+restore_vendor_override() {
+    local mc="${E2E_VENDOR_OVERRIDE_CLUSTER:-}"
+    [[ -n "$mc" ]] || return 0
+
+    # kubectl errors when asked to remove a key that is not set, which is fine
+    # here: the verification below is on the object, not on these exit codes.
+    $KUBE_CLI annotate managedcluster "$mc" "${RS_VENDOR_OVERRIDE_ANNOTATION}-" \
+        --request-timeout=20s &>/dev/null || true
+    $KUBE_CLI label managedcluster "$mc" "${RS_VENDOR_TRIGGER_LABEL}-" \
+        --request-timeout=20s &>/dev/null || true
+
+    local leftover
+    leftover=$($KUBE_CLI get managedcluster "$mc" -o json --request-timeout=20s 2>/dev/null | \
+        jq -r --arg a "$RS_VENDOR_OVERRIDE_ANNOTATION" --arg l "$RS_VENDOR_TRIGGER_LABEL" \
+            '[(if ((.metadata.annotations // {}) | has($a)) then "annotation " + $a else empty end),
+              (if ((.metadata.labels // {}) | has($l)) then "label " + $l else empty end)] |
+             join(", ")' 2>/dev/null) || leftover="unreadable"
+
+    if [[ -z "$leftover" ]]; then
+        E2E_VENDOR_OVERRIDE_CLUSTER=""
+        log_info "Cleared the vendor override on $mc"
+        return 0
+    fi
+
+    # Non-zero so the caller can count it. The sentinel is deliberately left
+    # set: e2e_on_exit retries the restore, and an uncleared override is the
+    # one piece of state in this phase that keeps right-sizing off a real
+    # cluster after the run ends.
+    if [[ "$leftover" == "unreadable" ]]; then
+        log_error "Could not read $mc to confirm the vendor override was cleared —" \
+            "check annotation $RS_VENDOR_OVERRIDE_ANNOTATION and label $RS_VENDOR_TRIGGER_LABEL"
+    else
+        log_error "Vendor override not fully cleared on $mc ($leftover) — remove it by hand," \
+            "or right-sizing stays disabled for that cluster"
+    fi
+    return 1
+}
+
+# Single EXIT handler. Lifts a vendor override phase 9f may still hold (restore_vendor_override),
+# restores the right-sizing state the phases captured (feature flags first,
 # then each RS ConfigMap's prometheusRuleConfig and placementConfiguration; see
 # restore_captured_rs_state), restarts a VM that phase 21b left stopped (patch only, no wait),
 # stops the Thanos port-forward and restores the original kubeconfig context. Runs on normal
 # exit, on a `set -u` abort, on Ctrl-C and on SIGTERM (not on SIGKILL). The right-sizing
 # restore can wait up to TIMEOUT_E2E_RECONCILE for a recreated ConfigMap; the rest always runs.
 e2e_on_exit() {
+    restore_vendor_override || true
     restore_captured_rs_state || true
     if [[ -n "${E2E_STOPPED_VM:-}" ]]; then
         local ctx ns vm
@@ -3551,6 +3916,296 @@ phase_9e() {
 
     if [[ $errors -gt 0 ]]; then
         PHASE_FAIL_REASON="$errors assertion(s) failed during MCOA namespaceBinding change"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# Phase 9f: Non-OpenShift Vendor Rendering and Probe
+# =============================================================================
+
+# Phase 9f (MCOA mode): mark one spoke as a non-OpenShift vendor for the
+# duration of the phase and check both halves of what MCOA owes that cluster.
+#
+#   Rendering (ACM-48483). Every resource commit 0361eb4 re-gated on
+#   isOpenShiftVendor must disappear: the right-sizing PrometheusRules, the
+#   kube-rbac-proxy sidecar and its TLS volume, the metrics Service carrying the
+#   service-CA annotation, the ServiceMonitor that scrapes it, and the metrics
+#   ClusterRole/ClusterRoleBinding pair. The metrics endpoint then binds 0.0.0.0
+#   instead of 127.0.0.1, because nothing is proxying it any more. The templates
+#   used to key off deployNonOCPStack, which is false when metrics are disabled,
+#   so a non-OpenShift cluster still got the proxy and a Service asking for a
+#   service-CA certificate nothing on that cluster can issue.
+#
+#   The Service is what matters for TLS: endpoint-monitoring-operator-tls is
+#   minted by the OpenShift service-CA operator from that annotation, so the
+#   chart never ships a Secret of its own and asserting on Secrets would always
+#   pass. emo_deployments is the counterweight to a wall of zeroes — the
+#   endpoint-monitoring-operator Deployment must survive the override, so an
+#   empty or absent ManifestWork fails instead of satisfying every assertion.
+#
+#   Probing (ACM-48626). The addon must still report
+#   Available=True/ProbeAvailable, via the endpoint-monitoring-operator
+#   Deployment. MCOA keeps the two PrometheusRule probe fields registered in
+#   spec.manifestConfigs even though neither rule is rendered here, so those
+#   fields return nothing and availableReplicas is the only result that comes
+#   back. Without the Deployment fallback addon-framework sees
+#   len(probeFields) > 0 && len(fieldResults) == 0 and short-circuits to
+#   Available=Unknown/NoProbeResult (healthcheck_sync.go). The same run covers
+#   the second half of the fix — rules that were never rendered must not be
+#   treated as missing — in its strongest form: two enabled, none rendered.
+#
+#   The feedback assertions are differential, against the OpenShift baseline
+#   captured before the override. On a build whose probe fields never report at
+#   all, "no ruleName" is true in both states and proves nothing; comparing the
+#   two states says so instead of recording a pass.
+#
+# The override is the mcoa-override-vendor annotation MCOA provides for exactly
+# this purpose, but setting it alone changes nothing: MCOA registers
+# AgentDeployTriggerClusterFilter on labels only, so the phase also touches a
+# throwaway label to raise the re-render event. The vendor label itself is left
+# alone — ACM's clusterinfo controller would revert it, MCO reads it in
+# areManagedClusterLabelsReady, and the fleet-navigation Placement selects on
+# it.
+#
+# Cluster changes: annotates and labels one spoke, then removes both. Nothing
+#   else is touched, and e2e_on_exit lifts the override if the run is
+#   interrupted while it is held.
+# Globals: sets E2E_VENDOR_OVERRIDE_CLUSTER while the override is applied;
+#   sets CURRENT_MODE=mcoa.
+# Returns: 0 pass; 1 fail (sets PHASE_FAIL_REASON); 2 skip (sets PHASE_SKIP_REASON).
+phase_9f() {
+    if release_is_216; then
+        PHASE_SKIP_REASON="Not applicable to ACM 2.16 (MCO-only; no MCOA support)"
+        return 2
+    fi
+    local errors=0
+
+    ensure_mco_installed || { PHASE_FAIL_REASON="MCO not installed or not ready"; return 1; }
+    ensure_mode mcoa || { PHASE_FAIL_REASON="Failed to switch to MCOA mode"; return 1; }
+
+    # Cluster selection runs before anything is written. Both checks below can
+    # still skip the phase, and a skip that has already flipped the RS feature
+    # flags is a skip that changed the cluster.
+    #
+    # A real spoke is preferred: local-cluster is the hub's own ManagedCluster
+    # and feeds console and Placement machinery that has nothing to do with this
+    # test. On a hub with no spokes it is the only candidate there is, and
+    # skipping would retire this coverage on exactly the single-cluster topology
+    # most development hubs run, so fall back to it and say so.
+    local spoke_name=""
+    if [[ -n "${NAMESPACE_SPOKE_CONTEXT:-}" ]] && \
+       resource_exists managedcluster "$NAMESPACE_SPOKE_CONTEXT"; then
+        spoke_name="$NAMESPACE_SPOKE_CONTEXT"
+    else
+        spoke_name=$($KUBE_CLI get managedcluster \
+            -o jsonpath='{.items[?(@.metadata.name!="local-cluster")].metadata.name}' \
+            2>/dev/null | awk '{print $1}')
+    fi
+    if [[ -z "$spoke_name" ]] && [[ "$RS_VENDOR_ALLOW_LOCAL_CLUSTER" == "true" ]] && \
+       resource_exists managedcluster "local-cluster"; then
+        spoke_name="local-cluster"
+        log_warn "  No spoke available — overriding local-cluster instead." \
+            "Right-sizing is withdrawn from the hub's own cluster for the length of this phase" \
+            "(set RS_VENDOR_ALLOW_LOCAL_CLUSTER=false to skip instead)"
+    fi
+    if [[ -z "$spoke_name" ]]; then
+        PHASE_SKIP_REASON="No non-local-cluster spoke available to override"
+        return 2
+    fi
+
+    if ! mc_is_openshift "$spoke_name"; then
+        PHASE_SKIP_REASON="$spoke_name is already non-OpenShift — nothing to override"
+        return 2
+    fi
+
+    log_substep "Ensuring both RS features enabled"
+    capture_rs_feature_state || \
+        log_warn "  Could not capture the RS feature flags — e2e_on_exit will not restore them"
+    patch_rs_features true true
+
+    log_substep "Capturing the OpenShift baseline of $spoke_name"
+    local baseline baseline_rules baseline_feedback
+    baseline=$(mcoa_mw_vendor_summary "$spoke_name")
+    baseline_rules=$(summary_count "$baseline" rules)
+    if [[ "$baseline_rules" -lt 1 ]]; then
+        PHASE_SKIP_REASON="$spoke_name has no RS PrometheusRules to lose (MCOA ManifestWork not rendered yet)"
+        return 2
+    fi
+    # The feedback the OpenShift render produces is the control for the two
+    # probe assertions below: without it, "no ruleName" cannot be told apart
+    # from a build that never reports ruleName in the first place.
+    baseline_feedback=" $(mcoa_mw_feedback_names "$spoke_name" | tr '\n' ' ')"
+    log_info "  Baseline: $(jq -c '{rules: (.rules | length), proxy_containers, proxy_volumes,
+                                    serving_cert_services: (.serving_cert_services | length),
+                                    metrics_servicemonitors: (.metrics_servicemonitors | length),
+                                    metrics_rbac: (.metrics_rbac | length),
+                                    emo_deployments, bind_addrs}' <<< "$baseline")"
+    log_info "  Baseline statusFeedback:${baseline_feedback:-none}"
+
+    log_substep "Overriding the vendor of $spoke_name to $RS_VENDOR_OVERRIDE_VALUE"
+    E2E_VENDOR_OVERRIDE_CLUSTER="$spoke_name"
+    kube_retry $KUBE_CLI annotate managedcluster "$spoke_name" \
+        "${RS_VENDOR_OVERRIDE_ANNOTATION}=${RS_VENDOR_OVERRIDE_VALUE}" --overwrite
+    # The annotation is inert on its own; this label change is what enqueues it.
+    kube_retry $KUBE_CLI label managedcluster "$spoke_name" \
+        "${RS_VENDOR_TRIGGER_LABEL}=1" --overwrite
+
+    log_substep "Waiting for MCOA to re-render $spoke_name as non-OpenShift"
+    if ! wait_until "$TIMEOUT_VENDOR_RERENDER" 5 "non-OpenShift re-render" \
+            mcoa_mw_rules_absent "$spoke_name"; then
+        log_error "  ManifestWork still has $(mcoa_mw_rule_count "$spoke_name") RS PrometheusRule(s)" \
+            "after ${TIMEOUT_VENDOR_RERENDER}s"
+        ((errors++)) || true
+    fi
+
+    local overridden
+    overridden=$(mcoa_mw_vendor_summary "$spoke_name")
+
+    log_substep "Verifying non-OpenShift rendering (ACM-48483)"
+    local rules_n proxy_c proxy_v svc_n sm_n rbac_n emo_n bind_addrs
+    rules_n=$(summary_count "$overridden" rules)
+    proxy_c=$(summary_count "$overridden" proxy_containers)
+    proxy_v=$(summary_count "$overridden" proxy_volumes)
+    svc_n=$(summary_count   "$overridden" serving_cert_services)
+    sm_n=$(summary_count    "$overridden" metrics_servicemonitors)
+    rbac_n=$(summary_count  "$overridden" metrics_rbac)
+    emo_n=$(summary_count   "$overridden" emo_deployments)
+    bind_addrs=$(jq -r '(.bind_addrs // []) | join(",")' <<< "$overridden" 2>/dev/null || echo "")
+
+    assert_count_is_zero "$rules_n" "RS PrometheusRules"              || ((errors++)) || true
+    assert_count_is_zero "$proxy_c" "kube-rbac-proxy containers"      || ((errors++)) || true
+    assert_count_is_zero "$proxy_v" "kube-rbac-proxy volumes"         || ((errors++)) || true
+    assert_count_is_zero "$svc_n"   "service-CA metrics Services"     || ((errors++)) || true
+    assert_count_is_zero "$sm_n"    "metrics ServiceMonitors"         || ((errors++)) || true
+    assert_count_is_zero "$rbac_n"  "metrics ClusterRole/Bindings"    || ((errors++)) || true
+
+    # The positive control. Everything above passes on an empty ManifestWork,
+    # so without this a teardown would read as a clean non-OpenShift render —
+    # and this Deployment is also what keeps the addon probe green (ACM-48626).
+    if [[ "$emo_n" == "1" ]]; then
+        log_success "  endpoint-monitoring-operator Deployment: still rendered"
+    else
+        log_error "  endpoint-monitoring-operator Deployment: $emo_n (expected 1) —" \
+            "the non-OpenShift render is missing the workload the probe depends on"
+        ((errors++)) || true
+    fi
+
+    if [[ -z "$bind_addrs" ]]; then
+        log_error "  metrics bind address: no --metrics-bind-address argument rendered"
+        ((errors++)) || true
+    elif [[ "$bind_addrs" != *"127.0.0.1"* ]]; then
+        log_success "  metrics bind address: $bind_addrs (not proxied)"
+    else
+        log_error "  metrics bind address: $bind_addrs (still bound for kube-rbac-proxy)"
+        ((errors++)) || true
+    fi
+
+    log_substep "Verifying the addon stays available (ACM-48626)"
+    if wait_until "$TIMEOUT_MCA_AVAILABLE" 5 "addon availability" \
+            mcoa_mca_is_available "$spoke_name"; then
+        log_success "  ManagedClusterAddOn: Available=True/ProbeAvailable"
+    else
+        local cond
+        cond=$(mcoa_mca_available "$spoke_name")
+        log_error "  ManagedClusterAddOn: Available=$cond (expected True/ProbeAvailable)"
+        if [[ "$cond" == "Unknown/NoProbeResult" ]]; then
+            log_error "    No probe result returned — the non-OpenShift probe fallback is missing (ACM-48626)"
+        fi
+        ((errors++)) || true
+    fi
+
+    log_substep "Verifying the probe fell back to endpoint-monitoring-operator"
+    local feedback
+    feedback=" $(mcoa_mw_feedback_names "$spoke_name" | tr '\n' ' ')"
+    log_info "  statusFeedback:${feedback:-none}"
+    # This is the mechanical cause of ACM-48626, not a proxy for it: the addon
+    # framework reports Unknown/NoProbeResult exactly when the agent registered
+    # probe fields and the ManifestWork came back with no field results at all
+    # (healthcheck_sync.go). Any probe result keeps it green, so emptiness is
+    # the assertion — a specific field name is not.
+    if [[ "${feedback// /}" != "" ]]; then
+        log_success "  statusFeedback is non-empty:${feedback}"
+    else
+        log_error "  statusFeedback is empty — the ManifestWork returned no probe" \
+            "result at all, which is what drives Available=Unknown/NoProbeResult (ACM-48626)"
+        ((errors++)) || true
+    fi
+    # Differential, for the same reason as ruleName below: on a build whose
+    # OpenShift render never reports availableReplicas either, demanding it here
+    # would fail a correctly-fixed MCOA.
+    if [[ "$feedback" == *" availableReplicas "* ]]; then
+        log_success "  statusFeedback reports availableReplicas"
+    elif [[ "$baseline_feedback" == *" availableReplicas "* ]]; then
+        log_error "  statusFeedback lost availableReplicas (the OpenShift baseline had it) —" \
+            "the endpoint-monitoring-operator probe is gone on non-OpenShift (ACM-48626)"
+        ((errors++)) || true
+    else
+        log_warn "  statusFeedback has no availableReplicas, but neither did the OpenShift" \
+            "baseline — this build does not probe that field, so it cannot be used as" \
+            "evidence either way here"
+    fi
+    # Differential against the baseline. "No ruleName now" only means something
+    # if the OpenShift render did report one; on a build whose RS probe fields
+    # never report, the absence is an artefact and claiming a pass would be a
+    # lie about what was covered.
+    if [[ "$feedback" == *" ruleName "* ]]; then
+        log_error "  statusFeedback still reports ruleName — a right-sizing rule is applied" \
+            "on a non-OpenShift cluster"
+        ((errors++)) || true
+    elif [[ "$baseline_feedback" == *" ruleName "* ]]; then
+        log_success "  statusFeedback no longer reports ruleName (was present on OpenShift)"
+    else
+        log_warn "  statusFeedback reports no ruleName, but the OpenShift baseline had none" \
+            "either — this build never reports ruleName, so the unrendered-rule half of" \
+            "ACM-48626 is not covered by this run"
+    fi
+
+    log_substep "Removing the vendor override from $spoke_name"
+    restore_vendor_override || ((errors++)) || true
+
+    log_substep "Waiting for the OpenShift rendering to come back"
+    if wait_until "$TIMEOUT_VENDOR_RERENDER" 5 "OpenShift re-render" \
+            mcoa_mw_rule_count_is "$spoke_name" "$baseline_rules"; then
+        log_success "  RS PrometheusRules restored: $baseline_rules"
+    else
+        log_error "  RS PrometheusRules not restored: $(mcoa_mw_rule_count "$spoke_name")" \
+            "(expected $baseline_rules)"
+        ((errors++)) || true
+    fi
+
+    local restored
+    restored=$(mcoa_mw_vendor_summary "$spoke_name")
+    if [[ "$(jq -cS . <<< "$restored" 2>/dev/null)" == "$(jq -cS . <<< "$baseline" 2>/dev/null)" ]]; then
+        log_success "  ManifestWork rendering matches the captured baseline"
+    else
+        log_error "  ManifestWork rendering differs from the baseline after restore"
+        log_info "    baseline: $baseline"
+        log_info "    restored: $restored"
+        ((errors++)) || true
+    fi
+
+    # Restoring the ManifestWork spec is not the same as restoring the addon.
+    # Reverting the vendor makes MCOA re-render the OpenShift-only resources,
+    # which the work agent deletes and recreates on the spoke; until they are
+    # back and re-probed the addon sits at Unknown/NoProbeResult. Measured at
+    # ~2.5 min on a SNO hub. Returning before that leaves every later phase —
+    # and the next run of this one — reading a degraded addon this phase caused.
+    log_substep "Waiting for the addon to recover from the override"
+    if wait_until "$TIMEOUT_MCA_RECOVERY" 10 "addon recovery" \
+            mcoa_mca_is_available "$spoke_name"; then
+        log_success "  ManagedClusterAddOn back to Available=True/ProbeAvailable"
+    else
+        log_error "  ManagedClusterAddOn still Available=$(mcoa_mca_available "$spoke_name")" \
+            "after ${TIMEOUT_MCA_RECOVERY}s — $spoke_name was left degraded by this phase"
+        ((errors++)) || true
+    fi
+
+    CURRENT_MODE="mcoa"
+
+    if [[ $errors -gt 0 ]]; then
+        PHASE_FAIL_REASON="$errors assertion(s) failed during the non-OpenShift vendor override"
         return 1
     fi
     return 0
@@ -6026,6 +6681,7 @@ main() {
     run_phase "9c"  "Disable both (MCOA)"             phase_9c
     run_phase "9d"  "Re-enable both (MCOA)"           phase_9d
     run_phase "9e"  "NamespaceBinding change (MCOA)"  phase_9e
+    run_phase "9f"  "Non-OpenShift vendor (MCOA)"     phase_9f
     run_phase "10a" "ConfigMap propagation (MCOA)"    phase_10a
     run_phase "10b" "Evaluation interval propagation (MCOA)" phase_10b
     run_phase "10c" "Evaluation interval validation/write-back (MCOA)" phase_10c

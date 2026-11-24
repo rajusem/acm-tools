@@ -42,7 +42,7 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 | `upgrade-acm` | Upgrade ACM/MCE via OLM; `list-channels`, `apply-mce-catalog`, `fix-mce` for stable-5.0 |
 | `setup-observability` | Install/uninstall MCO, object storage, and observability pipeline |
 | `image-override` | Build, push, and apply custom MCO/MCOA images from local repos |
-| `rs-e2e` | End-to-end right-sizing validation (38 phase entries, including configurable evaluation intervals, MCO/MCOA modes, and data-plane) |
+| `rs-e2e` | End-to-end right-sizing validation (39 phase entries, including configurable evaluation intervals, MCO/MCOA modes, non-OpenShift vendor simulation, and data-plane) |
 | `rs-status` | Dashboard showing right-sizing state (mode, ConfigMaps, ADC, policies) |
 | `rs-mode-switch` | Switch between MCO and MCOA right-sizing modes |
 | `rs-collect-must-gather` | Collect diagnostic data for right-sizing issues |
@@ -90,4 +90,6 @@ Stand-alone helpers (Python, no cluster access) live in `utility/`; see `utility
 - Test `--help` / `-h` first (no cluster connection needed)
 - Test `status` subcommands before mutating ones
 - After script changes, verify with a real cluster — bash pitfalls often only manifest at runtime
+- To exercise MCOA's non-OpenShift paths on an OCP spoke, set the `mcoa-override-vendor` annotation on the ManagedCluster. It is inert on its own: MCOA registers `AgentDeployTriggerClusterFilter` on **labels** only, so also touch a throwaway label to raise the re-render event. Remove the annotation *before* the label, so MCOA re-renders with the real vendor already restored. Never touch the `vendor`/`openshiftVersion` labels — ACM's clusterinfo controller reverts them, MCO reads them, and Placements select on them. Lifting the override restores the ManifestWork spec in seconds but the addon stays `Available=Unknown/NoProbeResult` for ~2.5 min while the work agent recreates the OpenShift-only resources and re-probes, so wait on the addon condition, not on the spec, before treating the cluster as clean
+- MCOA renders no `endpoint-monitoring-operator-tls` Secret on OpenShift either — the service-CA operator mints it from a Service annotation. Do not use its absence as evidence of a non-OpenShift render; assert on the annotated Service, the ServiceMonitor and the metrics RBAC instead
 

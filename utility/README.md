@@ -17,7 +17,9 @@ The utility follows AWS Secret references on the pools and their Hive `ClusterDe
 objects, including per-cluster `obsint-*` namespaces on the hub. It rotates the ACM source
 and the Hive Secrets using the anchor's old key. It updates a shared Secret once. The CCX
 credential, its pool and deployment Secret references, and copies of those key IDs are
-protected. Namespace names alone do not put a Secret in scope.
+protected. The known Collective CCX pool `obsint-sno-m5metal-420` is also protected by
+name, so a separate key in that pool or its deployments stays protected. Namespace names
+alone do not put a Secret in scope.
 
 ### Usage
 
@@ -49,11 +51,32 @@ your secret manager into `--credentials-stdin`. The fields are `aws_access_key_i
 Supply `old_hive_access_key_id` when the anchor already uses the new key but there may be
 copies on the previous key. An explicitly supplied previous key must agree with its source
 or its source must already carry the replacement.
-`--context` chooses among matching kubeconfig contexts. `--server`, `--namespace`,
-`--cluster-set`, `--credential`, and `--hive-anchor-pool` override the defaults. Use
+`--context` chooses among matching kubeconfig contexts. Use
 `--target acm` or `--target hive` with the corresponding replacement if the two groups
 use different IAM users. The default `--target both` requires the same IAM identity for
 every old key it replaces.
+
+### Environment defaults
+
+Command-line flags take precedence over nonempty environment variables, followed by the
+built-in defaults. The environment variables are for deployment settings. Enter the
+replacement key at the prompts or pass it on stdin using the fixed Hive field names
+`aws_access_key_id` and `aws_secret_access_key`.
+
+| Flag | Environment variable | Built-in default |
+| --- | --- | --- |
+| `--server` | `ACM_TOOLS_ROTATION_HUB` | `https://api.collective.aws.red-chesterfield.com:6443` |
+| `--namespace` | `ACM_TOOLS_ROTATION_NAMESPACE` | `obs-int-analytics` |
+| `--cluster-set` | `ACM_TOOLS_ROTATION_CLUSTER_SET` | `obs-int-analytics` |
+| `--credential` | `ACM_TOOLS_ROTATION_SOURCE` | `observability-llc-aws` |
+| `--hive-anchor-pool` | `ACM_TOOLS_ROTATION_HIVE_ANCHOR_POOL` | `obsint-sno-4xlarge-422` |
+| `--ccx-source` | `ACM_TOOLS_ROTATION_CCX_SOURCE` | `ccx-clusterpool-aws` |
+| `--aws-region` | `ACM_TOOLS_ROTATION_AWS_REGION` | `us-west-2` |
+
+The region override applies only to `--validate-replacement`. Rotation uses the regions
+reported by Hive. The namespace and cluster set can be configured independently. Using
+`--ccx-source` on Collective in `obs-int-analytics` adds a protected source alongside
+the built-in CCX source.
 
 ### Rotation sequence
 

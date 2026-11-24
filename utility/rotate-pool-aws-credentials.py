@@ -22,6 +22,7 @@ CLUSTER_SET = "obs-int-analytics"
 SOURCE = "observability-llc-aws"
 HIVE_ANCHOR_POOL = "obsint-sno-4xlarge-422"
 CCX_SOURCE = "ccx-clusterpool-aws"
+# This Collective pool has no CCX name marker and can hold a different key from the CCX source.
 CCX_POOL = "obsint-sno-m5metal-420"
 DEFAULT_AWS_REGION = "us-west-2"
 AWS_REGION_PATTERN = r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+"
@@ -308,10 +309,12 @@ def secret_pair(secret):
 
 
 def ccx_protection(snapshot, pairs, ccx):
+    protected = {ccx} | {ref for ref in pairs if ref[1] == CCX_SOURCE}
+    source_ids = {pairs[ref][0] for ref in protected}
     pools = {name for name, ref in snapshot.pool_credentials.items()
              if name == CCX_POOL or re.search(r"(?:^|-)ccx(?:-|$)", name)
-             or (ref is not None and pairs[ref][0] == pairs[ccx][0])}
-    protected = {ccx} | {ref for ref, owners in snapshot.owners.items() if owners & pools}
+             or (ref is not None and pairs[ref][0] in source_ids)}
+    protected.update(ref for ref, owners in snapshot.owners.items() if owners & pools)
     for ref in protected:
         if snapshot.owners.get(ref, set()) - pools:
             raise RotationError(f"CCX and another pool share Secret {ref[0]}/{ref[1]}. Review ownership before rotating")
@@ -436,8 +439,8 @@ def verify_reviewed_targets(reviewed, discovered):
 def run(args):
     cli = hub_client(args)
     source = (args.namespace, args.credential)
-    ccx = (args.namespace, CCX_SOURCE)
-    if source == ccx:
+    ccx = (args.namespace, args.ccx_source)
+    if source[1] in (CCX_SOURCE, args.ccx_source):
         raise RotationError("The CCX credential is excluded from rotation")
     scope = (args.namespace, args.cluster_set, args.credential)
     reviewed = (read_reviewed_targets(args.reviewed_hive_targets, args.server, args.namespace, args.cluster_set)
@@ -455,6 +458,9 @@ def run(args):
             progress("Limited Hive rotation. Keep the old AWS key active for deployments outside this inventory.")
     new_pair, previous_id, previous_hive_id = read_credentials(args.credentials_stdin, args.target)
     refs = set(snapshot.targets) | {ccx}
+    # An override can add a protected source on Collective without unprotecting the known CCX source.
+    if args.server == HUB and args.namespace == CLUSTER_SET:
+        refs.add((args.namespace, CCX_SOURCE))
     progress(f"Reading {len(refs)} hub Secrets to build the rotation plan.")
     secrets = load_secrets(cli, refs)
     if PROVIDER_LABEL not in secrets[source]["metadata"].get("labels", {}):
@@ -514,14 +520,24 @@ def run(args):
         print("Hub rotation verified. See utility/README.md for spoke, lifecycle, and old key retirement checks.")
 
 
+def rotation_default(setting, builtin):
+    return os.environ.get(f"ACM_TOOLS_ROTATION_{setting}") or builtin
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", default=HUB, help=f"expected hub API server (default: {HUB})")
+    parser.add_argument("--server", default=rotation_default("HUB", HUB), help=f"expected hub API server (built-in default: {HUB})")
     parser.add_argument("--context", help="kubeconfig context for the expected server")
-    parser.add_argument("--namespace", default=CLUSTER_SET, help=f"pool and credential namespace (default: {CLUSTER_SET})")
-    parser.add_argument("--cluster-set", default=CLUSTER_SET, help=f"pool cluster set label (default: {CLUSTER_SET})")
-    parser.add_argument("--credential", default=SOURCE, help=f"ACM credential Secret name (default: {SOURCE})")
-    parser.add_argument("--hive-anchor-pool", default=HIVE_ANCHOR_POOL, help=f"pool whose Secret identifies the shared Hive key (default: {HIVE_ANCHOR_POOL})")
+    parser.add_argument("--namespace", default=rotation_default("NAMESPACE", CLUSTER_SET),
+                        help=f"pool and credential namespace (built-in default: {CLUSTER_SET})")
+    parser.add_argument("--cluster-set", default=rotation_default("CLUSTER_SET", CLUSTER_SET),
+                        help=f"pool cluster set label (built-in default: {CLUSTER_SET})")
+    parser.add_argument("--credential", default=rotation_default("SOURCE", SOURCE),
+                        help=f"ACM credential Secret name (built-in default: {SOURCE})")
+    parser.add_argument("--hive-anchor-pool", default=rotation_default("HIVE_ANCHOR_POOL", HIVE_ANCHOR_POOL),
+                        help=f"pool whose Secret identifies the shared Hive key (built-in default: {HIVE_ANCHOR_POOL})")
+    parser.add_argument("--ccx-source", default=rotation_default("CCX_SOURCE", CCX_SOURCE),
+                        help=f"protected CCX credential Secret name (built-in default: {CCX_SOURCE})")
     parser.add_argument("--target", choices=("both", "acm", "hive"), default="both", help="credential groups to rotate (default: both)")
     parser.add_argument("--reviewed-hive-targets", metavar="FILE",
                         help="require the Hive plan to match the reviewed Secret references in this JSON file")
@@ -529,21 +545,26 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="write and verify the planned hub Secret changes")
     mode.add_argument("--validate-replacement", action="store_true", help="check only the new key in AWS, without connecting to the hub")
-    parser.add_argument("--aws-region", action="append", help=f"AWS region for --validate-replacement (repeatable, default: {DEFAULT_AWS_REGION})")
+    parser.add_argument("--aws-region", action="append",
+                        help=f"AWS region for --validate-replacement (repeatable, built-in default: {DEFAULT_AWS_REGION})")
     args = parser.parse_args()
     if args.reviewed_hive_targets and (args.target != "hive" or args.validate_replacement):
         parser.error("--reviewed-hive-targets requires a Hive preview or apply with --target hive")
     if args.aws_region and not args.validate_replacement:
         parser.error("--aws-region requires --validate-replacement")
+    if args.validate_replacement and not args.aws_region:
+        args.aws_region = [rotation_default("AWS_REGION", DEFAULT_AWS_REGION)]
     if any(not re.fullmatch(AWS_REGION_PATTERN, region) for region in args.aws_region or []):
-        parser.error("--aws-region must be an AWS region name")
-    args.server = args.server.rstrip("/")
-    if not re.fullmatch(r"https://[a-zA-Z0-9.-]+(?::[0-9]+)?", args.server):
-        parser.error("--server must be an HTTPS Kubernetes API URL")
-    for option, value in (("--namespace", args.namespace), ("--cluster-set", args.cluster_set),
-                          ("--credential", args.credential), ("--hive-anchor-pool", args.hive_anchor_pool)):
-        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", value):
-            parser.error(f"{option} must be a Kubernetes resource name")
+        parser.error("--aws-region or ACM_TOOLS_ROTATION_AWS_REGION must be an AWS region name")
+    if not args.validate_replacement:
+        args.server = args.server.rstrip("/")
+        if not re.fullmatch(r"https://[a-zA-Z0-9.-]+(?::[0-9]+)?", args.server):
+            parser.error("--server must be an HTTPS Kubernetes API URL")
+        for option, value in (("--namespace", args.namespace), ("--cluster-set", args.cluster_set),
+                              ("--credential", args.credential), ("--hive-anchor-pool", args.hive_anchor_pool),
+                              ("--ccx-source", args.ccx_source)):
+            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", value):
+                parser.error(f"{option} must be a Kubernetes resource name")
     try:
         if args.validate_replacement:
             validate_replacement(args)

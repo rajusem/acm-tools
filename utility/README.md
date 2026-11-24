@@ -1,11 +1,127 @@
 # Utilities
 
 Stand-alone helpers. Unlike the tools in `bin/`, they do not use `lib/common.sh` or
-`config.sh`, and they never connect to a cluster.
+`config.sh`.
 
 | Utility | Purpose |
 |---------|---------|
 | [`konflux-pr-image.py`](#konflux-pr-imagepy) | Find the Konflux image built for a GitHub PR: build status, image, quay.io expiry, and `image-override.json` entries |
+| [`rotate-pool-aws-credentials.py`](#rotate-pool-aws-credentialspy) | Validate and rotate the AWS IAM key in an ACM credential and the Hive Secrets that use it |
+
+## rotate-pool-aws-credentials.py
+
+The defaults are the Collective API at `https://api.collective.aws.red-chesterfield.com:6443`,
+namespace and cluster set `obs-int-analytics`, and ACM credential `observability-llc-aws`.
+The shared Hive key is identified by the AWS Secret referenced by `obsint-sno-4xlarge-422`.
+The utility follows AWS Secret references on the pools and their Hive `ClusterDeployment`
+objects, including per-cluster `obsint-*` namespaces on the hub. It rotates the ACM source
+and the Hive Secrets using the anchor's old key. It updates a shared Secret once. The CCX
+credential, its pool and deployment Secret references, and copies of those key IDs are
+protected. Namespace names alone do not put a Secret in scope.
+
+### Usage
+
+Requires Python 3.9+, `oc` or `kubectl`, AWS CLI, and a kubeconfig context with trusted TLS
+for the selected hub. The hub user needs read access to the pools, claims, deployments, and
+referenced Secrets, plus patch access to those Secrets for `--apply`.
+
+```bash
+# Validate just the replacement key with AWS, before checking Collective.
+utility/rotate-pool-aws-credentials.py --validate-replacement
+
+# Preview the affected Secret names and validate the new key in AWS.
+utility/rotate-pool-aws-credentials.py
+
+# Preflight, apply, and verify the hub Secret updates.
+utility/rotate-pool-aws-credentials.py --apply
+```
+
+`--validate-replacement` prompts for just the new pair and checks STS and EC2 permission
+in `us-west-2`. Use `--aws-region` to check another region. This mode skips hub access and
+cannot be combined with `--apply`. A successful check confirms the key works in AWS.
+The rotation preview still compares IAM identities and requires its own validation.
+Progress logs identify the AWS check and show only the last four characters of the access
+key ID. Secret access keys are omitted from all output.
+
+The prompts hide both parts of the key. For automation, pipe a JSON object directly from
+your secret manager into `--credentials-stdin`. The fields are `aws_access_key_id`,
+`aws_secret_access_key`, and optional `old_access_key_id` and `old_hive_access_key_id`.
+Supply `old_hive_access_key_id` when the anchor already uses the new key but there may be
+copies on the previous key. An explicitly supplied previous key must agree with its source
+or its source must already carry the replacement.
+`--context` chooses among matching kubeconfig contexts. `--server`, `--namespace`,
+`--cluster-set`, `--credential`, and `--hive-anchor-pool` override the defaults. Use
+`--target acm` or `--target hive` with the corresponding replacement if the two groups
+use different IAM users. The default `--target both` requires the same IAM identity for
+every old key it replaces.
+
+### Rotation sequence
+
+1. Create the replacement key for the same AWS IAM user and keep the old key active.
+   Coordinate a window with pool operators so claims, scaling, and provisioning do not race
+   with the rotation. Inventory other workloads that might also use the old key.
+2. Review the default plan. The tool uses AWS STS to compare the IAM identity of both keys
+   when the old key is still present, and checks EC2 `DescribeInstances` permission with an
+   AWS dry run in the relevant regions. These checks do not prove provisioning or cleanup.
+   An STS failure identifies the replacement, existing ACM key, or existing shared Hive key.
+   For `InvalidClientTokenId`, check that the identified key is active and that its access
+   key ID and secret are the matching pair in the expected AWS account.
+3. Apply the plan. The utility runs Kubernetes server dry runs before writing and changes
+   both key fields together with a resource version check. It reads back each update and
+   checks the discovered scope again after the last write, including the protected CCX references.
+   The Hive anchor and ACM source are written last. Kubernetes has no transaction across
+   Secrets. If a run stops partway through, keep the IAM keys active and rerun the plan.
+4. Check the Cloud Credential Operator (CCO) on the affected OpenShift clusters. If a cluster
+   uses the old key in its cloud credential Secret, rotate it using the procedure for that
+   cluster's OpenShift version and CCO mode. This is separate from Hive's copy on the hub.
+5. Provision and clean up a disposable cluster, and resume an agreed hibernating cluster
+   during the change window. Verify that the AWS lifecycle calls used the new key. After
+   checking all consumers, deactivate the old key and monitor before deleting it. The utility
+   does not change cluster power or pool size, modify spoke credentials, or manage IAM keys.
+
+### Limited Hive rotation
+
+If the hub account cannot list deployments cluster-wide, the utility can follow assigned
+claims for pools whose desired and observed inventory are both zero. A normal apply
+requires a cluster-wide deployment list. For a limited rotation in this situation, use
+`--target hive --reviewed-hive-targets FILE` with both the preview and apply. The JSON
+file must contain the expected `server`, `namespace`, and `clusterSet`, and a `secrets`
+array of reviewed `namespace` and `name` references. It contains no credential values.
+The live plan must match that list exactly, including targets that are already current.
+
+From the repository root, set `reviewed` to the path of your local target file.
+Run the preview first and check the listed Secret names and AWS validation result.
+
+```bash
+reviewed=./path/to/reviewed-hive-targets.json
+
+./utility/rotate-pool-aws-credentials.py \
+  --target hive --reviewed-hive-targets "$reviewed"
+```
+
+**Without `--apply`**, the script reads Collective, checks the reviewed list and AWS key,
+and prints the proposed Secret updates. It makes no changes to Collective.
+
+Once the preview passes and you have reviewed the targets, run the apply command in the
+same terminal with the same target file.
+
+```bash
+./utility/rotate-pool-aws-credentials.py \
+  --target hive --reviewed-hive-targets "$reviewed" --apply
+```
+
+**With `--apply`**, the script rebuilds and validates the plan, runs server dry runs,
+updates the two AWS key fields in the reviewed Hive Secrets, and reads them back to verify
+the writes. The ACM and CCX credentials are outside this Hive rotation.
+
+Collect a rollback snapshot for the reviewed targets and keep the old key active. This
+mode verifies only the reviewed Hive Secrets. A hub admin needs to check deployments
+outside the claim inventory and outstanding cleanup requests before the old key can be
+retired.
+
+See [ACM credential management](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.17/html/clusters/cluster_mce_overview),
+[OpenShift cloud credential rotation](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html/postinstallation_configuration/changing-cloud-credentials-configuration),
+and [AWS IAM key management](https://docs.aws.amazon.com/IAM/latest/UserGuide/access-keys-admin-managed.html).
 
 ## konflux-pr-image.py
 

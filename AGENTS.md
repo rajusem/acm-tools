@@ -49,6 +49,7 @@ All scripts live in `bin/` and source `lib/common.sh`. Run any script with `--he
 | `cluster-diagnose` | Automated cluster health diagnostic (16 checks, issues + fix commands) |
 | `add-managed-cluster` | Import/re-import managed clusters (klusterlet cleanup, pull secret sync) |
 | `sno-virt` | Enable/validate OpenShift Virtualization on an AWS SNO cluster (EC2 nested virt) |
+| `clusterpool` | Preview or update Hive OpenShift images and create AWS ClusterPools from templates |
 
 Stand-alone helpers (Python) live in `utility/`; see `utility/README.md`. They do not use
 `lib/common.sh` or `config.sh`. `rotate-pool-aws-credentials.py` reads and updates hub Secrets.

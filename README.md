@@ -49,6 +49,19 @@ export VM_SPOKE_CONTEXT="vm-spoke"               # default: hub (if no separate 
 
 ## Tools
 
+### clusterpool
+
+Preview or change the OpenShift release image for Hive ClusterPools, or create an AWS pool from a template in the same namespace. The command defaults to Collective and `obs-int-analytics`. Override the target with `--server`, `--context`, or `--namespace`, or set `CLUSTERPOOL_SERVER` and `CLUSTERPOOL_NAMESPACE` in the environment or `config.sh`.
+
+```bash
+bin/clusterpool update-image --version 5.0 obsint-sno-2xlarge-5 obsint-sno-4xlarge-5
+bin/clusterpool create-pool --version 5.1 obsint-sno-4xlarge-5 obsint-sno-4xlarge-51
+```
+
+Both examples preview. Use `--image-set` to pin the exact image set from the preview, then add `--apply` to write. Image updates affect future provisioning, and Hive can replace unclaimed clusters. Existing claims retain their installations. On apply, the tool preflights every patch with server-side dry-run before submitting any updates.
+
+Pool creation needs read access to the relevant install-config Secrets. It copies the source template to `<NEW_POOL>-install-config`, or uses an existing template supplied with `--install-config-secret`. It reuses the source AWS and pull-secret references. The new pool defaults to size `0` and provisions on demand when claimed. Install ACM and MCE separately if the claimed cluster will serve as a hub.
+
 ### install-custom-acm
 
 Install or manage ACM on a hub cluster via OLM. Supports merging quay.io pull secrets and applying custom CatalogSources for pre-release builds.

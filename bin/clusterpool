@@ -1,6 +1,22 @@
 #!/bin/bash
-# Manage OpenShift provisioning images and AWS ClusterPools on a Hive hub.
-# Run without --apply to inspect the proposed changes.
+# =============================================================================
+# clusterpool — Update Hive ClusterPool images and create AWS ClusterPools
+# =============================================================================
+#
+# Usage:
+#   clusterpool update-image [options] POOL [POOL ...]      # Change the pools' OpenShift image
+#   clusterpool create-pool  [options] SOURCE_POOL NEW_POOL # Clone a template-based AWS pool
+#
+# Both commands print a read-only preview unless --apply is passed. Preview and
+# apply run the same read-only checks; only apply writes to the hub.
+#
+# The target defaults to CLUSTERPOOL_SERVER and CLUSTERPOOL_NAMESPACE from
+# config.sh. Every request pins --context; the kubeconfig's current context is
+# never changed. Install-config Secret data passes only through pipes and is
+# never printed.
+#
+# See the clusterpool section of README.md for examples.
+# =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,7 +25,9 @@ source "$SCRIPT_DIR/../lib/common.sh"
 POOL_RESOURCE=clusterpools.hive.openshift.io
 IMAGE_SET_RESOURCE=clusterimagesets.hive.openshift.io
 
-# Print usage and the configured defaults without accessing a cluster.
+# Print usage, then the effective target defaults. Needs no cluster and no oc.
+# Globals: reads CLUSTERPOOL_SERVER and CLUSTERPOOL_NAMESPACE (config.sh or the
+#   environment).
 usage() {
     cat <<'USAGE'
 Usage:
@@ -50,7 +68,7 @@ it uses the current context when it is a candidate or asks for --context.
 
 create-pool clones a template-based AWS pool in the same namespace. It copies
 the install template on apply and reuses the source AWS and pull-secret references.
-Preview checks the required template references. Apply also checks the template key.
+Preview runs the same read-only template checks as apply.
 Install ACM/MCE separately on a claimed cluster if it will serve as an ACM hub.
 
 Examples:
@@ -62,18 +80,28 @@ USAGE
         "$CLUSTERPOOL_SERVER" "$CLUSTERPOOL_NAMESPACE"
 }
 
-# Report a fatal error on stderr and exit nonzero.
+# Log the arguments as an error on stderr and exit 1.
 die() {
     log_error "$*"
     exit 1
 }
 
-# Return success if the argument is a Kubernetes DNS label.
+# Check one value against the Kubernetes DNS label rules: lowercase alphanumerics
+# and '-', at most 63 characters, no leading or trailing '-'.
+# Args: $1 value.
+# Returns: 0 valid; 1 invalid.
 valid_label() {
     [[ ${#1} -le 63 && "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]
 }
 
-# Print the kubeconfig context for the given server and selected namespace, if unique.
+# Print the kubeconfig context for an API server. Among the contexts whose
+# cluster uses that server, those set to the pool namespace win. One candidate
+# is printed as is; with several, the current context is printed if it is one of
+# them, otherwise nothing. Uses `config view` without --raw, so credentials stay
+# redacted.
+# Args: $1 API server URL (a trailing '/' is ignored).
+# Globals: reads KUBE_CLI and namespace.
+# Returns: nonzero when the kubeconfig cannot be read or parsed.
 resolve_context() {
     "$KUBE_CLI" config view -o json | jq -r --arg server "${1%/}" --arg namespace "$namespace" '
         . as $config |
@@ -86,14 +114,24 @@ resolve_context() {
     '
 }
 
-# Run a CLI request against the selected context without changing kubeconfig.
+# Run $KUBE_CLI against the selected context with a 20s request timeout. The
+# kubeconfig's current context is never changed.
+# Args: passed to the CLI.
+# Globals: reads KUBE_CLI and context.
+# Returns: the CLI's exit code.
 kube() {
     "$KUBE_CLI" --context="$context" --request-timeout=20s "$@"
 }
 
-# Print the best live image-set name for the requested OpenShift major.minor.
+# Print the best ClusterImageSet name for an OpenShift MAJOR.MINOR. Ranks the
+# release image tag, which can differ from the ClusterImageSet name: stable
+# before EC or RC previews, then the highest patch, then RC before EC, then the
+# highest build. Only x86_64/amd64 tags count, and sets being deleted are
+# skipped. Prints nothing when no set matches.
+# Args: $1 MAJOR.MINOR, such as 5.1.
+# Globals: reads context (through kube).
+# Returns: nonzero when the list cannot be read or two sets tie for the best build.
 resolve_image_set() {
-    # Rank the payload tag, which can differ from the ClusterImageSet name.
     kube get "$IMAGE_SET_RESOURCE" -o json | jq -r --arg version "$1" '
         [ .items[] | select(.metadata.deletionTimestamp == null) |
           .metadata.name as $name |
@@ -110,7 +148,15 @@ resolve_image_set() {
     '
 }
 
-# Preview pool image changes. On apply, preflight all patches before updating any pool.
+# Preview the image change for each pool; a repeated name is checked once. With
+# --apply, preflight every patch with --dry-run=server before sending any real
+# patch. If a real patch fails, read back each pool's image, report it and exit 1.
+# Each patch tests the pool's uid and current image, so a concurrent edit fails
+# instead of being overwritten.
+# Args: pool names.
+# Globals: reads namespace, image_set and apply.
+# Cluster changes: with --apply, sets spec.imageSetRef.name on each pool that
+#   differs. Exits through die on a failed read, preflight or patch.
 update_image() {
     local name pool current uid patch
     local seen=() plans=()
@@ -160,20 +206,30 @@ update_image() {
     done
 }
 
-# Print the install template's status for the expected provenance marker, or
-# nothing if absent. Project only status and suppress diagnostics from Secret reads.
+# Print the state of an install-config Secret: nothing when it is absent, else
+# terminating, missing-key (no install-config.yaml data), managed (carries the
+# expected acm-tools/source-install-config annotation) or unmarked. Prints only
+# the state; Secret data stays in the pipe and read diagnostics are suppressed.
+# Args: $1 Secret name; $2 expected annotation value (<source pool uid>/<source Secret>).
+# Globals: reads namespace.
+# Returns: nonzero when the Secret cannot be read.
 inspect_install_template() {
     kube get secret "$1" -n "$namespace" --ignore-not-found -o json 2>/dev/null |
-        jq -r --arg expected "$2" --argjson check_key "$apply" '
+        jq -r --arg expected "$2" '
             if .metadata.deletionTimestamp != null then "terminating"
-            elif $check_key and (.data["install-config.yaml"] | length) == 0 then "missing-key"
+            elif (.data["install-config.yaml"] | length) == 0 then "missing-key"
             elif .metadata.annotations["acm-tools/source-install-config"] == $expected then "managed"
             else "unmarked" end
         ' 2>/dev/null
 }
 
-# Return success if the pending copy still contains the current source template.
-# Secret contents flow only through the pipe and are never printed.
+# Check that a copy left by an earlier run still matches its source: both
+# Secrets exist and are not being deleted, the copy carries the expected
+# annotation, and its install-config.yaml equals the source's non-empty value.
+# Prints nothing; Secret data stays in the pipe.
+# Args: $1 source Secret; $2 copy; $3 expected annotation value.
+# Globals: reads namespace.
+# Returns: 0 match; nonzero on a mismatch or when either Secret cannot be read.
 verify_install_template_copy() {
     local source_config="$1" target_config="$2" expected="$3"
     kube get secret "$source_config" "$target_config" -n "$namespace" -o json 2>/dev/null |
@@ -187,7 +243,12 @@ verify_install_template_copy() {
         ' >/dev/null 2>&1
 }
 
-# Copy the install-config.yaml key from the source Secret to a new managed Secret.
+# Create a Secret that holds only the source's install-config.yaml key, annotated
+# with acm-tools/source-install-config so a rerun can recognize it.
+# Args: $1 source Secret; $2 new Secret name; $3 annotation value.
+# Globals: reads namespace.
+# Cluster changes: creates Secret $2. Exits through die when the source cannot
+#   be read, has no install-config.yaml key, or the create fails.
 copy_install_template() {
     # Secret data passes directly through stdin. Errors from this pipeline are
     # suppressed because API diagnostics can include submitted field values.
@@ -205,13 +266,25 @@ copy_install_template() {
     log_success "Created install-config Secret $target_config"
 }
 
-# Check the explicit or managed template for a new or existing pool. On apply,
-# copy a missing managed template and verify pending copies before pool creation.
+# Check the install-config Secret that the new pool references. Preview and
+# apply run the same read-only checks:
+#   - With --install-config-secret, that Secret must exist, must not be being
+#     deleted, and must have the install-config.yaml key.
+#   - Otherwise an unmarked Secret with the target name stops the run. For an
+#     existing pool, a managed copy is accepted as is. In every other case the
+#     source template must have the key, and a pending managed copy must still
+#     match it.
+# On apply, a missing managed copy is created from the source.
+# Args: $1 source Secret; $2 target Secret; $3 expected annotation value;
+#   $4 true when the new pool already exists.
+# Globals: reads namespace, apply and install_config_secret.
+# Cluster changes: with --apply, may create $2 (copy_install_template). Exits
+#   through die when a check fails.
 ensure_install_template() {
     local source_config="$1" target_config="$2" expected="$3" pool_exists="$4"
     local target_state source_state
     target_state=$(inspect_install_template "$target_config" "$expected") \
-        || die "Could not check install-config Secret $target_config"
+        || die "Could not check install-config Secret $target_config. Check Secret read access."
     case "$target_state" in
         terminating) die "Install-config Secret $target_config is being deleted" ;;
         missing-key) die "Install-config Secret $target_config has no install-config.yaml key" ;;
@@ -230,7 +303,7 @@ ensure_install_template() {
     fi
 
     source_state=$(inspect_install_template "$source_config" "$expected") \
-        || die "Could not check source install-config Secret $source_config"
+        || die "Could not check source install-config Secret $source_config. Check Secret read access."
     case "$source_state" in
         '') die "Source install-config Secret $source_config was not found" ;;
         terminating) die "Source install-config Secret $source_config is being deleted" ;;
@@ -238,10 +311,9 @@ ensure_install_template() {
     esac
 
     if [[ "$target_state" == managed ]]; then
-        log_info "Check existing copy $target_config against the source on apply"
-        if [[ "$apply" == true ]] && ! verify_install_template_copy "$source_config" "$target_config" "$expected"; then
-            die "Cannot verify $target_config matches the current source. Inspect the copy before retrying, or reference an approved template with --install-config-secret."
-        fi
+        verify_install_template_copy "$source_config" "$target_config" "$expected" \
+            || die "Cannot verify $target_config matches the current source. Check Secret read access and inspect the copy before retrying, or reference an approved template with --install-config-secret."
+        log_info "Reuse existing copy $target_config, which matches the source"
     else
         log_info "Copy install-config Secret $source_config to $target_config"
         if [[ "$apply" == true ]]; then
@@ -250,7 +322,15 @@ ensure_install_template() {
     fi
 }
 
-# Preview or create a same-namespace AWS pool from the source specification.
+# Preview or create NEW_POOL from SOURCE_POOL in the same namespace. The new spec
+# is the source spec with the requested image, the target install template and
+# size, and no runningCount; labels are copied. An existing pool that already
+# matches is accepted after its template checks, so a rerun after a partial
+# failure is safe.
+# Args: $1 source pool; $2 new pool.
+# Globals: reads namespace, image_set, size, apply and install_config_secret.
+# Cluster changes: with --apply, may create the install-config Secret, then
+#   creates the ClusterPool. Exits through die when a check or write fails.
 create_pool() {
     local source_name="$1" target_name="$2"
     local source_pool source_config target_config source_uid target_pool manifest expected

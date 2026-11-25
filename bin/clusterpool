@@ -1,0 +1,303 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+
+POOL_RESOURCE=clusterpools.hive.openshift.io
+IMAGE_SET_RESOURCE=clusterimagesets.hive.openshift.io
+DEFAULT_SERVER=https://api.collective.aws.red-chesterfield.com:6443
+DEFAULT_NAMESPACE=obs-int-analytics
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  clusterpool update-image [options] POOL [POOL ...]
+  clusterpool create-pool  [options] SOURCE_POOL NEW_POOL
+
+Both commands show a read-only preview by default. Pass --apply to make changes.
+
+Image selection (choose one):
+  --version MAJOR.MINOR          Select an x86_64 OpenShift image set on the hub
+  --image-set NAME               Existing Hive ClusterImageSet for OpenShift
+
+Target options:
+  -n, --namespace NAMESPACE      Pool namespace (default obs-int-analytics)
+  --context CONTEXT              Use a specific kubeconfig context
+  --server URL                   Select a context for this server (default Collective)
+                                 With --context, verify that it points to this server
+
+Other options:
+  --apply                        Make the previewed changes
+  --dry-run                      Explicitly request a read-only preview
+  -h, --help                     Show this help
+
+Create-pool options:
+  --size COUNT                   Unclaimed clusters to maintain (default 0)
+  --install-config-secret NAME   Use an existing install-config Secret instead
+                                 of copying the source template to NEW_POOL-install-config
+
+update-image changes the OpenShift image for future provisioning. Hive can
+replace unclaimed stock. Claimed clusters are updated through their own APIs.
+
+--version prefers the newest stable patch, then the newest EC or RC preview
+if no stable image is available. Use --image-set to pin a build or architecture.
+
+Without --context, the command looks for a kubeconfig context on
+https://api.collective.aws.red-chesterfield.com:6443 or the supplied --server.
+It prefers a context set to the pool namespace. If several candidates remain,
+it uses the current context when it is a candidate or asks for --context.
+
+create-pool clones a template-based AWS pool in the same namespace. It copies
+the install template on apply and reuses the source AWS and pull-secret references.
+Install ACM/MCE separately on a claimed cluster if it will serve as an ACM hub.
+
+Examples:
+  clusterpool update-image --version 5.0 \
+    obsint-sno-2xlarge-5 obsint-sno-4xlarge-5 obsint-sno-m7i-4xlarge-5
+  clusterpool create-pool --version 5.1 obsint-sno-4xlarge-5 obsint-sno-4xlarge-51
+USAGE
+}
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+valid_label() {
+    [[ ${#1} -le 63 && "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]
+}
+
+resolve_context() {
+    "$KUBE_CLI" config view -o json | jq -r --arg server "${1%/}" --arg namespace "$namespace" '
+        . as $config |
+        [ .clusters[]? | select((.cluster.server // "" | rtrimstr("/")) == $server) | .name ] as $clusters |
+        [ .contexts[]? | select(.context.cluster as $cluster | $clusters | index($cluster) != null) ] as $matches |
+        [ $matches[] | select((.context.namespace // "default") == $namespace) ] |
+        if length == 0 then $matches else . end |
+        if length == 1 then .[0].name
+        else .[] | select(.name == $config["current-context"]) | .name end
+    '
+}
+
+kube() {
+    "$KUBE_CLI" --context="$context" --request-timeout=20s "$@"
+}
+
+resolve_image_set() {
+    # Rank the payload tag, which can differ from the ClusterImageSet name.
+    kube get "$IMAGE_SET_RESOURCE" -o json | jq -r --arg version "$1" '
+        [ .items[] | select(.metadata.deletionTimestamp == null) |
+          .metadata.name as $name |
+          (.spec.releaseImage // "" | capture(
+              ":(?<minor>[0-9]+\\.[0-9]+)\\.(?<patch>[0-9]+)(?:-(?<stage>rc|ec)\\.(?<build>[0-9]+))?-(?:x86_64|amd64)$"
+          )) |
+          select(.minor == $version) |
+          {name: $name, rank: [(.stage == null), (.patch | tonumber), (.stage == "rc"), (.build // "0" | tonumber)]}
+        ] |
+        max_by(.rank).rank as $best | map(select(.rank == $best)) |
+        if length > 1 then
+            error("Multiple image sets match the best build: " + (map(.name) | sort | join(", ")))
+        else .[0].name // empty end
+    '
+}
+
+update_image() {
+    local name pool current uid patch
+    local seen=() plans=()
+
+    for name in "$@"; do
+        [[ " ${seen[*]-} " != *" $name "* ]] || continue
+        seen+=("$name")
+        pool=$(kube get "$POOL_RESOURCE" "$name" -n "$namespace" -o json)
+        jq -e '.metadata.deletionTimestamp == null' <<< "$pool" >/dev/null || die "Pool is being deleted: $name"
+        current=$(jq -er '.spec.imageSetRef.name | select(length > 0)' <<< "$pool")
+        if [[ "$current" == "$image_set" ]]; then
+            log_info "$name already uses $image_set"
+            continue
+        fi
+
+        uid=$(jq -er '.metadata.uid | select(length > 0)' <<< "$pool")
+        patch=$(jq -nc --arg uid "$uid" --arg current "$current" --arg image "$image_set" '[
+            {op: "test", path: "/metadata/uid", value: $uid},
+            {op: "test", path: "/spec/imageSetRef/name", value: $current},
+            {op: "replace", path: "/spec/imageSetRef/name", value: $image}
+        ]')
+        log_info "$name: $current -> $image_set"
+        plans+=("$name" "$patch")
+    done
+
+    [[ "$apply" == true ]] || return 0
+    local i
+    for ((i = 0; i < ${#plans[@]}; i += 2)); do
+        name=${plans[i]}
+        kube patch "$POOL_RESOURCE" "$name" -n "$namespace" --type=json -p "${plans[i+1]}" -o name \
+            || die "Could not update $name. Rerun to preview the current state of the requested pools."
+    done
+}
+
+copy_install_template() {
+    # Secret data passes directly through stdin. Errors from this pipeline are
+    # suppressed because API diagnostics can include submitted field values.
+    local source_config="$1" target_config="$2" source_uid="$3"
+    local existing expected
+    expected="$source_uid/$source_config"
+    existing=$(kube get secret "$target_config" -n "$namespace" --ignore-not-found -o json 2>/dev/null |
+        jq -r 'if (.data["install-config.yaml"] | length) > 0
+            then .metadata.annotations["acm-tools/source-install-config"] // "unmarked"
+            else "invalid" end' 2>/dev/null) \
+        || die "Could not check install-config Secret $target_config"
+
+    if [[ -n "$existing" ]]; then
+        [[ "$existing" == "$expected" ]] || die "Install-config Secret $target_config already exists. Use --install-config-secret to reference it explicitly."
+        return 0
+    fi
+
+    if ! kube get secret "$source_config" -n "$namespace" -o json 2>/dev/null |
+        jq -ec --arg name "$target_config" --arg namespace "$namespace" --arg source "$expected" '
+            select(.data["install-config.yaml"] | length > 0) |
+            {apiVersion: "v1", kind: "Secret",
+             metadata: {name: $name, namespace: $namespace, annotations: {"acm-tools/source-install-config": $source}},
+             type: (.type // "Opaque"), data: {"install-config.yaml": .data["install-config.yaml"]}}
+        ' 2>/dev/null |
+        kube create -n "$namespace" -f - -o name >/dev/null 2>&1; then
+        die "Could not copy install-config Secret $source_config to $target_config. Check Secret access and the install-config.yaml key, then rerun."
+    fi
+    log_success "Created install-config Secret $target_config"
+}
+
+create_pool() {
+    local source_name="$1" target_name="$2"
+    local source_pool source_config target_config source_uid target_pool manifest
+
+    source_pool=$(kube get "$POOL_RESOURCE" "$source_name" -n "$namespace" -o json)
+    jq -e '.metadata.deletionTimestamp == null and .spec.platform.aws != null and .spec.inventory == null' \
+        <<< "$source_pool" >/dev/null || die "Source must be an active, template-based AWS ClusterPool: $source_name"
+    source_config=$(jq -er '.spec.installConfigSecretTemplateRef.name | select(length > 0)' <<< "$source_pool") \
+        || die "Source pool has no install-config template: $source_name"
+    source_uid=$(jq -er '.metadata.uid | select(length > 0)' <<< "$source_pool")
+    target_config="${install_config_secret:-$target_name-install-config}"
+
+    manifest=$(jq -c --arg name "$target_name" --arg image "$image_set" --arg template "$target_config" \
+        --argjson size "$size" '{
+            apiVersion: .apiVersion, kind: "ClusterPool",
+            metadata: {name: $name, namespace: .metadata.namespace, labels: .metadata.labels},
+            spec: (.spec | .imageSetRef.name = $image | .installConfigSecretTemplateRef.name = $template |
+                .size = $size | del(.runningCount))
+        }' <<< "$source_pool")
+
+    target_pool=$(kube get "$POOL_RESOURCE" "$target_name" -n "$namespace" --ignore-not-found -o json)
+    if [[ -n "$target_pool" ]]; then
+        if printf '%s\n%s\n' "$manifest" "$target_pool" | jq -es '
+            .[0] as $desired | .[1] as $current |
+            $current.metadata.deletionTimestamp == null and
+            ($desired.spec | .runningCount //= 0) == ($current.spec | .runningCount //= 0) and
+            ($desired.metadata.labels // {} | to_entries | all(.value == $current.metadata.labels[.key]))
+        ' >/dev/null; then
+            log_info "$target_name already matches the requested configuration"
+            return 0
+        fi
+        die "ClusterPool $target_name already exists with a different configuration"
+    fi
+
+    log_info "Create $target_name from $source_name with $image_set and size $size"
+    if [[ -n "$install_config_secret" ]]; then
+        log_info "Use existing install-config Secret $target_config"
+    else
+        log_info "Copy install-config Secret $source_config to $target_config"
+    fi
+    [[ "$apply" == true ]] || return 0
+
+    if [[ -n "$install_config_secret" ]]; then
+        if ! kube get secret "$target_config" -n "$namespace" -o json 2>/dev/null |
+            jq -e '.data["install-config.yaml"] | length > 0' >/dev/null 2>&1; then
+            die "Cannot read the install-config.yaml key in Secret $target_config"
+        fi
+    else
+        copy_install_template "$source_config" "$target_config" "$source_uid"
+    fi
+    printf '%s\n' "$manifest" | kube create -n "$namespace" -f - -o name \
+        || die "Could not create $target_name. A rerun can reuse the copied install-config Secret."
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    update-image|create-pool) command="$1"; shift ;;
+    '') usage >&2; exit 1 ;;
+    *) die "Unknown command: $1" ;;
+esac
+
+context="" namespace="$DEFAULT_NAMESPACE" server="" image_set="" version="" size="" install_config_secret=""
+apply=false dry_run=false
+pool_names=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --context|-n|--namespace|--server|--image-set|--version|--size|--install-config-secret)
+            [[ -n "${2:-}" && "$2" != -* ]] || die "$1 requires a value"
+            case "$1" in
+                --context) context="$2" ;;
+                -n|--namespace) namespace="$2" ;;
+                --server) server="$2" ;;
+                --image-set) image_set="$2" ;;
+                --version) version="$2" ;;
+                --size) size="$2" ;;
+                --install-config-secret) install_config_secret="$2" ;;
+            esac
+            shift 2 ;;
+        --server=*) server="${1#*=}"; [[ -n "$server" ]] || die "--server requires a URL"; shift ;;
+        --apply) apply=true; shift ;;
+        --dry-run) dry_run=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*) die "Unknown option: $1" ;;
+        *) pool_names+=("$1"); shift ;;
+    esac
+done
+
+if [[ -n "$version" ]]; then
+    [[ -z "$image_set" ]] || die "Choose either --version or --image-set"
+    [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || die "Use MAJOR.MINOR for --version, such as 5.1"
+else
+    [[ -n "$image_set" ]] || die "Pass --version or --image-set. See --help."
+fi
+[[ "$apply" == false || "$dry_run" == false ]] || die "Choose either --apply or --dry-run"
+[[ ${#pool_names[@]} -gt 0 ]] || die "Provide at least one pool name. See --help."
+valid_label "$namespace" || die "Invalid namespace: $namespace"
+for name in "${pool_names[@]}"; do
+    valid_label "$name" || die "Invalid pool name: $name"
+done
+if [[ "$command" == create-pool ]]; then
+    [[ ${#pool_names[@]} -eq 2 && "${pool_names[0]}" != "${pool_names[1]}" ]] || die "Specify distinct source and new pool names"
+    size="${size:-0}"
+    [[ "$size" =~ ^(0|[1-9][0-9]{0,9})$ && "$size" -le 2147483647 ]] || die "--size must be a nonnegative 32-bit integer"
+else
+    [[ -z "$size" && -z "$install_config_secret" ]] || die "--size and --install-config-secret are for create-pool"
+fi
+
+ensure_cli
+command -v jq >/dev/null || die "jq is required"
+if [[ -z "$context" ]]; then
+    server="${server:-$DEFAULT_SERVER}"
+    context=$(resolve_context "$server") || die "Could not read kubeconfig contexts"
+    [[ -n "$context" ]] || die "Could not select a kubeconfig context for $server in $namespace. Pass --context."
+fi
+# All requests pin the selected context. This script never switches contexts.
+context_server=$("$KUBE_CLI" config view --context="$context" --minify -o jsonpath='{.clusters[0].cluster.server}')
+[[ -n "$context_server" ]] || die "Could not resolve the API server for context $context"
+[[ -z "$server" || "${server%/}" == "${context_server%/}" ]] || die "--server does not match the API server for context $context"
+if [[ -n "$version" ]]; then
+    image_set=$(resolve_image_set "$version") || die "Could not resolve OpenShift $version. Use --image-set to select an exact name."
+    [[ -n "$image_set" ]] || die "No tagged x86_64 OpenShift $version image set found. Use --image-set to select an exact name."
+    log_info "OpenShift $version resolved to $image_set"
+else
+    kube get "$IMAGE_SET_RESOURCE" "$image_set" -o name >/dev/null
+fi
+
+log_step "$command in $namespace (context $context)"
+if [[ "$apply" == false ]]; then
+    log_info "Read-only preview. Pass --apply to make changes."
+fi
+
+case "$command" in
+    update-image) update_image "${pool_names[@]}" ;;
+    create-pool) create_pool "${pool_names[@]}" ;;
+esac

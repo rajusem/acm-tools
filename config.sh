@@ -22,6 +22,10 @@ export SNO_VIRT_HUB="${SNO_VIRT_HUB:-https://api.collective.aws.red-chesterfield
 export NAMESPACE_SPOKE_CONTEXT="${NAMESPACE_SPOKE_CONTEXT:-namespace-spoke}"
 export VM_SPOKE_CONTEXT="${VM_SPOKE_CONTEXT:-vm-spoke}"
 
+# --- Hive ClusterPools ---
+export CLUSTERPOOL_SERVER="${CLUSTERPOOL_SERVER:-https://api.collective.aws.red-chesterfield.com:6443}"
+export CLUSTERPOOL_NAMESPACE="${CLUSTERPOOL_NAMESPACE:-obs-int-analytics}"
+
 # --- Source Repos (relative to acm-tools root, or absolute) ---
 _ACM_TOOLS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export MCO_REPO_DIR="${MCO_REPO_DIR:-${_ACM_TOOLS_ROOT}/../multicluster-observability-operator}"
